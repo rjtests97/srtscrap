@@ -167,7 +167,9 @@ export default function App() {
             case 'progress': setProgress({done:d.done,total:totalRef.val||d.total,found:orders.length}); break
             case 'error': addLog('⚠ '+d.msg,'err'); break
             case 'chunk_done':
-              if(d.chunkOrders)d.chunkOrders.forEach((o:Order)=>{orders.push(o);ordersRef.current=[...orders]})
+              if(d.chunkOrders)d.chunkOrders.forEach((o:Order)=>{
+                if(!orders.find(x=>x.orderId===o.orderId)){orders.push(o);ordersRef.current=[...orders]}
+              })
               nextParams=d; break
             case 'done': return{status:'done'}
           }
@@ -206,17 +208,22 @@ export default function App() {
         const{status,nextParams}=await readSSE(res,orders,ab,totalRef)
         if(status==='done')break
         if(status==='chunk'&&nextParams){
+          const np=nextParams
           currentParams={
             ...base,
-            mode:'date',
-            scanStart:nextParams.nextStart,
-            scanEnd:nextParams.scanEnd,
-            originalStart:nextParams.originalStart||nextParams.nextStart,
-            fromDate:nextParams.fromDate||base.fromDate,
-            toDate:nextParams.toDate||base.toDate,
-            runId:nextParams.runId
+            mode: np.mode||base.mode||'date',
+            scanStart: np.nextStart,
+            scanEnd:   np.scanEnd,
+            originalStart: np.originalStart||np.nextStart,
+            fromDate:  np.fromDate||base.fromDate,
+            toDate:    np.toDate||base.toDate,
+            startId:   np.startId||base.startId,
+            endId:     np.endId||base.endId,
+            useAuto:   np.useAuto||base.useAuto,
+            stopAfter: np.stopAfter||base.stopAfter,
+            runId:     np.runId
           }
-          addLog(`Continuing from #${nextParams.nextStart} — ${orders.length} found so far...`,'info')
+          addLog(`Continuing from #${np.nextStart} — ${orders.length} found so far...`,'info')
         } else break
       }
 

@@ -1,15 +1,22 @@
 import { NextRequest } from 'next/server'
 import { fetchOrder } from '@/lib/scraper'
 
-// Node.js runtime — 60s timeout on Vercel free tier (vs 10s for Edge)
 export const runtime = 'nodejs'
 export const maxDuration = 60
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
+// Safe IDs per 60s call: at 5 concurrency, 250ms/batch = 20 IDs/s × 50s = 1000 IDs
+// Use 900 to leave buffer for boundary detection overhead
+const CHUNK = 900
+
 export async function POST(req: NextRequest) {
   const body = await req.json()
-  const { subdomain, slug, concurrency = 5, mode = 'date' } = body
+  const { subdomain, slug, concurrency = 5, mode = 'date',
+          fromDate, toDate, scanStart: resumeFrom, scanEnd: resumeTo,
+          startId, endId, useAuto, stopAfter = 200,
+          originalStart, runId, anchorId, anchorDate,
+          regressionPoints = [] } = body
 
   const encoder = new TextEncoder()
   const stream  = new TransformStream()
@@ -19,25 +26,53 @@ export async function POST(req: NextRequest) {
     try { writer.write(encoder.encode(`data: ${JSON.stringify({ type, ...data })}\n\n`)) } catch {}
   }
 
-  const heartbeat = setInterval(() => {
+  const ping = setInterval(() => {
     try { writer.write(encoder.encode(': ping\n\n')) } catch {}
   }, 4000)
 
   ;(async () => {
     try {
       const orders: any[] = []
-      let scanned = 0
+      let scanned = 0, matched = 0, rlStreak = 0
+
+      // ── Helper: scan a range of IDs ──────────────────
+      const scanRange = async (from: number, to: number, totalSpan: number, dateFilter?: {from:string,to:string}) => {
+        for (let base = from; base <= to; base += concurrency) {
+          const ids: number[] = []
+          for (let id = base; id <= Math.min(base + concurrency - 1, to); id++) ids.push(id)
+          const fetched = await Promise.all(ids.map(id => fetchOrder(subdomain, id)))
+          for (let i = 0; i < ids.length; i++) {
+            const o = fetched[i]; scanned++
+            if (o === 'rl') { rlStreak++; continue }
+            rlStreak = Math.max(0, rlStreak - 1)
+            if (o && o.slug === slug) {
+              if (!dateFilter || (o.dateYMD && o.dateYMD >= dateFilter.from && o.dateYMD <= dateFilter.to)) {
+                orders.push(o); matched++
+                send('order', { order: o })
+                send('log', { msg: `#${ids[i]}  ${o.orderDate}  ${o.value}  ${o.payment}  ${o.location}${o.pincode?' '+o.pincode:''}`, cls: 'ok' })
+              }
+            }
+          }
+          send('progress', { done: (originalStart||from) + scanned - 1, total: totalSpan, found: matched })
+          await sleep(rlStreak > 3 ? Math.min(rlStreak * 1500, 10000) : 250)
+        }
+      }
 
       if (mode === 'manual') {
-        const { startId, endId, useAuto = false, stopAfter = 200 } = body
-        const maxId = useAuto ? startId + 50000 : endId
-        send('log', { msg: `Manual: #${startId} → ${useAuto ? 'auto' : '#'+endId} | ${concurrency}x`, cls: 'info' })
-        send('start', { total: useAuto ? 0 : maxId - startId + 1 })
-        let misses = 0, matched = 0, stopped = false
+        const chunkStart = resumeFrom || startId
+        const chunkEnd   = resumeTo   || (useAuto ? startId + 50000 : endId)
+        const totalSpan  = (useAuto ? 0 : (endId - startId + 1))
+        const thisEnd    = Math.min(chunkStart + CHUNK - 1, chunkEnd)
 
-        for (let base = startId; base <= maxId && !stopped; base += concurrency) {
+        if (!resumeFrom) {
+          send('log', { msg: `Manual: #${startId} → ${useAuto ? 'auto' : '#'+endId} | ${concurrency}x`, cls: 'info' })
+          send('start', { total: totalSpan })
+        }
+
+        let misses = 0, stopped = false
+        for (let base = chunkStart; base <= thisEnd && !stopped; base += concurrency) {
           const ids: number[] = []
-          for (let id = base; id <= Math.min(base + concurrency - 1, maxId); id++) ids.push(id)
+          for (let id = base; id <= Math.min(base + concurrency - 1, thisEnd); id++) ids.push(id)
           const fetched = await Promise.all(ids.map(id => fetchOrder(subdomain, id)))
           for (let i = 0; i < ids.length && !stopped; i++) {
             const o = fetched[i]; scanned++
@@ -51,26 +86,32 @@ export async function POST(req: NextRequest) {
               stopped = true
             }
           }
-          send('progress', { done: scanned, total: useAuto ? 0 : maxId - startId + 1, found: matched })
+          send('progress', { done: base - startId + scanned, total: totalSpan, found: matched })
           await sleep(250)
         }
-        send('done', { matched: orders.length, scanned, runId: Date.now().toString() })
+
+        if (!stopped && thisEnd < chunkEnd) {
+          send('chunk_done', {
+            mode: 'manual', nextStart: thisEnd + 1, scanEnd: chunkEnd,
+            startId, endId, useAuto, stopAfter,
+            runId: runId || Date.now().toString(), chunkOrders: orders
+          })
+        } else {
+          send('done', { matched: orders.length, scanned, runId: runId || Date.now().toString() })
+        }
 
       } else {
-        const { fromDate, toDate, anchorId, anchorDate, regressionPoints = [],
-                scanStart: resumeFrom, scanEnd: resumeTo } = body
-
+        // ── Date scan ────────────────────────────────────
         let scanStart: number
         let scanEnd: number
+        let totalSpan: number
 
         if (resumeFrom && resumeTo) {
-          // Resuming a chunk
           scanStart = resumeFrom
           scanEnd   = resumeTo
-          send('log', { msg: `Chunk: #${scanStart}–#${scanEnd}`, cls: 'info' })
-          send('start', { total: resumeTo - resumeFrom + 1, scanStart, scanEnd })
+          totalSpan = resumeTo - (originalStart || resumeFrom) + 1
+          send('log', { msg: `Continuing from #${scanStart} (${matched} found so far)...`, cls: 'info' })
         } else {
-          // First call — find boundaries by walking from anchor
           send('log', { msg: `Scan: ${fromDate} → ${toDate}`, cls: 'info' })
           send('log', { msg: `Finding boundaries from #${anchorId} = ${anchorDate}...`, cls: 'info' })
 
@@ -103,54 +144,33 @@ export async function POST(req: NextRequest) {
           const toB   = await walk(toDate)
           scanStart = Math.max(1, fromB.lo - 200)
           scanEnd   = toB.hi + 200
-          const total = scanEnd - scanStart + 1
-          send('log', { msg: `Range: #${scanStart}–#${scanEnd} (${total} IDs)`, cls: 'ok' })
-          send('range', { scanStart, scanEnd, total })
-          send('start', { total, scanStart, scanEnd })
+          totalSpan = scanEnd - scanStart + 1
+          send('log', { msg: `Range: #${scanStart}–#${scanEnd} (${totalSpan} IDs)`, cls: 'ok' })
+          send('range', { scanStart, scanEnd, total: totalSpan })
+          send('start', { total: totalSpan, scanStart, scanEnd })
         }
 
-        // Scan a safe chunk that fits within 50s
-        // At 5 concurrency + 250ms/batch = 20 IDs/sec → 50s = 1000 IDs max safely
-        const SAFE_CHUNK = 800
-        const chunkEnd = Math.min(scanStart + SAFE_CHUNK - 1, scanEnd)
-        let matched = 0, rlStreak = 0
-
-        for (let base = scanStart; base <= chunkEnd; base += concurrency) {
-          const ids: number[] = []
-          for (let id = base; id <= Math.min(base + concurrency - 1, chunkEnd); id++) ids.push(id)
-          const fetched = await Promise.all(ids.map(id => fetchOrder(subdomain, id)))
-          for (let i = 0; i < ids.length; i++) {
-            const o = fetched[i]; scanned++
-            if (o === 'rl') { rlStreak++; continue }
-            rlStreak = Math.max(0, rlStreak - 1)
-            if (o && o.slug === slug && o.dateYMD && o.dateYMD >= fromDate && o.dateYMD <= toDate) {
-              orders.push(o); matched++
-              send('order', { order: o })
-              send('log', { msg: `#${ids[i]}  ${o.orderDate}  ${o.value}  ${o.payment}  ${o.location}  ${o.pincode}`, cls: 'ok' })
-            }
-          }
-          send('progress', { done: scanned, total: scanEnd - (body.originalStart || scanStart) + 1, found: matched })
-          await sleep(rlStreak > 3 ? Math.min(rlStreak * 1500, 10000) : 250)
-        }
+        const chunkEnd = Math.min(scanStart + CHUNK - 1, scanEnd)
+        await scanRange(scanStart, chunkEnd, totalSpan, { from: fromDate, to: toDate })
 
         if (chunkEnd < scanEnd) {
           send('chunk_done', {
-            nextStart: chunkEnd + 1,
-            scanEnd,
-            originalStart: body.originalStart || scanStart,
+            mode: 'date', nextStart: chunkEnd + 1, scanEnd,
+            originalStart: originalStart || scanStart,
             fromDate, toDate,
-            runId: body.runId || Date.now().toString(),
+            runId: runId || Date.now().toString(),
             chunkOrders: orders
           })
         } else {
-          send('done', { matched: orders.length, scanned, runId: body.runId || Date.now().toString() })
+          send('done', { matched: orders.length, scanned, runId: runId || Date.now().toString() })
         }
       }
+
     } catch (err: any) {
       send('error', { msg: err.message })
-      send('done', { matched: 0, scanned: 0, runId: Date.now().toString() })
+      send('done', { matched: 0, scanned: 0, runId: runId || Date.now().toString() })
     } finally {
-      clearInterval(heartbeat)
+      clearInterval(ping)
       writer.close().catch(() => {})
     }
   })()
