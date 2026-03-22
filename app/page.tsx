@@ -124,6 +124,18 @@ export default function App() {
 
   useEffect(()=>{if(logRef.current)logRef.current.scrollTop=logRef.current.scrollHeight},[scanLog])
 
+  // Warn if tab becomes hidden during scan
+  useEffect(()=>{
+    const handleVisibility=()=>{
+      if(document.hidden&&isScanning){
+        // Add warning to log — scan may slow down
+        setScanLog(p=>[...p,{msg:'⚠ Tab is hidden — scan may slow down. Keep this tab active!',cls:'err'}])
+      }
+    }
+    document.addEventListener('visibilitychange',handleVisibility)
+    return()=>document.removeEventListener('visibilitychange',handleVisibility)
+  },[isScanning])
+
   function loadRunsForBrand(b:Brand){
     const r=LS.get<ScanRun[]>(`runs_${b.id}`,[]);setRuns(r)
     if(r.length>0){setLastOrders(r[0].orders);setAnalytics(buildAnalytics(r[0].orders))}
@@ -142,6 +154,12 @@ export default function App() {
   async function startScan(fromDate:string,toDate:string,concurrency:number,startId?:number,endId?:number,useAuto?:boolean,stopAfter?:number){
     if(!activeBrand||isScanning)return
     setIsScanning(true);setScanLog([]);setProgress({done:0,total:0,found:0});setStartedAt(Date.now());ordersRef.current=[]
+    // Warn user not to switch tabs
+    addLog('⚠ Keep this tab active — switching tabs may pause the scan','info')
+    // Request wake lock to prevent tab throttling
+    if('wakeLock' in navigator){
+      try{(navigator as any).wakeLock.request('screen').catch(()=>{})}catch(e){}
+    }
     const ab=new AbortController();abortRef.current=ab
     const orders:Order[]=[]
     try{
@@ -173,6 +191,11 @@ export default function App() {
               const run:ScanRun={runId:d.runId||Date.now().toString(),dateRange:dateLabel,found:orders.length,scanned:d.scanned||0,orders,createdAt:new Date().toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'numeric'})}
               const updated=[run,...LS.get<ScanRun[]>(`runs_${activeBrand.id}`,[])].slice(0,50)
               LS.set(`runs_${activeBrand.id}`,updated);setRuns(updated);setLastOrders(orders);setAnalytics(buildAnalytics(orders))
+              // Auto-sync to Sheets if URL is saved
+              const sheetsUrl=LS.get(`sheets_${activeBrand.id}`,'')
+              if(sheetsUrl&&orders.length>0){
+                autoSyncToSheets(sheetsUrl,orders,activeBrand.name)
+              }
               // Update regression
               const byDate:Record<string,{min:number,max:number}>={}
               orders.forEach(o=>{if(!o.dateYMD)return;if(!byDate[o.dateYMD])byDate[o.dateYMD]={min:o.orderId,max:o.orderId};else{byDate[o.dateYMD].min=Math.min(byDate[o.dateYMD].min,o.orderId);byDate[o.dateYMD].max=Math.max(byDate[o.dateYMD].max,o.orderId)}})
@@ -195,6 +218,24 @@ export default function App() {
 
   // Keep a ref to orders collected so far so stopScan can save them
   const ordersRef = useRef<Order[]>([])
+
+  // Auto-sync to sheets after scan
+  async function autoSyncToSheets(url:string, orders:Order[], brandName:string){
+    if(!url||!orders.length)return
+    addLog(`Auto-syncing ${orders.length} orders to Sheets...`,'info')
+    const BATCH=200
+    let added=0
+    for(let i=0;i<orders.length;i+=BATCH){
+      const batch=orders.slice(i,i+BATCH)
+      try{
+        const res=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({orders:batch,mode:i===0?'append':'append'})})
+        const d=await res.json()
+        if(d.ok)added+=d.added||0
+      }catch(e){}
+      await new Promise(r=>setTimeout(r,500))
+    }
+    addLog(`✓ Sheets: ${added} rows synced`,'ok')
+  }
 
   function stopScan(){
     abortRef.current?.abort()
@@ -561,10 +602,14 @@ function HistoryTab({runs,brandName,onClear}:{runs:ScanRun[],brandName:string,on
 // ── Settings Tab ──────────────────────────────────────
 function SettingsTab({brands,activeBrand,onDelete,onUpdate,runs}:any){
   const [sheetsUrl,setSheetsUrl]=useState(()=>LS.get(`sheets_${activeBrand?.id}`,''))
+  useEffect(()=>{setSheetsUrl(LS.get(`sheets_${activeBrand?.id}`,''))},[activeBrand?.id])
   const [sheetsStatus,setSheetsStatus]=useState('')
   const [syncing,setSyncing]=useState(false)
 
-  async function saveSheets(){LS.set(`sheets_${activeBrand.id}`,sheetsUrl);setSheetsStatus('✓ URL saved')}
+  async function saveSheets(){
+    LS.set(`sheets_${activeBrand.id}`,sheetsUrl)
+    setSheetsStatus('✓ URL saved — will auto-sync after each scan')
+  }
 
   async function testSheets(){
     if(!sheetsUrl){setSheetsStatus('⚠ Enter a URL first');return}
