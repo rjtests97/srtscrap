@@ -141,7 +141,7 @@ export default function App() {
 
   async function startScan(fromDate:string,toDate:string,concurrency:number,startId?:number,endId?:number,useAuto?:boolean,stopAfter?:number){
     if(!activeBrand||isScanning)return
-    setIsScanning(true);setScanLog([]);setProgress({done:0,total:0,found:0});setStartedAt(Date.now())
+    setIsScanning(true);setScanLog([]);setProgress({done:0,total:0,found:0});setStartedAt(Date.now());ordersRef.current=[]
     const ab=new AbortController();abortRef.current=ab
     const orders:Order[]=[]
     try{
@@ -163,7 +163,7 @@ export default function App() {
           try{
             const d=JSON.parse(line.slice(6))
             if(d.type==='log')addLog(d.msg,d.cls||'')
-            else if(d.type==='order')orders.push(d.order)
+            else if(d.type==='order'){orders.push(d.order);ordersRef.current=orders}
             else if(d.type==='progress')setProgress({done:d.done,total:d.total,found:d.found})
             else if(d.type==='start')setProgress(p=>({...p,total:d.total}))
             else if(d.type==='error')addLog('⚠ '+d.msg,'err')
@@ -193,7 +193,26 @@ export default function App() {
     finally{setIsScanning(false)}
   }
 
-  function stopScan(){abortRef.current?.abort();setIsScanning(false);addLog('Scan stopped.','info')}
+  // Keep a ref to orders collected so far so stopScan can save them
+  const ordersRef = useRef<Order[]>([])
+
+  function stopScan(){
+    abortRef.current?.abort()
+    setIsScanning(false)
+    addLog('Scan stopped.','info')
+    // Save whatever was found so far
+    if(ordersRef.current.length>0&&activeBrand){
+      const orders=ordersRef.current
+      setLastOrders(orders)
+      setAnalytics(buildAnalytics(orders))
+      const dates=orders.map(r=>r.dateYMD).filter(Boolean).sort()
+      const dateLabel=dates.length===0?'partial':dates[0]===dates[dates.length-1]?dates[0]!+' (partial)':`${dates[0]} to ${dates[dates.length-1]} (partial)`
+      const run:ScanRun={runId:Date.now().toString(),dateRange:dateLabel,found:orders.length,scanned:progress.done,orders,createdAt:new Date().toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'numeric'})}
+      const updated=[run,...LS.get<ScanRun[]>(`runs_${activeBrand.id}`,[])].slice(0,50)
+      LS.set(`runs_${activeBrand.id}`,updated);setRuns(updated)
+      addLog(`Saved ${orders.length} orders found so far`,'info')
+    }
+  }
 
   const eta=(()=>{
     if(!startedAt||!progress.done||!progress.total)return''
