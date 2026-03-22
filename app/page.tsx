@@ -203,40 +203,61 @@ export default function App() {
     }
 
     try{
-      // First call includes boundary detection. Subsequent calls are pure scan chunks.
-      let currentParams:any = { ...base, runId: Date.now().toString() }
-      let initialised = false
+      const rid = Date.now().toString()
+      let scanStart: number
+      let scanEnd: number
+      let totalSpan: number
 
-      while(!ab.signal.aborted){
+      if(base.mode==='date'){
+        // Step 1: bounds detection (separate call, separate timeout budget)
+        addLog(`Finding boundaries for ${base.fromDate} → ${base.toDate}...`,'info')
+        const br = await fetch('/api/bounds',{
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({
+            subdomain:active.subdomain, slug:active.slug,
+            anchorId:active.anchorId, anchorDate:active.anchorDate,
+            regressionPoints:active.regressionPoints||[],
+            fromDate:base.fromDate, toDate:base.toDate
+          }), signal:ab.signal
+        })
+        if(!br.ok) throw new Error('Bounds detection failed')
+        const bounds = await br.json()
+        scanStart = bounds.scanStart
+        scanEnd   = bounds.scanEnd
+        totalSpan = bounds.total
+        totalRef.val = totalSpan
+        setProgress({done:0, total:totalSpan, found:0})
+        addLog(`Range: #${scanStart}–#${scanEnd} (${totalSpan} IDs)`, 'ok')
+      } else {
+        // Manual: scanStart/scanEnd come from params
+        scanStart = base.startId
+        scanEnd   = base.useAuto ? base.startId+50000 : base.endId
+        totalSpan = base.useAuto ? 0 : (scanEnd - scanStart + 1)
+        totalRef.val = totalSpan
+        setProgress({done:0,total:totalSpan,found:0})
+      }
+
+      // Step 2: scan in chunks — each chunk is a fresh 60s server call
+      let chunkStart = scanStart
+      while(chunkStart <= scanEnd && !ab.signal.aborted){
         const res = await fetch('/api/scan',{
           method:'POST', headers:{'Content-Type':'application/json'},
-          body:JSON.stringify(currentParams), signal:ab.signal
+          body:JSON.stringify({
+            ...base,
+            scanStart:    chunkStart,
+            scanEnd:      scanEnd,
+            originalStart:scanStart,
+            totalSpan,
+            runId:        rid
+          }), signal:ab.signal
         })
         if(!res.ok||!res.body) throw new Error(`HTTP ${res.status}`)
 
         const chunk = await processStream(res)
-
-        if(!initialised){ initialised=true }
-        if(chunk===null) break // fully done
-        if(!chunk?.nextStart){ break }
-
-        // Continue with next chunk
-        currentParams = {
-          ...base,
-          mode:          chunk.mode        || base.mode || 'date',
-          scanStart:     chunk.nextStart,
-          scanEnd:       chunk.scanEnd,
-          originalStart: chunk.originalStart,
-          totalSpan:     chunk.totalSpan   || totalRef.val,
-          fromDate:      chunk.fromDate    || base.fromDate,
-          toDate:        chunk.toDate      || base.toDate,
-          startId:       chunk.startId     || base.startId,
-          endId:         chunk.endId       || base.endId,
-          useAuto:       chunk.useAuto     !== undefined ? chunk.useAuto : base.useAuto,
-          stopAfter:     chunk.stopAfter   || base.stopAfter,
-          runId:         chunk.runId
-        }
-        addLog(`→ ${allOrders.length} found, next chunk from #${chunk.nextStart}...`,'info')
+        if(chunk===null) break // server sent 'done'
+        if(!chunk?.nextStart) break
+        chunkStart = chunk.nextStart
+        addLog(`→ ${allOrders.length} found, continuing from #${chunkStart}...`,'info')
       }
 
       const dates=allOrders.map(r=>r.dateYMD).filter(Boolean).sort()
