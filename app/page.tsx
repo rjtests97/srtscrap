@@ -147,95 +147,114 @@ export default function App() {
 
   const [scanLabel,setScanLabel]=useState('')
 
-  // Read one SSE stream fully, returns 'done' or next chunk params
-  async function readSSE(res:Response, orders:Order[], ab:AbortController, totalRef:{val:number}):Promise<{status:'done'|'chunk', nextParams?:any}>{
-    const reader=res.body!.getReader();const dec=new TextDecoder();let buf=''
-    let nextParams:any=null
-    while(true){
-      const{done,value}=await reader.read();if(done)break
-      buf+=dec.decode(value,{stream:true})
-      const lines=buf.split('\n');buf=lines.pop()||''
-      for(const line of lines){
-        if(!line.startsWith('data: '))continue
-        try{
-          const d=JSON.parse(line.slice(6))
-          switch(d.type){
-            case 'log': addLog(d.msg,d.cls||''); break
-            case 'order': orders.push(d.order);ordersRef.current=[...orders]; break
-            case 'range': totalRef.val=d.total; setProgress(p=>({...p,total:d.total})); break
-            case 'start': if(!totalRef.val&&d.total){totalRef.val=d.total;setProgress(p=>({...p,total:d.total}))}; break
-            case 'progress': setProgress({done:d.done,total:totalRef.val||d.total,found:orders.length}); break
-            case 'error': addLog('⚠ '+d.msg,'err'); break
-            case 'chunk_done':
-              if(d.chunkOrders)d.chunkOrders.forEach((o:Order)=>{
-                if(!orders.find(x=>x.orderId===o.orderId)){orders.push(o);ordersRef.current=[...orders]}
-              })
-              nextParams=d; break
-            case 'done': return{status:'done'}
-          }
-        }catch{}
-      }
-    }
-    if(nextParams)return{status:'chunk',nextParams}
-    return{status:'done'}
-  }
-
   async function startScan(params:any){
     if(!active||scanning)return
     setScanning(true);setLog([]);setProgress({done:0,total:0,found:0});setStartedAt(Date.now());ordersRef.current=[]
     if('wakeLock' in navigator){try{(navigator as any).wakeLock.request('screen').catch(()=>{})}catch{}}
     addLog('⚠ Keep this tab active — switching tabs may pause the scan','info')
     const ab=new AbortController();abortRef.current=ab
-    const orders:Order[]=[]
+    const allOrders:Order[]=[]
     const totalRef={val:0}
-    // Label for display during scan
-    const label0=params.fromDate?`${params.fromDate} → ${params.toDate}`:params.startId?`#${params.startId}+`:'scan'
+    const label0=params.fromDate?`${params.fromDate} → ${params.toDate}`:params.startId?`#${params.startId} → #${params.endId||'auto'}`:'scan'
     setScanLabel(label0)
 
-    // Base params — use active (correct ref), not activeBrand
-    const base={...params,subdomain:active.subdomain,slug:active.slug,
+    const base={...params,
+      subdomain:active.subdomain,slug:active.slug,
       anchorId:active.anchorId,anchorDate:active.anchorDate,
       avgPerDay:active.avgPerDay,regressionPoints:active.regressionPoints}
 
-    try{
-      let currentParams=base
-      let iterations=0
-      while(iterations++<100){  // max 100 chunks = 200k IDs max
-        if(ab.signal.aborted)break
-        const res=await fetch('/api/scan',{method:'POST',headers:{'Content-Type':'application/json'},
-          body:JSON.stringify(currentParams),signal:ab.signal})
-        if(!res.ok||!res.body)throw new Error('Scan request failed')
-        const{status,nextParams}=await readSSE(res,orders,ab,totalRef)
-        if(status==='done')break
-        if(status==='chunk'&&nextParams){
-          const np=nextParams
-          currentParams={
-            ...base,
-            mode: np.mode||base.mode||'date',
-            scanStart: np.nextStart,
-            scanEnd:   np.scanEnd,
-            originalStart: np.originalStart||np.nextStart,
-            fromDate:  np.fromDate||base.fromDate,
-            toDate:    np.toDate||base.toDate,
-            startId:   np.startId||base.startId,
-            endId:     np.endId||base.endId,
-            useAuto:   np.useAuto||base.useAuto,
-            stopAfter: np.stopAfter||base.stopAfter,
-            runId:     np.runId
+    // processStream: reads one SSE response, adds orders, returns chunk_done payload or null
+    const processStream = async (res:Response):Promise<any|null> => {
+      const reader=res.body!.getReader()
+      const dec=new TextDecoder()
+      let buf='', chunkPayload:any=null
+
+      try {
+        while(true){
+          const{done,value}=await reader.read()
+          if(done) break
+          buf+=dec.decode(value,{stream:true})
+          const lines=buf.split('\n'); buf=lines.pop()||''
+          for(const line of lines){
+            if(!line.startsWith('data: ')) continue
+            try{
+              const d=JSON.parse(line.slice(6))
+              if(d.type==='log')        addLog(d.msg,d.cls||'')
+              else if(d.type==='order') { allOrders.push(d.order); ordersRef.current=[...allOrders] }
+              else if(d.type==='range') { totalRef.val=d.total; setProgress(p=>({...p,total:d.total})) }
+              else if(d.type==='start') { if(d.total&&!totalRef.val){ totalRef.val=d.total; setProgress(p=>({...p,total:d.total})) } }
+              else if(d.type==='progress') setProgress({done:d.done,total:totalRef.val||d.total,found:allOrders.length})
+              else if(d.type==='error') addLog('⚠ '+d.msg,'err')
+              else if(d.type==='chunk_done'){
+                // Merge any orders sent with chunk (server may include them)
+                if(d.chunkOrders){
+                  const existing=new Set(allOrders.map((o:Order)=>o.orderId))
+                  d.chunkOrders.forEach((o:Order)=>{ if(!existing.has(o.orderId)){ allOrders.push(o); ordersRef.current=[...allOrders] } })
+                }
+                chunkPayload=d
+              }
+              else if(d.type==='done') { chunkPayload=null; return null } // null = fully done
+            }catch{}
           }
-          addLog(`Continuing from #${np.nextStart} — ${orders.length} found so far...`,'info')
-        } else break
+        }
+      } finally { reader.releaseLock() }
+
+      return chunkPayload // non-null = more chunks needed
+    }
+
+    try{
+      let currentParams:any = base
+      let chunkNum = 0
+
+      while(!ab.signal.aborted){
+        chunkNum++
+        addLog(chunkNum===1 ? `Starting scan...` : `Chunk ${chunkNum}: #${currentParams.scanStart}...`, 'info')
+
+        const res = await fetch('/api/scan', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify(currentParams),
+          signal:ab.signal
+        })
+        if(!res.ok||!res.body) throw new Error(`HTTP ${res.status}`)
+
+        const chunk = await processStream(res)
+
+        if(chunk===null) break // done
+
+        if(!chunk?.nextStart){
+          addLog('Scan complete (no more chunks)','info')
+          break
+        }
+
+        // Build next chunk params
+        currentParams = {
+          ...base,
+          mode:        chunk.mode || base.mode || 'date',
+          scanStart:   chunk.nextStart,
+          scanEnd:     chunk.scanEnd,
+          originalStart: chunk.originalStart || base.originalStart || chunk.nextStart,
+          fromDate:    chunk.fromDate || base.fromDate,
+          toDate:      chunk.toDate   || base.toDate,
+          startId:     chunk.startId  || base.startId,
+          endId:       chunk.endId    || base.endId,
+          useAuto:     chunk.useAuto  !== undefined ? chunk.useAuto  : base.useAuto,
+          stopAfter:   chunk.stopAfter|| base.stopAfter,
+          runId:       chunk.runId
+        }
+        addLog(`→ ${allOrders.length} orders found so far, continuing...`,'info')
       }
 
-      // Save results
-      const dates=orders.map(r=>r.dateYMD).filter(Boolean).sort()
-      const label=dates.length===0?(params.fromDate?`${params.fromDate} to ${params.toDate}`:'scan')
-                 :dates[0]===dates[dates.length-1]?dates[0]!:`${dates[0]} to ${dates[dates.length-1]}`
-      saveRun(orders,label,totalRef.val)
-      addLog(`✓ Done: ${label} — ${orders.length} orders`,'ok')
+      const dates=allOrders.map(r=>r.dateYMD).filter(Boolean).sort()
+      const label=dates.length===0
+        ? (params.fromDate?`${params.fromDate} to ${params.toDate}`:'scan')
+        : dates[0]===dates[dates.length-1] ? dates[0]!
+        : `${dates[0]} to ${dates[dates.length-1]}`
+      saveRun(allOrders,label,totalRef.val)
+      addLog(`✓ Done: ${label} — ${allOrders.length} orders`,'ok')
 
     }catch(e:any){
-      if(e.name!=='AbortError')addLog('Error: '+e.message,'err')
+      if(e.name!=='AbortError') addLog('Error: '+e.message,'err')
       if(ordersRef.current.length>0){
         const o=ordersRef.current
         const dates=o.map(r=>r.dateYMD).filter(Boolean).sort()
