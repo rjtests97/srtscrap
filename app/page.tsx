@@ -167,7 +167,7 @@ export default function App() {
             case 'progress': setProgress({done:d.done,total:totalRef.val||d.total,found:orders.length}); break
             case 'error': addLog('⚠ '+d.msg,'err'); break
             case 'chunk_done':
-              if(d.orders)d.orders.forEach((o:Order)=>{orders.push(o);ordersRef.current=[...orders]})
+              if(d.chunkOrders)d.chunkOrders.forEach((o:Order)=>{orders.push(o);ordersRef.current=[...orders]})
               nextParams=d; break
             case 'done': return{status:'done'}
           }
@@ -206,9 +206,17 @@ export default function App() {
         const{status,nextParams}=await readSSE(res,orders,ab,totalRef)
         if(status==='done')break
         if(status==='chunk'&&nextParams){
-          // Continue scanning next chunk
-          currentParams={...base,scanStart:nextParams.nextStart,scanEnd:nextParams.scanEnd,runId:nextParams.runId}
-          addLog(`Continuing: ${orders.length} found so far...`,'info')
+          currentParams={
+            ...base,
+            mode:'date',
+            scanStart:nextParams.nextStart,
+            scanEnd:nextParams.scanEnd,
+            originalStart:nextParams.originalStart||nextParams.nextStart,
+            fromDate:nextParams.fromDate||base.fromDate,
+            toDate:nextParams.toDate||base.toDate,
+            runId:nextParams.runId
+          }
+          addLog(`Continuing from #${nextParams.nextStart} — ${orders.length} found so far...`,'info')
         } else break
       }
 

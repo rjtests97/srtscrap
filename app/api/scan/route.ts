@@ -1,8 +1,9 @@
 import { NextRequest } from 'next/server'
 import { fetchOrder } from '@/lib/scraper'
 
-export const runtime = 'edge'
-export const maxDuration = 300
+// Node.js runtime — 60s timeout on Vercel free tier (vs 10s for Edge)
+export const runtime = 'nodejs'
+export const maxDuration = 60
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
@@ -18,10 +19,9 @@ export async function POST(req: NextRequest) {
     try { writer.write(encoder.encode(`data: ${JSON.stringify({ type, ...data })}\n\n`)) } catch {}
   }
 
-  // Heartbeat — keeps SSE alive and prevents Vercel/browser timeouts
-  const heartbeatInterval = setInterval(() => {
-    try { writer.write(encoder.encode(': heartbeat\n\n')) } catch {}
-  }, 5000)
+  const heartbeat = setInterval(() => {
+    try { writer.write(encoder.encode(': ping\n\n')) } catch {}
+  }, 4000)
 
   ;(async () => {
     try {
@@ -46,49 +46,49 @@ export async function POST(req: NextRequest) {
               send('order', { order: o })
               send('log', { msg: `#${ids[i]}  ${o.orderDate}  ${o.value}  ${o.payment}  ${o.location}`, cls: 'ok' })
             } else if (o !== 'rl') misses++
-            if (useAuto && misses >= stopAfter) { send('log', { msg: `Auto-stopped: ${stopAfter} consecutive misses`, cls: 'info' }); stopped = true }
+            if (useAuto && misses >= stopAfter) {
+              send('log', { msg: `Auto-stopped: ${stopAfter} consecutive misses`, cls: 'info' })
+              stopped = true
+            }
           }
           send('progress', { done: scanned, total: useAuto ? 0 : maxId - startId + 1, found: matched })
-          await sleep(300)
+          await sleep(250)
         }
         send('done', { matched: orders.length, scanned, runId: Date.now().toString() })
 
       } else {
-        // ── Date scan ────────────────────────────────────────
-        const { fromDate, toDate, anchorId, anchorDate, regressionPoints = [], scanStart: resumeFrom } = body
+        const { fromDate, toDate, anchorId, anchorDate, regressionPoints = [],
+                scanStart: resumeFrom, scanEnd: resumeTo } = body
 
-        // If resuming a chunked scan, skip boundary detection
         let scanStart: number
         let scanEnd: number
-        const totalFromBody = body.scanEnd - body.scanStart + 1
 
-        if (resumeFrom && body.scanEnd) {
-          // Resuming from a previous chunk
+        if (resumeFrom && resumeTo) {
+          // Resuming a chunk
           scanStart = resumeFrom
-          scanEnd   = body.scanEnd
-          send('log', { msg: `Resuming from #${scanStart}`, cls: 'info' })
-          send('start', { total: totalFromBody, scanStart, scanEnd })
+          scanEnd   = resumeTo
+          send('log', { msg: `Chunk: #${scanStart}–#${scanEnd}`, cls: 'info' })
+          send('start', { total: resumeTo - resumeFrom + 1, scanStart, scanEnd })
         } else {
-          // First call — find boundaries
+          // First call — find boundaries by walking from anchor
           send('log', { msg: `Scan: ${fromDate} → ${toDate}`, cls: 'info' })
-          send('log', { msg: `Finding boundaries from anchor #${anchorId} = ${anchorDate}...`, cls: 'info' })
+          send('log', { msg: `Finding boundaries from #${anchorId} = ${anchorDate}...`, cls: 'info' })
 
           const pts = [{ date: anchorDate, id: anchorId }, ...regressionPoints]
             .filter((p: any) => p.date && p.id > 0)
             .sort((a: any, b: any) => a.date.localeCompare(b.date))
 
-          const walkToDate = async (targetDate: string) => {
+          const walk = async (targetDate: string) => {
             let ref = pts[0]
             for (const p of pts) {
               if (Math.abs(new Date(p.date+'T00:00:00').getTime() - new Date(targetDate+'T00:00:00').getTime()) <
                   Math.abs(new Date(ref.date+'T00:00:00').getTime() - new Date(targetDate+'T00:00:00').getTime())) ref = p
             }
             const forward = targetDate >= ref.date
-            const STEP = 500
             let lo = ref.id, hi = ref.id
-            for (let i = 1; i <= 400; i++) {
-              const probeId = forward ? ref.id + i * STEP : Math.max(1, ref.id - i * STEP)
-              const o = await fetchOrder(subdomain, probeId)
+            for (let i = 1; i <= 300; i++) {
+              const pid = forward ? ref.id + i*500 : Math.max(1, ref.id - i*500)
+              const o = await fetchOrder(subdomain, pid)
               if (o && o !== 'rl' && o.slug === slug && o.dateYMD) {
                 send('log', { msg: `  #${o.orderId} = ${o.orderDate}`, cls: 'info' })
                 if (forward) { if (o.dateYMD >= targetDate) { hi = o.orderId; break }; lo = o.orderId }
@@ -99,22 +99,21 @@ export async function POST(req: NextRequest) {
             return { lo, hi }
           }
 
-          const fromB = await walkToDate(fromDate)
-          const toB   = await walkToDate(toDate)
-          scanStart = Math.max(1, fromB.lo - 300)
-          scanEnd   = toB.hi + 300
+          const fromB = await walk(fromDate)
+          const toB   = await walk(toDate)
+          scanStart = Math.max(1, fromB.lo - 200)
+          scanEnd   = toB.hi + 200
           const total = scanEnd - scanStart + 1
           send('log', { msg: `Range: #${scanStart}–#${scanEnd} (${total} IDs)`, cls: 'ok' })
-          send('start', { total, scanStart, scanEnd })
-          // Tell client the full range for chunking
           send('range', { scanStart, scanEnd, total })
+          send('start', { total, scanStart, scanEnd })
         }
 
+        // Scan a safe chunk that fits within 50s
+        // At 5 concurrency + 250ms/batch = 20 IDs/sec → 50s = 1000 IDs max safely
+        const SAFE_CHUNK = 800
+        const chunkEnd = Math.min(scanStart + SAFE_CHUNK - 1, scanEnd)
         let matched = 0, rlStreak = 0
-        const CHUNK_SIZE = 2000 // IDs per server call — safe for 5min timeout at 5x concurrency
-        const chunkEnd = Math.min(scanStart + CHUNK_SIZE - 1, scanEnd)
-
-        send('log', { msg: `Scanning #${scanStart}–#${chunkEnd} of #${scanEnd}...`, cls: 'info' })
 
         for (let base = scanStart; base <= chunkEnd; base += concurrency) {
           const ids: number[] = []
@@ -130,18 +129,18 @@ export async function POST(req: NextRequest) {
               send('log', { msg: `#${ids[i]}  ${o.orderDate}  ${o.value}  ${o.payment}  ${o.location}  ${o.pincode}`, cls: 'ok' })
             }
           }
-          send('progress', { done: scanned, total: scanEnd - (body.scanStart || scanStart) + 1, found: matched })
-          await sleep(rlStreak > 3 ? Math.min(rlStreak * 1500, 15000) : 250)
+          send('progress', { done: scanned, total: scanEnd - (body.originalStart || scanStart) + 1, found: matched })
+          await sleep(rlStreak > 3 ? Math.min(rlStreak * 1500, 10000) : 250)
         }
 
         if (chunkEnd < scanEnd) {
-          // More chunks needed — tell client to call again
-          send('chunk_done', { 
-            nextStart: chunkEnd + 1, 
-            scanEnd, 
-            matched, 
-            orders,
-            runId: body.runId || Date.now().toString()
+          send('chunk_done', {
+            nextStart: chunkEnd + 1,
+            scanEnd,
+            originalStart: body.originalStart || scanStart,
+            fromDate, toDate,
+            runId: body.runId || Date.now().toString(),
+            chunkOrders: orders
           })
         } else {
           send('done', { matched: orders.length, scanned, runId: body.runId || Date.now().toString() })
@@ -151,7 +150,7 @@ export async function POST(req: NextRequest) {
       send('error', { msg: err.message })
       send('done', { matched: 0, scanned: 0, runId: Date.now().toString() })
     } finally {
-      clearInterval(heartbeatInterval)
+      clearInterval(heartbeat)
       writer.close().catch(() => {})
     }
   })()
