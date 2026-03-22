@@ -7,14 +7,15 @@ export const maxDuration = 300
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
 // Find nearest brand order within ±range IDs of a given ID
-async function findNearestBrandOrder(subdomain: string, slug: string, id: number, range = 150) {
-  for (let d = 0; d <= range; d += 5) {
+// Uses step of 10 to reduce API calls — at 10 IDs/step, ±50 = only 10 probes max
+async function findNearestBrandOrder(subdomain: string, slug: string, id: number, range = 50) {
+  for (let d = 0; d <= range; d += 10) {
     for (const p of d === 0 ? [id] : [id + d, id - d]) {
       if (p < 1) continue
       const o = await fetchOrder(subdomain, p)
       if (o && o !== 'rl' && o.slug === slug && o.dateYMD) return o
     }
-    if (d > 0) await sleep(20)
+    if (d > 0) await sleep(50)
   }
   return null
 }
@@ -65,7 +66,7 @@ async function findBoundary(
     hi = lastKnownId
     for (let i = 1; i <= 200; i++) {
       const probeId = lastKnownId + i * STEP
-      const o = await findNearestBrandOrder(subdomain, slug, probeId, 100)
+      const o = await findNearestBrandOrder(subdomain, slug, probeId, 50)
       if (!o) continue
       send(`  Walk: #${o.orderId} = ${o.orderDate}`)
       if (o.dateYMD! >= target) {
@@ -82,7 +83,7 @@ async function findBoundary(
     lo = Math.max(1, lastKnownId)
     for (let i = 1; i <= 200; i++) {
       const probeId = Math.max(1, lastKnownId - i * STEP)
-      const o = await findNearestBrandOrder(subdomain, slug, probeId, 100)
+      const o = await findNearestBrandOrder(subdomain, slug, probeId, 50)
       if (!o) continue
       send(`  Walk: #${o.orderId} = ${o.orderDate}`)
       if (o.dateYMD! <= target) {
@@ -103,7 +104,7 @@ async function findBoundary(
 
   for (let steps = 0; steps < 25 && blo <= bhi; steps++) {
     const mid = Math.floor((blo + bhi) / 2)
-    const found = await findNearestBrandOrder(subdomain, slug, mid, 150)
+    const found = await findNearestBrandOrder(subdomain, slug, mid, 50)
     if (!found) {
       if (mode === 'first') blo = mid + 151; else bhi = mid - 151
       continue
