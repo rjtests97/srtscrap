@@ -291,7 +291,7 @@ export default function App() {
           {tab==='manual'&&<ManualTab activeBrand={activeBrand} isScanning={isScanning} scanLog={scanLog} progress={progress} eta={eta} logRef={logRef} lastOrders={lastOrders} onStart={startScan} onStop={stopScan}/>}
           {tab==='analytics'&&<AnalyticsTab analytics={analytics}/>}
           {tab==='history'&&<HistoryTab runs={runs} brandName={activeBrand.name} onClear={()=>{localStorage.removeItem(`runs_${activeBrand.id}`);setRuns([]);setLastOrders([]);setAnalytics(null)}}/>}
-          {tab==='settings'&&<SettingsTab brands={brands} activeBrand={activeBrand} onDelete={deleteBrand} onUpdate={(u:Brand)=>{const all=brands.map(b=>b.id===u.id?u:b);setBrands(all);LS.set('brands',all);setActiveBrand(u)}}/>}
+          {tab==='settings'&&<SettingsTab brands={brands} activeBrand={activeBrand} runs={runs} onDelete={deleteBrand} onUpdate={(u:Brand)=>{const all=brands.map(b=>b.id===u.id?u:b);setBrands(all);LS.set('brands',all);setActiveBrand(u)}}/>}
         </>
       )}
     </div>
@@ -457,7 +457,10 @@ function ManualTab({activeBrand,isScanning,scanLog,progress,eta,logRef,lastOrder
       {useAuto&&(
         <div style={{marginBottom:10}}>
           <label style={lbl}>Stop after N misses</label>
-          <input type="number" value={stopAfter} onChange={e=>setStopAfter(e.target.value)} style={{...inp,width:100}}/>
+          <div style={{display:'flex',alignItems:'center',gap:8}}>
+            <input type="number" value={stopAfter} onChange={e=>setStopAfter(e.target.value)} style={{...inp,width:100}}/>
+            <span style={{fontSize:9,color:'var(--muted)'}}>Tip: use {parseInt(conc)*50}+ at {conc}x concurrency (rate limits look like misses)</span>
+          </div>
         </div>
       )}
       <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:12,fontSize:11,color:'var(--muted)'}}>
@@ -556,10 +559,90 @@ function HistoryTab({runs,brandName,onClear}:{runs:ScanRun[],brandName:string,on
 }
 
 // ── Settings Tab ──────────────────────────────────────
-function SettingsTab({brands,activeBrand,onDelete,onUpdate}:any){
+function SettingsTab({brands,activeBrand,onDelete,onUpdate,runs}:any){
+  const [sheetsUrl,setSheetsUrl]=useState(()=>LS.get(`sheets_${activeBrand?.id}`,''))
+  const [sheetsStatus,setSheetsStatus]=useState('')
+  const [syncing,setSyncing]=useState(false)
+
+  async function saveSheets(){LS.set(`sheets_${activeBrand.id}`,sheetsUrl);setSheetsStatus('✓ URL saved')}
+
+  async function testSheets(){
+    if(!sheetsUrl){setSheetsStatus('⚠ Enter a URL first');return}
+    setSyncing(true);setSheetsStatus('Testing...')
+    try{
+      const res=await fetch(sheetsUrl,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({orders:[{orderId:'TEST',orderDate:'test',value:'Rs.1',payment:'test',status:'test',location:'test',pincode:'000000'}],mode:'test'})})
+      const d=await res.json();setSheetsStatus(d.ok?'✓ Connected!':'⚠ Error: '+JSON.stringify(d))
+    }catch(e:any){setSheetsStatus('⚠ '+e.message)}
+    setSyncing(false)
+  }
+
+  async function syncToSheets(mode:'append'|'replace'){
+    if(!sheetsUrl){setSheetsStatus('⚠ Save URL first');return}
+    const allOrders=runs.flatMap((r:ScanRun)=>r.orders)
+    if(!allOrders.length){setSheetsStatus('⚠ No orders to sync');return}
+    setSyncing(true);setSheetsStatus(`Syncing ${allOrders.length} orders...`)
+    const BATCH=200;let added=0
+    for(let i=0;i<allOrders.length;i+=BATCH){
+      const batch=allOrders.slice(i,i+BATCH)
+      try{
+        const res=await fetch(sheetsUrl,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({orders:batch,mode:i===0?mode:'append'})})
+        const d=await res.json();if(d.ok)added+=d.added||0
+      }catch(e:any){setSheetsStatus('⚠ Sync error: '+e.message);setSyncing(false);return}
+      await new Promise(r=>setTimeout(r,500))
+    }
+    setSheetsStatus(`✓ Synced ${added} rows to Sheets`)
+    setSyncing(false)
+  }
+
+  const inp={width:'100%',padding:'8px 10px',fontSize:11,background:'var(--surface)',border:'1px solid var(--border)',color:'var(--text)',borderRadius:6,fontFamily:'inherit',outline:'none'}
+  const lbl={fontSize:9,color:'var(--muted)',letterSpacing:'.08em',textTransform:'uppercase' as const,display:'block' as const,marginBottom:4}
+  const btn=(extra:any={})=>({background:'var(--surface)',border:'1px solid var(--border)',color:'var(--text)',padding:'8px 12px',borderRadius:6,fontSize:10,fontWeight:700,fontFamily:'inherit',cursor:'pointer',...extra})
+
   return(
     <div>
-      <div style={{fontSize:9,color:'var(--muted)',textTransform:'uppercase',letterSpacing:'.08em',marginBottom:10}}>Manage Brands</div>
+      {/* Google Sheets */}
+      <div style={{background:'var(--surface)',border:'1px solid var(--border)',borderRadius:8,padding:14,marginBottom:12}}>
+        <div style={{fontSize:10,fontWeight:700,color:'var(--accent)',marginBottom:10,letterSpacing:'.06em',textTransform:'uppercase'}}>Google Sheets Sync</div>
+        <div style={{fontSize:9,color:'var(--muted)',marginBottom:10,lineHeight:1.8}}>
+          1. Open <a href="https://script.google.com" target="_blank" style={{color:'var(--accent)'}}>Google Apps Script</a><br/>
+          2. New project → paste the Apps Script code below → Deploy as web app<br/>
+          3. Copy the deployment URL and paste it here
+        </div>
+        <details style={{marginBottom:10}}>
+          <summary style={{fontSize:9,color:'var(--muted)',cursor:'pointer',marginBottom:6}}>Show Apps Script code ▼</summary>
+          <pre style={{background:'var(--surface2)',border:'1px solid var(--border)',borderRadius:4,padding:8,fontSize:8,color:'var(--muted)',overflow:'auto',maxHeight:200,lineHeight:1.6}}>{`function doPost(e) {
+  try {
+    const data = JSON.parse(e.postData.contents);
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    let sheet = ss.getSheetByName('Orders') || ss.insertSheet('Orders');
+    if (data.mode === 'replace' || sheet.getLastRow() === 0) {
+      sheet.clearContents();
+      sheet.appendRow(['Order ID','Date','Time','Value','Payment','Status','Location','Pincode']);
+    }
+    data.orders.forEach(o => {
+      sheet.appendRow([o.orderId,o.orderDate,o.orderTime,o.value,o.payment,o.status,o.location,o.pincode]);
+    });
+    return ContentService.createTextOutput(JSON.stringify({ok:true,added:data.orders.length})).setMimeType(ContentService.MimeType.JSON);
+  } catch(e) {
+    return ContentService.createTextOutput(JSON.stringify({ok:false,error:e.message})).setMimeType(ContentService.MimeType.JSON);
+  }
+}`}</pre>
+        </details>
+        <div style={{marginBottom:8}}>
+          <label style={lbl}>Apps Script Webhook URL</label>
+          <input value={sheetsUrl} onChange={ev=>setSheetsUrl(ev.target.value)} placeholder="https://script.google.com/macros/s/.../exec" style={inp}/>
+        </div>
+        {sheetsStatus&&<div style={{fontSize:10,padding:'6px 8px',borderRadius:4,marginBottom:8,background:sheetsStatus.startsWith('✓')?'#00ff8815':'#ff444415',color:sheetsStatus.startsWith('✓')?'var(--accent)':'var(--red)',border:`1px solid ${sheetsStatus.startsWith('✓')?'var(--accent)':'var(--red)'}`}}>{sheetsStatus}</div>}
+        <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
+          <button onClick={saveSheets} style={btn()}>Save URL</button>
+          <button onClick={testSheets} disabled={syncing} style={btn()}>Test Connection</button>
+          <button onClick={()=>syncToSheets('append')} disabled={syncing} style={btn({color:'var(--accent)',borderColor:'var(--accent)'})}>↑ Sync (Append)</button>
+          <button onClick={()=>syncToSheets('replace')} disabled={syncing} style={btn({color:'var(--warn)',borderColor:'var(--warn)'})}>↺ Sync (Replace)</button>
+        </div>
+      </div>
+
+      {/* Manage Brands */}
+      <div style={{fontSize:9,color:'var(--muted)',textTransform:'uppercase',letterSpacing:'.08em',marginBottom:8}}>Manage Brands</div>
       {brands.map((b:Brand)=>(
         <div key={b.id} style={{background:'var(--surface)',border:`1px solid ${b.id===activeBrand.id?'var(--accent)':'var(--border)'}`,borderRadius:8,padding:12,marginBottom:8}}>
           <div style={{fontWeight:700,color:'var(--accent)',fontSize:12,marginBottom:2}}>{b.name}</div>
@@ -569,10 +652,9 @@ function SettingsTab({brands,activeBrand,onDelete,onUpdate}:any){
           <button onClick={()=>onDelete(b.id)} style={{background:'none',border:'1px solid var(--red)',color:'var(--red)',padding:'5px 12px',borderRadius:4,fontSize:9,fontWeight:700,fontFamily:'inherit',cursor:'pointer'}}>Delete Brand</button>
         </div>
       ))}
-      <div style={{marginTop:16,padding:12,background:'var(--surface)',border:'1px solid var(--border)',borderRadius:8,fontSize:9,color:'var(--muted)',lineHeight:2}}>
+      <div style={{marginTop:12,padding:12,background:'var(--surface)',border:'1px solid var(--border)',borderRadius:8,fontSize:9,color:'var(--muted)',lineHeight:2}}>
         <div style={{color:'var(--accent)',fontWeight:700,marginBottom:4,fontSize:10}}>About</div>
-        Data stored in browser localStorage · No external database needed<br/>
-        Scraping runs via Vercel Edge Functions (server-side, different IPs)<br/>
+        Data in browser localStorage · Scraping via Vercel Edge (server-side IPs)<br/>
         Free forever · by RahulJ
       </div>
     </div>
