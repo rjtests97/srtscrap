@@ -203,46 +203,9 @@ export default function App() {
     }
 
     try{
-      let initialScanStart: number
-      let initialScanEnd: number
-      let totalSpan: number
-
-      if(base.mode==='date' && !base.scanStart){
-        // Step 1: Find boundaries via separate fast call
-        addLog(`Finding boundaries for ${base.fromDate} → ${base.toDate}...`,'info')
-        const boundsRes = await fetch('/api/bounds',{
-          method:'POST', headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({
-            subdomain:active.subdomain, slug:active.slug,
-            anchorId:active.anchorId, anchorDate:active.anchorDate,
-            regressionPoints:active.regressionPoints,
-            fromDate:base.fromDate, toDate:base.toDate
-          }), signal:ab.signal
-        })
-        if(!boundsRes.ok) throw new Error('Bounds detection failed')
-        const bounds = await boundsRes.json()
-        initialScanStart = bounds.scanStart
-        initialScanEnd   = bounds.scanEnd
-        totalSpan        = bounds.total
-        totalRef.val     = totalSpan
-        setProgress({done:0, total:totalSpan, found:0})
-        addLog(`Range: #${initialScanStart}–#${initialScanEnd} (${totalSpan} IDs)`, 'ok')
-      } else {
-        initialScanStart = base.scanStart || base.startId
-        initialScanEnd   = base.scanEnd   || base.endId || (base.startId+50000)
-        totalSpan        = base.totalSpan || (initialScanEnd - initialScanStart + 1)
-        totalRef.val     = totalSpan
-      }
-
-      // Step 2: Scan in chunks
-      let currentParams:any = {
-        ...base,
-        scanStart: initialScanStart,
-        scanEnd:   initialScanEnd,
-        originalStart: initialScanStart,
-        totalSpan,
-        runId: Date.now().toString()
-      }
+      // First call includes boundary detection. Subsequent calls are pure scan chunks.
+      let currentParams:any = { ...base, runId: Date.now().toString() }
+      let initialised = false
 
       while(!ab.signal.aborted){
         const res = await fetch('/api/scan',{
@@ -252,27 +215,28 @@ export default function App() {
         if(!res.ok||!res.body) throw new Error(`HTTP ${res.status}`)
 
         const chunk = await processStream(res)
+
+        if(!initialised){ initialised=true }
         if(chunk===null) break // fully done
+        if(!chunk?.nextStart){ break }
 
-        if(!chunk?.nextStart){ addLog('Scan complete','info'); break }
-
-        // Next chunk
+        // Continue with next chunk
         currentParams = {
           ...base,
-          mode:         chunk.mode || base.mode || 'date',
-          scanStart:    chunk.nextStart,
-          scanEnd:      chunk.scanEnd,
-          originalStart:chunk.originalStart || initialScanStart,
-          totalSpan:    chunk.totalSpan || totalSpan,
-          fromDate:     chunk.fromDate || base.fromDate,
-          toDate:       chunk.toDate   || base.toDate,
-          startId:      chunk.startId  || base.startId,
-          endId:        chunk.endId    || base.endId,
-          useAuto:      chunk.useAuto  !== undefined ? chunk.useAuto : base.useAuto,
-          stopAfter:    chunk.stopAfter || base.stopAfter,
-          runId:        chunk.runId
+          mode:          chunk.mode        || base.mode || 'date',
+          scanStart:     chunk.nextStart,
+          scanEnd:       chunk.scanEnd,
+          originalStart: chunk.originalStart,
+          totalSpan:     chunk.totalSpan   || totalRef.val,
+          fromDate:      chunk.fromDate    || base.fromDate,
+          toDate:        chunk.toDate      || base.toDate,
+          startId:       chunk.startId     || base.startId,
+          endId:         chunk.endId       || base.endId,
+          useAuto:       chunk.useAuto     !== undefined ? chunk.useAuto : base.useAuto,
+          stopAfter:     chunk.stopAfter   || base.stopAfter,
+          runId:         chunk.runId
         }
-        addLog(`→ ${allOrders.length} found, continuing from #${chunk.nextStart}...`,'info')
+        addLog(`→ ${allOrders.length} found, next chunk from #${chunk.nextStart}...`,'info')
       }
 
       const dates=allOrders.map(r=>r.dateYMD).filter(Boolean).sort()
