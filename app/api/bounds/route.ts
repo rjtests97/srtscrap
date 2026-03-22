@@ -12,73 +12,79 @@ export async function POST(req: NextRequest) {
   const encoder = new TextEncoder()
   const { readable, writable } = new TransformStream()
   const writer = writable.getWriter()
-
   const send = (type: string, data: any) => {
     try { writer.write(encoder.encode(`data: ${JSON.stringify({ type, ...data })}\n\n`)) } catch {}
   }
-
   const ping = setInterval(() => {
     try { writer.write(encoder.encode(': ping\n\n')) } catch {}
   }, 4000)
 
   ;(async () => {
     try {
-      const pts = [{ date: anchorDate, id: anchorId }, ...(regressionPoints||[])]
-        .filter((p:any) => p.date && p.id > 0)
-        .sort((a:any, b:any) => a.date.localeCompare(b.date))
+      // All known reference points sorted by date
+      const pts = [{ date: anchorDate, id: anchorId }, ...(regressionPoints || [])]
+        .filter((p: any) => p.date && p.id > 0)
+        .sort((a: any, b: any) => a.date.localeCompare(b.date))
 
-      const closest = (targetDate: string) => {
-        let best = pts[0]
-        for (const p of pts) {
-          const da = Math.abs(new Date(p.date+'T00:00:00').getTime() - new Date(targetDate+'T00:00:00').getTime())
-          const db = Math.abs(new Date(best.date+'T00:00:00').getTime() - new Date(targetDate+'T00:00:00').getTime())
-          if (da < db) best = p
-        }
-        return best
+      // Single forward walk from anchor — finds BOTH boundaries in one pass
+      // As we walk forward, we note when we cross fromDate and toDate
+      send('log', { msg: `Walking from #${anchorId} (${anchorDate})...`, cls: 'info' })
+
+      // Find best starting point (closest known to fromDate)
+      let best = pts[0]
+      for (const p of pts) {
+        const da = Math.abs(new Date(p.date+'T00:00:00').getTime() - new Date(fromDate+'T00:00:00').getTime())
+        const db = Math.abs(new Date(best.date+'T00:00:00').getTime() - new Date(fromDate+'T00:00:00').getTime())
+        if (da < db) best = p
       }
 
-      // Walk from ref toward targetDate, return bracket {lo, hi}
-      // lo = last brand ID before targetDate
-      // hi = first brand ID on/after targetDate
-      const walk = async (targetDate: string) => {
-        const ref = closest(targetDate)
-        const forward = targetDate > ref.date
-        let lo = ref.id, hi = ref.id
+      const forward = fromDate >= best.date
+      let fromLo = best.id, fromHi = best.id
+      let toLo   = best.id, toHi   = best.id
+      let foundFrom = false, foundTo = false
 
-        send('log', { msg: `Walking ${forward?'forward':'backward'} from #${ref.id} (${ref.date}) → ${targetDate}`, cls: 'info' })
+      for (let i = 1; i <= 300 && !(foundFrom && foundTo); i++) {
+        const pid = forward ? best.id + i * 500 : Math.max(1, best.id - i * 500)
+        const o = await fetchOrder(subdomain, pid)
 
-        for (let i = 1; i <= 300; i++) {
-          const pid = forward ? ref.id + i*500 : Math.max(1, ref.id - i*500)
-          const o = await fetchOrder(subdomain, pid)
-          if (o && o !== 'rl' && o.slug === slug && o.dateYMD) {
-            send('log', { msg: `  #${o.orderId} = ${o.orderDate}`, cls: 'info' })
-            if (forward) {
-              if (o.dateYMD >= targetDate) { hi = o.orderId; break }
-              lo = o.orderId
-            } else {
-              if (o.dateYMD < targetDate) { lo = o.orderId; break }
-              hi = o.orderId
+        if (o && o !== 'rl' && o.slug === slug && o.dateYMD) {
+          send('log', { msg: `  #${o.orderId} = ${o.orderDate}`, cls: 'info' })
+
+          if (forward) {
+            // Looking for fromDate bracket
+            if (!foundFrom) {
+              if (o.dateYMD >= fromDate) { fromHi = o.orderId; foundFrom = true }
+              else fromLo = o.orderId
+            }
+            // Looking for toDate bracket (always after fromDate)
+            if (!foundTo) {
+              if (o.dateYMD > toDate) { toHi = o.orderId; foundTo = true }
+              else toLo = o.orderId
+            }
+          } else {
+            if (!foundFrom) {
+              if (o.dateYMD < fromDate) { fromLo = o.orderId; foundFrom = true }
+              else fromHi = o.orderId
+            }
+            if (!foundTo) {
+              if (o.dateYMD < fromDate) { toLo = o.orderId; foundTo = true }
+              else toHi = o.orderId
             }
           }
-          await sleep(50)
-          if (!forward && pid <= 1) break
         }
-        return { lo, hi }
+        await sleep(50)
+        if (!forward && pid <= 1) break
       }
 
-      const fromB = await walk(fromDate)
-      const toB   = await walk(toDate)
-
-      const scanStart = Math.max(1, fromB.lo - 50)
-      const scanEnd   = toB.hi + 50
+      const scanStart = Math.max(1, fromLo - 50)
+      const scanEnd   = toHi + 50
       const total     = scanEnd - scanStart + 1
 
-      send('log', { msg: `Range: #${scanStart}–#${scanEnd} (${total} IDs)`, cls: 'ok' })
+      send('log', { msg: `✓ #${scanStart}–#${scanEnd} (${total} IDs)`, cls: 'ok' })
       send('result', { scanStart, scanEnd, total })
 
     } catch (err: any) {
-      send('error', { msg: err.message })
-      send('result', { scanStart: 0, scanEnd: 0, total: 0 })
+      send('error', { msg: String(err.message || err) })
     } finally {
       clearInterval(ping)
       writer.close().catch(() => {})
