@@ -199,25 +199,37 @@ export default function App() {
       let totalIds: number
 
       if(mode==='date'){
-        // Step 1: find boundaries via dedicated call
-        addLog(`Finding boundaries for ${fromDate} → ${toDate}...`, 'info')
-        const br = await fetch('/api/bounds',{
-          method:'POST', headers:{'Content-Type':'application/json'},
-          signal: ab.signal,
-          body: JSON.stringify({
-            subdomain:brand.subdomain, slug:brand.slug,
-            anchorId:brand.anchorId, anchorDate:brand.anchorDate,
-            regressionPoints:brand.regressionPoints||[],
-            fromDate, toDate
-          })
+        // Step 1: find boundaries via streaming SSE (keeps connection alive, avoids timeout)
+        addLog('Finding boundaries...', 'info')
+        const boundsResult = await new Promise<{scanStart:number,scanEnd:number,total:number}>((resolve,reject)=>{
+          fetch('/api/bounds',{method:'POST',headers:{'Content-Type':'application/json'},signal:ab.signal,
+            body:JSON.stringify({subdomain:brand.subdomain,slug:brand.slug,anchorId:brand.anchorId,
+              anchorDate:brand.anchorDate,regressionPoints:brand.regressionPoints||[],fromDate,toDate})
+          }).then(br=>{
+            if(!br.ok||!br.body){reject(new Error('Bounds HTTP '+br.status));return}
+            const reader=br.body.getReader(),dec=new TextDecoder()
+            let buf=''
+            const read=()=>reader.read().then(({done,value})=>{
+              if(done){reject(new Error('Bounds stream ended'));return}
+              buf+=dec.decode(value,{stream:true})
+              const lines=buf.split('\n');buf=lines.pop()||''
+              for(const line of lines){
+                if(!line.startsWith('data: '))continue
+                try{const d=JSON.parse(line.slice(6))
+                  if(d.type==='log')addLog(d.msg,d.cls||'')
+                  else if(d.type==='error'){reader.releaseLock();reject(new Error(d.msg));return}
+                  else if(d.type==='result'){reader.releaseLock();resolve(d);return}
+                }catch{}
+              }
+              read()
+            }).catch(reject)
+            read()
+          }).catch(reject)
         })
-        if(!br.ok) throw new Error(`Bounds failed: HTTP ${br.status}`)
-        const bounds = await br.json()
-        scanStart = bounds.scanStart
-        scanEnd   = bounds.scanEnd
-        totalIds  = bounds.total
-        addLog(`Range: #${scanStart}–#${scanEnd} (${totalIds} IDs)`, 'ok')
-        setProgress({done:0, total:totalIds, found:0})
+        scanStart = boundsResult.scanStart
+        scanEnd   = boundsResult.scanEnd
+        totalIds  = boundsResult.total
+        setProgress({done:0,total:totalIds,found:0})
       } else {
         scanStart = startId
         scanEnd   = useAuto ? startId+50000 : endId
