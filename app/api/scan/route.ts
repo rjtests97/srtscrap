@@ -6,17 +6,20 @@ export const maxDuration = 60
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
-const CHUNK = 1000 // IDs per call
+// How many IDs to scan per server call
+// At concurrency=5, ~20 IDs/sec, 50s usable = 1000 IDs max. Use 800 to be safe.
+const IDS_PER_CHUNK = 800
 
 export async function POST(req: NextRequest) {
   const body = await req.json()
   const {
     subdomain, slug, concurrency = 5,
-    fromDate, toDate,
-    scanStart, scanEnd, originalStart, totalSpan, runId,
+    // Date scan params
+    fromDate, toDate, scanStart, scanEnd,
+    // Manual scan params  
     startId, endId, useAuto = false, stopAfter = 200,
-    anchorId, anchorDate, regressionPoints = [],
-    mode = 'date'
+    // Shared
+    mode = 'date', runId
   } = body
 
   const encoder = new TextEncoder()
@@ -24,85 +27,69 @@ export async function POST(req: NextRequest) {
   const writer = writable.getWriter()
 
   const send = (type: string, data: any) => {
-    try { writer.write(encoder.encode(`data: ${JSON.stringify({ type, ...data })}\n\n`)) } catch {}
+    try {
+      writer.write(encoder.encode(`data: ${JSON.stringify({ type, ...data })}\n\n`))
+    } catch {}
   }
+
+  // Keepalive ping every 5s so Vercel doesn't close idle connection
   const ping = setInterval(() => {
     try { writer.write(encoder.encode(': ping\n\n')) } catch {}
   }, 5000)
 
   ;(async () => {
     try {
-      const orders: any[] = []
-      let scanned = 0, matched = 0, rlStreak = 0
+      if (mode === 'manual') {
+        // ── Manual scan ──────────────────────────────────
+        const chunkEnd = Math.min(scanStart + IDS_PER_CHUNK - 1, scanEnd)
+        send('log', { msg: `Scanning #${scanStart}–#${chunkEnd}`, cls: 'info' })
 
-      // ── Walk from a known point to bracket a target date ──
-      const walk = async (targetDate: string, label: string) => {
-        const pts = [{ date: anchorDate, id: anchorId }, ...regressionPoints]
-          .filter((p: any) => p.date && p.id > 0)
-          .sort((a: any, b: any) => a.date.localeCompare(b.date))
+        const orders: any[] = []
+        let scanned = 0, matched = 0, misses = 0, stopped = false
 
-        // Pick closest known point to target
-        let ref = pts[0]
-        for (const p of pts) {
-          if (Math.abs(new Date(p.date + 'T00:00:00').getTime() - new Date(targetDate + 'T00:00:00').getTime()) <
-              Math.abs(new Date(ref.date + 'T00:00:00').getTime() - new Date(targetDate + 'T00:00:00').getTime())) ref = p
-        }
+        for (let base = scanStart; base <= chunkEnd && !stopped; base += concurrency) {
+          const ids = Array.from({ length: Math.min(concurrency, chunkEnd - base + 1) }, (_, i) => base + i)
+          const results = await Promise.all(ids.map(id => fetchOrder(subdomain, id)))
 
-        send('log', { msg: `  Walk ${label}: from #${ref.id} (${ref.date}) → ${targetDate}`, cls: 'info' })
-
-        const forward = targetDate >= ref.date
-        let lo = ref.id, hi = ref.id
-
-        for (let i = 1; i <= 500; i++) {
-          const pid = forward ? ref.id + i * 500 : Math.max(1, ref.id - i * 500)
-          if (pid < 1) break
-          const o = await fetchOrder(subdomain, pid)
-          if (o && o !== 'rl' && o.slug === slug && o.dateYMD) {
-            send('log', { msg: `    #${o.orderId} = ${o.orderDate}`, cls: 'info' })
-            if (forward) {
-              if (o.dateYMD >= targetDate) { hi = o.orderId; break }
-              lo = o.orderId
-            } else {
-              if (o.dateYMD <= targetDate) { lo = o.orderId; break }
-              hi = o.orderId
+          for (let i = 0; i < ids.length && !stopped; i++) {
+            const o = results[i]; scanned++
+            if (o && o !== 'rl' && o.slug === slug) {
+              orders.push(o); matched++; misses = 0
+              send('order', { order: o })
+              send('log', { msg: `#${ids[i]}  ${o.orderDate}  ${o.value}  ${o.payment}  ${o.location}`, cls: 'ok' })
+            } else if (o !== 'rl') {
+              misses++
+              if (useAuto && misses >= stopAfter) {
+                send('log', { msg: `Auto-stopped: ${stopAfter} consecutive misses`, cls: 'info' })
+                stopped = true
+              }
             }
           }
-          // No delay — walk as fast as possible
+          send('progress', { scanned: scanStart + scanned - 1, found: matched })
+          await sleep(250)
         }
-        return { lo, hi }
-      }
 
-      // ── Date scan ──────────────────────────────────────────
-      if (mode === 'date') {
-        let ss: number, se: number, ts: number
-
-        if (scanStart && scanEnd) {
-          // Resuming a chunk — no boundary detection needed
-          ss = scanStart; se = scanEnd
-          ts = totalSpan || (se - ss + 1)
+        if (!stopped && chunkEnd < scanEnd) {
+          // More chunks to go
+          send('next', { nextStart: chunkEnd + 1, scanEnd, matched, orders })
         } else {
-          // First call — detect boundaries sequentially (not parallel, to avoid rate limits)
-          send('log', { msg: `Finding boundaries for ${fromDate} → ${toDate}...`, cls: 'info' })
-          const fromB = await walk(fromDate, 'start')
-          const toB   = await walk(toDate,   'end')
-          ss = Math.max(1, fromB.lo - 100)
-          se = toB.hi + 100
-          ts = se - ss + 1
-          send('log', { msg: `Range: #${ss}–#${se} (${ts} IDs)`, cls: 'ok' })
-          send('range', { scanStart: ss, scanEnd: se, total: ts })
+          send('done', { orders })
         }
 
-        send('start', { total: ts, scanStart: ss, scanEnd: se })
+      } else {
+        // ── Date scan ────────────────────────────────────
+        const chunkEnd = Math.min(scanStart + IDS_PER_CHUNK - 1, scanEnd)
+        send('log', { msg: `Scanning #${scanStart}–#${chunkEnd} of #${scanEnd}`, cls: 'info' })
 
-        const chunkEnd = Math.min(ss + CHUNK - 1, se)
-        send('log', { msg: `Scanning #${ss}–#${chunkEnd}...`, cls: 'info' })
+        const orders: any[] = []
+        let scanned = 0, matched = 0, rlStreak = 0
 
-        for (let base = ss; base <= chunkEnd; base += concurrency) {
-          const ids: number[] = []
-          for (let id = base; id <= Math.min(base + concurrency - 1, chunkEnd); id++) ids.push(id)
-          const fetched = await Promise.all(ids.map(id => fetchOrder(subdomain, id)))
+        for (let base = scanStart; base <= chunkEnd; base += concurrency) {
+          const ids = Array.from({ length: Math.min(concurrency, chunkEnd - base + 1) }, (_, i) => base + i)
+          const results = await Promise.all(ids.map(id => fetchOrder(subdomain, id)))
+
           for (let i = 0; i < ids.length; i++) {
-            const o = fetched[i]; scanned++
+            const o = results[i]; scanned++
             if (o === 'rl') { rlStreak++; continue }
             rlStreak = Math.max(0, rlStreak - 1)
             if (o && o.slug === slug && o.dateYMD && o.dateYMD >= fromDate && o.dateYMD <= toDate) {
@@ -111,76 +98,21 @@ export async function POST(req: NextRequest) {
               send('log', { msg: `#${ids[i]}  ${o.orderDate}  ${o.value}  ${o.payment}  ${o.location}  ${o.pincode}`, cls: 'ok' })
             }
           }
-          const globalDone = (originalStart || ss) + scanned
-          send('progress', { done: globalDone, total: ts, found: matched })
-          await sleep(rlStreak > 3 ? Math.min(rlStreak * 1500, 10000) : 200)
+          send('progress', { scanned: scanStart + scanned - 1, found: matched })
+          await sleep(rlStreak > 3 ? Math.min(rlStreak * 1500, 12000) : 250)
         }
 
-        if (chunkEnd < se) {
-          send('chunk_done', {
-            mode: 'date',
-            nextStart: chunkEnd + 1, scanEnd: se,
-            originalStart: originalStart || ss,
-            totalSpan: ts, fromDate, toDate,
-            runId: runId || Date.now().toString(),
-            chunkOrders: orders
-          })
+        if (chunkEnd < scanEnd) {
+          // More chunks to go — tell client to call again with nextStart
+          send('next', { nextStart: chunkEnd + 1, scanEnd, matched, orders })
         } else {
-          send('done', { matched: orders.length, scanned, runId: runId || Date.now().toString() })
-        }
-
-      // ── Manual scan ────────────────────────────────────────
-      } else {
-        const ss = scanStart || startId
-        const se = scanEnd   || (useAuto ? startId + 50000 : endId)
-        const ts = totalSpan || (useAuto ? 0 : endId - startId + 1)
-        const chunkEnd = Math.min(ss + CHUNK - 1, se)
-
-        send('log', { msg: `Manual #${ss}–#${chunkEnd} | ${concurrency}x`, cls: 'info' })
-        send('start', { total: ts })
-
-        let misses = 0, stopped = false
-        for (let base = ss; base <= chunkEnd && !stopped; base += concurrency) {
-          const ids: number[] = []
-          for (let id = base; id <= Math.min(base + concurrency - 1, chunkEnd); id++) ids.push(id)
-          const fetched = await Promise.all(ids.map(id => fetchOrder(subdomain, id)))
-          for (let i = 0; i < ids.length && !stopped; i++) {
-            const o = fetched[i]; scanned++
-            if (o && o !== 'rl' && o.slug === slug) {
-              orders.push(o); matched++; misses = 0
-              send('order', { order: o })
-              send('log', { msg: `#${ids[i]}  ${o.orderDate}  ${o.value}  ${o.payment}  ${o.location}`, cls: 'ok' })
-            } else if (o !== 'rl') {
-              misses++
-            }
-            if (useAuto && misses >= stopAfter) {
-              send('log', { msg: `Auto-stopped: ${stopAfter} consecutive misses`, cls: 'info' })
-              stopped = true
-            }
-          }
-          const globalDone = (originalStart || ss) + scanned
-          send('progress', { done: globalDone, total: ts, found: matched })
-          await sleep(200)
-        }
-
-        if (!stopped && chunkEnd < se) {
-          send('chunk_done', {
-            mode: 'manual',
-            nextStart: chunkEnd + 1, scanEnd: se,
-            originalStart: originalStart || ss,
-            totalSpan: ts, startId, endId, useAuto, stopAfter,
-            fromDate, toDate,
-            runId: runId || Date.now().toString(),
-            chunkOrders: orders
-          })
-        } else {
-          send('done', { matched: orders.length, scanned, runId: runId || Date.now().toString() })
+          send('done', { orders })
         }
       }
 
     } catch (err: any) {
       send('error', { msg: err.message })
-      send('done', { matched: 0, scanned: 0, runId: runId || Date.now().toString() })
+      send('done', { orders: [] })
     } finally {
       clearInterval(ping)
       writer.close().catch(() => {})

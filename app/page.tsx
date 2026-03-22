@@ -79,6 +79,7 @@ export default function App() {
   const [progress,setProgress] = useState({done:0,total:0,found:0})
   const [startedAt,setStartedAt] = useState(0)
   const [showAdd,setShowAdd] = useState(false)
+  const [scanLabel,setScanLabel]=useState('')
   const abortRef = useRef<AbortController|null>(null)
   const ordersRef = useRef<Order[]>([])
   const logRef = useRef<HTMLDivElement>(null)
@@ -145,8 +146,6 @@ export default function App() {
     return added
   }
 
-  const [scanLabel,setScanLabel]=useState('')
-
   async function startScan(params:any){
     if(!active||scanning)return
     setScanning(true);setLog([]);setProgress({done:0,total:0,found:0});setStartedAt(Date.now());ordersRef.current=[]
@@ -154,130 +153,124 @@ export default function App() {
     addLog('⚠ Keep this tab active — switching tabs may pause the scan','info')
     const ab=new AbortController();abortRef.current=ab
     const allOrders:Order[]=[]
-    const totalRef={val:0}
-    const label0=params.fromDate?`${params.fromDate} → ${params.toDate}`:params.startId?`#${params.startId} → #${params.endId||'auto'}`:'scan'
-    setScanLabel(label0)
 
-    const base={...params,
-      subdomain:active.subdomain,slug:active.slug,
-      anchorId:active.anchorId,anchorDate:active.anchorDate,
-      avgPerDay:active.avgPerDay,regressionPoints:active.regressionPoints}
-
-    // processStream: reads one SSE response, adds orders, returns chunk_done payload or null
-    const processStream = async (res:Response):Promise<any|null> => {
-      const reader=res.body!.getReader()
-      const dec=new TextDecoder()
-      let buf='', chunkPayload:any=null
-
+    // Read one SSE stream. Returns {done:true} or {done:false, nextStart, scanEnd}
+    const readStream = async (res:Response, totalIds:number): Promise<{done:boolean,nextStart?:number,scanEnd?:number}> => {
+      const reader = res.body!.getReader()
+      const dec = new TextDecoder()
+      let buf = ''
       try {
         while(true){
-          const{done,value}=await reader.read()
-          if(done) break
-          buf+=dec.decode(value,{stream:true})
-          const lines=buf.split('\n'); buf=lines.pop()||''
+          const{done,value} = await reader.read()
+          if(done) return {done:true}
+          buf += dec.decode(value,{stream:true})
+          const lines = buf.split('\n'); buf = lines.pop()||''
           for(const line of lines){
             if(!line.startsWith('data: ')) continue
             try{
-              const d=JSON.parse(line.slice(6))
-              if(d.type==='log')        addLog(d.msg,d.cls||'')
-              else if(d.type==='order') { allOrders.push(d.order); ordersRef.current=[...allOrders] }
-              else if(d.type==='range') { totalRef.val=d.total; setProgress(p=>({...p,total:d.total})) }
-              else if(d.type==='start') { if(d.total&&!totalRef.val){ totalRef.val=d.total; setProgress(p=>({...p,total:d.total})) } }
-              else if(d.type==='progress') setProgress({done:d.done,total:totalRef.val||d.total,found:allOrders.length})
-              else if(d.type==='error') addLog('⚠ '+d.msg,'err')
-              else if(d.type==='chunk_done'){
-                // Merge any orders sent with chunk (server may include them)
-                if(d.chunkOrders){
-                  const existing=new Set(allOrders.map((o:Order)=>o.orderId))
-                  d.chunkOrders.forEach((o:Order)=>{ if(!existing.has(o.orderId)){ allOrders.push(o); ordersRef.current=[...allOrders] } })
-                }
-                chunkPayload=d
+              const d = JSON.parse(line.slice(6))
+              switch(d.type){
+                case 'log':      addLog(d.msg, d.cls||''); break
+                case 'order':    allOrders.push(d.order); ordersRef.current=[...allOrders]; break
+                case 'progress': setProgress({done:d.scanned||0, total:totalIds, found:allOrders.length}); break
+                case 'error':    addLog('⚠ '+d.msg,'err'); break
+                case 'next':
+                  // Server has more chunks — merge orders from this chunk
+                  if(d.orders) d.orders.forEach((o:Order)=>{ if(!allOrders.find(x=>x.orderId===o.orderId)){ allOrders.push(o); ordersRef.current=[...allOrders] } })
+                  return {done:false, nextStart:d.nextStart, scanEnd:d.scanEnd}
+                case 'done':
+                  // Final chunk — merge orders
+                  if(d.orders) d.orders.forEach((o:Order)=>{ if(!allOrders.find(x=>x.orderId===o.orderId)){ allOrders.push(o); ordersRef.current=[...allOrders] } })
+                  return {done:true}
               }
-              else if(d.type==='done') { chunkPayload=null; return null } // null = fully done
             }catch{}
           }
         }
       } finally { reader.releaseLock() }
-
-      return chunkPayload // non-null = more chunks needed
+      return {done:true}
     }
 
     try{
-      const rid = Date.now().toString()
+      const brand = active // capture now, won't change during scan
+      const {fromDate, toDate, startId, endId, useAuto, stopAfter=200, concurrency=5, mode='date'} = params
+
       let scanStart: number
       let scanEnd: number
-      let totalSpan: number
+      let totalIds: number
 
-      if(base.mode==='date'){
-        // Step 1: bounds detection (separate call, separate timeout budget)
-        addLog(`Finding boundaries for ${base.fromDate} → ${base.toDate}...`,'info')
+      if(mode==='date'){
+        // Step 1: find boundaries via dedicated call
+        addLog(`Finding boundaries for ${fromDate} → ${toDate}...`, 'info')
         const br = await fetch('/api/bounds',{
           method:'POST', headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({
-            subdomain:active.subdomain, slug:active.slug,
-            anchorId:active.anchorId, anchorDate:active.anchorDate,
-            regressionPoints:active.regressionPoints||[],
-            fromDate:base.fromDate, toDate:base.toDate
-          }), signal:ab.signal
+          signal: ab.signal,
+          body: JSON.stringify({
+            subdomain:brand.subdomain, slug:brand.slug,
+            anchorId:brand.anchorId, anchorDate:brand.anchorDate,
+            regressionPoints:brand.regressionPoints||[],
+            fromDate, toDate
+          })
         })
-        if(!br.ok) throw new Error('Bounds detection failed')
+        if(!br.ok) throw new Error(`Bounds failed: HTTP ${br.status}`)
         const bounds = await br.json()
         scanStart = bounds.scanStart
         scanEnd   = bounds.scanEnd
-        totalSpan = bounds.total
-        totalRef.val = totalSpan
-        setProgress({done:0, total:totalSpan, found:0})
-        addLog(`Range: #${scanStart}–#${scanEnd} (${totalSpan} IDs)`, 'ok')
+        totalIds  = bounds.total
+        addLog(`Range: #${scanStart}–#${scanEnd} (${totalIds} IDs)`, 'ok')
+        setProgress({done:0, total:totalIds, found:0})
       } else {
-        // Manual: scanStart/scanEnd come from params
-        scanStart = base.startId
-        scanEnd   = base.useAuto ? base.startId+50000 : base.endId
-        totalSpan = base.useAuto ? 0 : (scanEnd - scanStart + 1)
-        totalRef.val = totalSpan
-        setProgress({done:0,total:totalSpan,found:0})
+        scanStart = startId
+        scanEnd   = useAuto ? startId+50000 : endId
+        totalIds  = useAuto ? 0 : scanEnd-scanStart+1
+        setProgress({done:0, total:totalIds, found:0})
       }
 
-      // Step 2: scan in chunks — each chunk is a fresh 60s server call
+      // Step 2: scan in chunks
       let chunkStart = scanStart
-      while(chunkStart <= scanEnd && !ab.signal.aborted){
+      while(!ab.signal.aborted){
+        addLog(`Chunk: #${chunkStart}–${Math.min(chunkStart+799,scanEnd)}`, 'info')
         const res = await fetch('/api/scan',{
           method:'POST', headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({
-            ...base,
-            scanStart:    chunkStart,
-            scanEnd:      scanEnd,
-            originalStart:scanStart,
-            totalSpan,
-            runId:        rid
-          }), signal:ab.signal
+          signal: ab.signal,
+          body: JSON.stringify({
+            mode, subdomain:brand.subdomain, slug:brand.slug,
+            concurrency, fromDate, toDate,
+            startId, endId, useAuto, stopAfter,
+            scanStart:chunkStart, scanEnd
+          })
         })
-        if(!res.ok||!res.body) throw new Error(`HTTP ${res.status}`)
+        if(!res.ok||!res.body) throw new Error(`Scan HTTP ${res.status}`)
 
-        const chunk = await processStream(res)
-        if(chunk===null) break // server sent 'done'
-        if(!chunk?.nextStart) break
-        chunkStart = chunk.nextStart
-        addLog(`→ ${allOrders.length} found, continuing from #${chunkStart}...`,'info')
+        const result = await readStream(res, totalIds)
+        if(result.done) break
+        if(!result.nextStart) break
+        chunkStart = result.nextStart
+        addLog(`→ ${allOrders.length} found so far`, 'info')
       }
 
-      const dates=allOrders.map(r=>r.dateYMD).filter(Boolean).sort()
-      const label=dates.length===0
-        ? (params.fromDate?`${params.fromDate} to ${params.toDate}`:'scan')
+      // Done — save
+      const dates = allOrders.map(r=>r.dateYMD).filter(Boolean).sort()
+      const label = dates.length===0
+        ? (fromDate ? `${fromDate} to ${toDate}` : `#${startId}–#${endId||'auto'}`)
         : dates[0]===dates[dates.length-1] ? dates[0]!
         : `${dates[0]} to ${dates[dates.length-1]}`
-      saveRun(allOrders,label,totalRef.val)
-      addLog(`✓ Done: ${label} — ${allOrders.length} orders`,'ok')
+      saveRun(allOrders, label, totalIds)
+      addLog(`✓ Done: ${label} — ${allOrders.length} orders`, 'ok')
 
     }catch(e:any){
-      if(e.name!=='AbortError') addLog('Error: '+e.message,'err')
+      if(e.name!=='AbortError') addLog('Error: '+e.message, 'err')
+      // Save partial results
       if(ordersRef.current.length>0){
-        const o=ordersRef.current
-        const dates=o.map(r=>r.dateYMD).filter(Boolean).sort()
-        const lbl=dates.length===0?'partial':`${dates[0]} to ${dates[dates.length-1]} (partial)`
-        saveRun(o,lbl,0)
-        addLog(`Saved ${o.length} orders collected so far`,'info')
+        const o = ordersRef.current
+        const dates = o.map(r=>r.dateYMD).filter(Boolean).sort()
+        const lbl = dates.length===0 ? 'partial' : `${dates[0]} to ${dates[dates.length-1]} (partial)`
+        saveRun(o, lbl, 0)
+        addLog(`Saved ${o.length} partial orders`, 'info')
       }
-    }finally{setScanning(false);setScanLabel('')}
+    }finally{
+      setScanning(false)
+      setScanLabel('')
+    }
   }
 
   function stopScan(){abortRef.current?.abort()}
