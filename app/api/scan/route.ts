@@ -19,124 +19,103 @@ async function findNearestBrandOrder(subdomain: string, slug: string, id: number
   return null
 }
 
-// Binary search for boundary — finds first/last brand order on targetDate
-// Uses the anchor as a reliable starting point, then brackets outward
+// Find boundary using walk + binary search
+// Walk from anchor in steps to bracket the date, then binary search
+// Never uses avgPerDay — measures actual rate from API responses
 async function findBoundary(
   subdomain: string, slug: string,
   anchorId: number, anchorDate: string,
   regressionPoints: Array<{date:string,id:number}>,
-  avgPerDay: number,
+  _avgPerDay: number, // ignored — we measure real rate
   targetDate: string,
   mode: 'first' | 'last',
   send: (msg: string) => void
 ): Promise<number | null> {
 
-  // Step 1: Get a tight estimate using only known data points
-  // Use regression if available, else anchor + conservative rate
-  const pts = [...(regressionPoints || []), {date: anchorDate, id: anchorId}]
-    .filter(p => p.date && p.id > 0)
-    .sort((a, b) => a.date.localeCompare(b.date))
+  send(`Finding ${mode} boundary for ${targetDate}...`)
 
-  const target = new Date(targetDate + 'T00:00:00').getTime()
-  let estimatedId: number
+  // Build list of all known (date, id) points including anchor + regression
+  const knownPts = [
+    { date: anchorDate, id: anchorId },
+    ...(regressionPoints || [])
+  ].filter(p => p.date && p.id > 0)
+   .sort((a, b) => a.date.localeCompare(b.date))
 
-  // Find bracketing points from known data
-  let before: typeof pts[0] | null = null, after: typeof pts[0] | null = null
-  for (const p of pts) {
-    const pd = new Date(p.date + 'T00:00:00').getTime()
-    if (pd <= target) before = p
-    else if (!after) after = p
+  // Find the closest known point to targetDate
+  const target = targetDate
+  let bestKnown = knownPts[0]
+  for (const p of knownPts) {
+    const dBest = Math.abs(new Date(bestKnown.date+'T00:00:00').getTime() - new Date(target+'T00:00:00').getTime())
+    const dThis = Math.abs(new Date(p.date+'T00:00:00').getTime() - new Date(target+'T00:00:00').getTime())
+    if (dThis < dBest) bestKnown = p
   }
 
-  if (before && after) {
-    // Interpolate between two known points — most accurate
-    const span = new Date(after.date + 'T00:00:00').getTime() - new Date(before.date + 'T00:00:00').getTime()
-    const pos  = target - new Date(before.date + 'T00:00:00').getTime()
-    estimatedId = Math.round(before.id + (pos / span) * (after.id - before.id))
-  } else if (before) {
-    // Extrapolate forward — use actual measured rate from regression if possible
-    let rate = avgPerDay
-    if (pts.length >= 2) {
-      const p1 = pts[pts.length - 2], p2 = pts[pts.length - 1]
-      const days = (new Date(p2.date + 'T00:00:00').getTime() - new Date(p1.date + 'T00:00:00').getTime()) / 86400000
-      if (days > 0) rate = (p2.id - p1.id) / days
+  send(`  Starting from known point: #${bestKnown.id} = ${bestKnown.date}`)
+
+  // Walk from bestKnown toward target in steps of 1000
+  // Measure actual ID progression rate from responses
+  const STEP = 1000
+  let lo: number, hi: number
+  let lastKnownId = bestKnown.id
+  let lastKnownDate = bestKnown.date
+
+  if (target > lastKnownDate) {
+    // Target is after known point — walk forward
+    lo = lastKnownId
+    hi = lastKnownId
+    for (let i = 1; i <= 200; i++) {
+      const probeId = lastKnownId + i * STEP
+      const o = await findNearestBrandOrder(subdomain, slug, probeId, 100)
+      if (!o) continue
+      send(`  Walk: #${o.orderId} = ${o.orderDate}`)
+      if (o.dateYMD! >= target) {
+        hi = o.orderId
+        break
+      }
+      lo = o.orderId
+      await sleep(30)
     }
-    const days = (target - new Date(before.date + 'T00:00:00').getTime()) / 86400000
-    estimatedId = Math.round(before.id + days * rate)
-  } else if (after) {
-    let rate = avgPerDay
-    if (pts.length >= 2) {
-      const p1 = pts[0], p2 = pts[1]
-      const days = (new Date(p2.date + 'T00:00:00').getTime() - new Date(p1.date + 'T00:00:00').getTime()) / 86400000
-      if (days > 0) rate = (p2.id - p1.id) / days
-    }
-    const days = (target - new Date(after.date + 'T00:00:00').getTime()) / 86400000
-    estimatedId = Math.round(after.id + days * rate)
+    if (hi === lastKnownId) hi = lastKnownId + 200 * STEP
   } else {
-    estimatedId = anchorId
-  }
-
-  send(`Finding ${mode} boundary for ${targetDate} (est. #${estimatedId})...`)
-
-  // Step 2: Verify estimate by probing it — adjust if wrong direction
-  // First probe the estimate to see what date we're actually at
-  const probe = await findNearestBrandOrder(subdomain, slug, estimatedId, 200)
-  if (probe) {
-    send(`  Probe: #${probe.orderId} = ${probe.orderDate}`)
-    // Adjust estimate based on actual probe result
-    if (probe.dateYMD! < targetDate) {
-      // We're before target — estimate was too low
-      // Don't adjust lo/hi yet, binary search will handle it
+    // Target is before known point — walk backward
+    hi = lastKnownId
+    lo = Math.max(1, lastKnownId)
+    for (let i = 1; i <= 200; i++) {
+      const probeId = Math.max(1, lastKnownId - i * STEP)
+      const o = await findNearestBrandOrder(subdomain, slug, probeId, 100)
+      if (!o) continue
+      send(`  Walk: #${o.orderId} = ${o.orderDate}`)
+      if (o.dateYMD! <= target) {
+        lo = o.orderId
+        break
+      }
+      hi = o.orderId
+      if (probeId <= 1) break
+      await sleep(30)
     }
   }
 
-  // Step 3: Binary search with ±5000 initial window (tight but safe)
-  let lo = Math.max(1, estimatedId - 5000)
-  let hi = estimatedId + 5000
+  send(`  Bracket: #${lo}–#${hi} | Binary searching...`)
+
+  // Binary search within bracket
   let best: number | null = null
-  let steps = 0
+  let blo = lo, bhi = hi
 
-  while (lo <= hi && steps < 20) {
-    steps++
-    const mid = Math.floor((lo + hi) / 2)
+  for (let steps = 0; steps < 25 && blo <= bhi; steps++) {
+    const mid = Math.floor((blo + bhi) / 2)
     const found = await findNearestBrandOrder(subdomain, slug, mid, 150)
-
     if (!found) {
-      if (mode === 'first') lo = mid + 151; else hi = mid - 151
+      if (mode === 'first') blo = mid + 151; else bhi = mid - 151
       continue
     }
-
     if (mode === 'first') {
-      if (found.dateYMD! >= targetDate) { best = found.orderId; hi = found.orderId - 1 }
-      else lo = found.orderId + 1
+      if (found.dateYMD! >= target) { best = found.orderId; bhi = found.orderId - 1 }
+      else blo = found.orderId + 1
     } else {
-      if (found.dateYMD! <= targetDate) { best = found.orderId; lo = found.orderId + 1 }
-      else hi = found.orderId - 1
+      if (found.dateYMD! <= target) { best = found.orderId; blo = found.orderId + 1 }
+      else bhi = found.orderId - 1
     }
     await sleep(30)
-    if (lo > hi) break
-  }
-
-  // Step 4: Expand window if not found (estimate was off)
-  if (!best) {
-    send(`  Estimate was off, expanding search...`)
-    lo = Math.max(1, estimatedId - 25000); hi = estimatedId + 25000
-    steps = 0
-    while (lo <= hi && steps < 15) {
-      steps++
-      const mid = Math.floor((lo + hi) / 2)
-      const found = await findNearestBrandOrder(subdomain, slug, mid, 300)
-      if (!found) { if (mode === 'first') lo = mid + 301; else hi = mid - 301; continue }
-      if (mode === 'first') {
-        if (found.dateYMD! >= targetDate) { best = found.orderId; hi = found.orderId - 1 }
-        else lo = found.orderId + 1
-      } else {
-        if (found.dateYMD! <= targetDate) { best = found.orderId; lo = found.orderId + 1 }
-        else hi = found.orderId - 1
-      }
-      await sleep(30)
-      if (lo > hi) break
-    }
   }
 
   send(`→ ${mode} boundary: #${best ?? 'not found'}`)
