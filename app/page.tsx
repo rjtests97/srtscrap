@@ -159,25 +159,41 @@ class Scanner {
   ): Promise<{lo:number, hi:number}> {
     const forward = targetDate > refDate
     let lo=refId, hi=refId
+    let lastFoundId=refId, lastFoundDate=refDate
+    let missesAfterLastFound=0
 
     this.onLog(`${logPrefix}: walking ${forward?'→':'←'} from #${refId} (${refDate})`, 'info')
 
-    for(let i=1; i<=500 && !this.stopped; i++) {
+    for(let i=1; i<=400 && !this.stopped; i++) {
       const pid = forward ? refId + i*500 : Math.max(1, refId - i*500)
       const o = await this.probe(pid)
+
       if(o && o!=='rl' && o.slug===this.slug && o.dateYMD) {
+        lastFoundId=o.orderId; lastFoundDate=o.dateYMD; missesAfterLastFound=0
         this.onLog(`  #${o.orderId} = ${o.orderDate}`, 'info')
         if(forward) {
           if(o.dateYMD >= targetDate) { hi=o.orderId; break }
           lo=o.orderId
+          // If last found date is within 5 days of target, use it as approximate end
+          const daysLeft=(new Date(targetDate+'T00:00:00').getTime()-new Date(o.dateYMD+'T00:00:00').getTime())/86400000
+          if(daysLeft<=5) { hi=o.orderId+3000; break }
         } else {
           if(o.dateYMD < targetDate) { lo=o.orderId; break }
           hi=o.orderId
         }
+      } else {
+        missesAfterLastFound++
+        // After 4 consecutive misses while we've already found orders past anchor,
+        // the brand has ended for that period — use last found + buffer
+        if(forward && lo>refId && missesAfterLastFound>=4) {
+          hi=lastFoundId+1500; break
+        }
       }
-      await sleep(80)
+      await sleep(60)
       if(!forward && pid<=1) break
     }
+    // Safety fallback
+    if(hi<=lo) hi=lo+2000
     return {lo, hi}
   }
 
