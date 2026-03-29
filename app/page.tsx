@@ -741,9 +741,12 @@ function AddBrandForm({onAdd,onCancel,inp,lbl}:any) {
       const {results}=await res.json()
       const o=results[0]
       if(!o||o==='rl'){setStatus({msg:'Cannot fetch that order. Check subdomain & order ID.',ok:false});setLoading(false);return}
-      // Probe 30 nearby IDs to estimate avgPerDay
+      // Detect prefix FIRST before using it
+      const prefixMatch2 = oid.trim().match(/^([A-Za-z]+)/)
+      const detectedPrefix = prefixMatch2 ? prefixMatch2[1].toUpperCase() : ''
       const numericBase=parseInt(oid.replace(/[^0-9]/g,''))
-      const probeIds=Array.from({length:30},(_,i)=>idPrefix?`${idPrefix}${numericBase+i+1}`:numericBase+i+1)
+      // Probe 30 nearby IDs to estimate avgPerDay
+      const probeIds=Array.from({length:30},(_,i)=>detectedPrefix?`${detectedPrefix}${numericBase+i+1}`:numericBase+i+1)
       const probeRes=await fetch('/api/proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({subdomain:sub,ids:probeIds})})
       const {results:probeResults}=await probeRes.json()
       const found=probeResults.filter((r:any)=>r&&r!=='rl'&&r.slug===o.slug)
@@ -753,7 +756,7 @@ function AddBrandForm({onAdd,onCancel,inp,lbl}:any) {
       const idPrefix = prefixMatch ? prefixMatch[1].toUpperCase() : ''
       const numericAnchorId = parseInt(oid.replace(/[^0-9]/g,''))
       onAdd({id:Date.now().toString(),name,subdomain:sub,slug:o.slug,companyName:o.companyName,
-        anchorId:numericAnchorId,anchorDate:date,avgPerDay,regressionPoints:[],idPrefix})
+        anchorId:numericBase,anchorDate:date,avgPerDay,regressionPoints:[],idPrefix:detectedPrefix})
     }catch(e:any){setStatus({msg:e.message,ok:false})}
     setLoading(false)
   }
