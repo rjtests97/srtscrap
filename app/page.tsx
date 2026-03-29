@@ -8,13 +8,14 @@ interface Brand {
   id: string; name: string; subdomain: string; slug: string
   companyName: string; anchorId: number; anchorDate: string
   avgPerDay: number; regressionPoints: Array<{date:string,id:number}>
+  idPrefix: string  // e.g. "KYT" for "KYT53199", "" for numeric-only
 }
 interface Order {
-  orderId: number; slug: string; orderDate: string; orderTime: string
+  orderId: number|string; slug: string; orderDate: string; orderTime: string
   dateYMD: string|null; value: string; valueNum: number
   payment: string; status: string; pincode: string; location: string
 }
-interface Run { runId:string; dateRange:string; found:number; orders:Order[]; createdAt:string }
+interface Run { runId:string; dateRange:string; found:number; orders:Order[]; createdAt:string; idPrefix?:string }
 interface Analytics {
   totalOrders:number; totalRevenue:number; avgOrderVal:number
   codCount:number; prepaidCount:number; codPct:number
@@ -100,6 +101,7 @@ function dlFile(content:string, filename:string) {
 class Scanner {
   private subdomain: string
   private slug: string
+  private idPrefix: string  // e.g. "KYT" — prepended to numeric IDs
   private stopped = false
   private rlStreak = 0
   private onLog: (msg:string, cls:string)=>void
@@ -107,16 +109,21 @@ class Scanner {
   private onOrder: (o:Order)=>void
 
   constructor(
-    subdomain:string, slug:string,
+    subdomain:string, slug:string, idPrefix:string,
     onLog:(msg:string,cls:string)=>void,
     onProgress:(done:number,total:number,found:number,startedAt:number)=>void,
     onOrder:(o:Order)=>void
   ) {
-    this.subdomain=subdomain; this.slug=slug
+    this.subdomain=subdomain; this.slug=slug; this.idPrefix=idPrefix
     this.onLog=onLog; this.onProgress=onProgress; this.onOrder=onOrder
   }
 
   stop() { this.stopped=true }
+
+  // Convert numeric counter to full order ID (adds prefix if needed)
+  private toOrderId(n:number): string|number {
+    return this.idPrefix ? `${this.idPrefix}${n}` : n
+  }
 
   // Fetch a batch of IDs via server proxy (bypasses CORS)
   async fetchBatch(ids:number[]): Promise<Array<Order|null|'rl'>> {
@@ -128,9 +135,10 @@ class Scanner {
       await sleep(wait)
     }
     try {
+      const orderIds = ids.map(n => this.toOrderId(n))
       const res = await fetch('/api/proxy', {
         method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({subdomain:this.subdomain, ids})
+        body: JSON.stringify({subdomain:this.subdomain, ids:orderIds})
       })
       if(!res.ok) { this.rlStreak++; return ids.map(()=>'rl') }
       const {results} = await res.json()
@@ -151,6 +159,13 @@ class Scanner {
     return results[0]
   }
 
+  // Parse numeric part from an order ID (strips prefix)
+  static parseNumeric(orderId:number|string): number {
+    if(typeof orderId==='number') return orderId
+    const m = orderId.match(/(\d+)$/)
+    return m ? parseInt(m[1]) : 0
+  }
+
   // Walk from a reference point to find where a date boundary is
   // Returns: last ID before targetDate (lo) and first ID on/after targetDate (hi)
   async walkToBracket(
@@ -159,8 +174,9 @@ class Scanner {
   ): Promise<{lo:number, hi:number}> {
     const forward = targetDate > refDate
     let lo=refId, hi=refId
-    let lastFoundId=refId, lastFoundDate=refDate
+    let lastFoundId:number|string=refId, lastFoundDate=refDate
     let missesAfterLastFound=0
+    const numId=(o:Order)=>typeof o.orderId==='number'?o.orderId:Scanner.parseNumeric(o.orderId)
 
     this.onLog(`${logPrefix}: walking ${forward?'→':'←'} from #${refId} (${refDate})`, 'info')
 
@@ -172,21 +188,21 @@ class Scanner {
         lastFoundId=o.orderId; lastFoundDate=o.dateYMD; missesAfterLastFound=0
         this.onLog(`  #${o.orderId} = ${o.orderDate}`, 'info')
         if(forward) {
-          if(o.dateYMD >= targetDate) { hi=o.orderId; break }
-          lo=o.orderId
+          if(o.dateYMD >= targetDate) { hi=numId(o); break }
+          lo=numId(o)
           // If last found date is within 5 days of target, use it as approximate end
           const daysLeft=(new Date(targetDate+'T00:00:00').getTime()-new Date(o.dateYMD+'T00:00:00').getTime())/86400000
-          if(daysLeft<=5) { hi=o.orderId+3000; break }
+          if(daysLeft<=5) { hi=(typeof o.orderId==='number'?o.orderId:Scanner.parseNumeric(o.orderId))+3000; break }
         } else {
-          if(o.dateYMD < targetDate) { lo=o.orderId; break }
-          hi=o.orderId
+          if(o.dateYMD < targetDate) { lo=numId(o); break }
+          hi=numId(o)
         }
       } else {
         missesAfterLastFound++
         // After 4 consecutive misses while we've already found orders past anchor,
         // the brand has ended for that period — use last found + buffer
         if(forward && lo>refId && missesAfterLastFound>=4) {
-          hi=lastFoundId+1500; break
+          hi=(typeof lastFoundId==='number'?lastFoundId:Scanner.parseNumeric(lastFoundId))+1500; break
         }
       }
       await sleep(60)
@@ -386,10 +402,12 @@ export default function App() {
     LS.set(`runs_${brand.id}`,updated); setRuns(updated); setLastOrders(orders); setAnalytics(buildAnalytics(orders))
     // Update regression
     const byDate:Record<string,{min:number,max:number}>={}
+    const toNum=(id:number|string)=>typeof id==='number'?id:parseInt(String(id).replace(/[^0-9]/g,''))||0
     orders.forEach(o=>{
       if(!o.dateYMD)return
-      if(!byDate[o.dateYMD])byDate[o.dateYMD]={min:o.orderId,max:o.orderId}
-      else{byDate[o.dateYMD].min=Math.min(byDate[o.dateYMD].min,o.orderId);byDate[o.dateYMD].max=Math.max(byDate[o.dateYMD].max,o.orderId)}
+      const n=toNum(o.orderId)
+      if(!byDate[o.dateYMD])byDate[o.dateYMD]={min:n,max:n}
+      else{byDate[o.dateYMD].min=Math.min(byDate[o.dateYMD].min,n);byDate[o.dateYMD].max=Math.max(byDate[o.dateYMD].max,n)}
     })
     const newPts=Object.entries(byDate).map(([date,{min,max}])=>({date,id:Math.round((min+max)/2)}))
     const merged=Object.values(Object.fromEntries(
@@ -455,7 +473,7 @@ export default function App() {
     addLog(`⚠ Keep this tab active — switching tabs may pause the scan`,'info')
 
     const scanner = new Scanner(
-      brand.subdomain, brand.slug,
+      brand.subdomain, brand.slug, brand.idPrefix||'',
       addLog,
       (done,total,found,sat)=>{ setProgress({done,total,found}); rateWindow.current=[...rateWindow.current,{t:Date.now(),done}] },
       (o)=>{ ordersRef.current=[...ordersRef.current,o] }
@@ -515,7 +533,7 @@ export default function App() {
     setScanLabel(`#${startId}–${useAuto?'auto':'#'+endId}`)
     addLog(`Manual: #${startId}–${useAuto?'auto':'#'+endId} | ${concurrency}x`,'info')
 
-    const scanner=new Scanner(brand.subdomain,brand.slug,addLog,
+    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,
       (done,total,found)=>setProgress({done,total,found}),
       (o)=>{ordersRef.current=[...ordersRef.current,o]}
     )
@@ -729,8 +747,12 @@ function AddBrandForm({onAdd,onCancel,inp,lbl}:any) {
       const {results:probeResults}=await probeRes.json()
       const found=probeResults.filter((r:any)=>r&&r!=='rl'&&r.slug===o.slug)
       const avgPerDay=found.length>0?Math.min(2000,Math.max(5,Math.round((found.length/30)*2000))):30
+      // Detect prefix: if anchor order ID has letters, extract them
+      const prefixMatch = oid.match(/^([A-Za-z]+)/)
+      const idPrefix = prefixMatch ? prefixMatch[1].toUpperCase() : ''
+      const numericAnchorId = parseInt(oid.replace(/[^0-9]/g,''))
       onAdd({id:Date.now().toString(),name,subdomain:sub,slug:o.slug,companyName:o.companyName,
-        anchorId:parseInt(oid),anchorDate:date,avgPerDay,regressionPoints:[]})
+        anchorId:numericAnchorId,anchorDate:date,avgPerDay,regressionPoints:[],idPrefix})
     }catch(e:any){setStatus({msg:e.message,ok:false})}
     setLoading(false)
   }
@@ -748,7 +770,7 @@ function AddBrandForm({onAdd,onCancel,inp,lbl}:any) {
           <div><label style={lbl}>Subdomain</label><input value={sub} onChange={e=>setSub(e.target.value)} placeholder="e.g. everlasting" style={inp}/></div>
         </div>
         <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
-          <div><label style={lbl}>One Known Order ID</label><input type="number" value={oid} onChange={e=>setOid(e.target.value)} placeholder="e.g. 437470" style={inp}/></div>
+          <div><label style={lbl}>One Known Order ID</label><input type="text" value={oid} onChange={e=>setOid(e.target.value)} placeholder="e.g. 437470 or KYT53199" style={inp}/></div>
           <div><label style={lbl}>That Order's Date</label><input type="date" value={date} onChange={e=>setDate(e.target.value)} style={inp}/></div>
         </div>
         {status&&<div style={{padding:'8px 10px',borderRadius:6,fontSize:11,background:status.ok?'#00ff8815':'#ff444415',border:`1px solid ${status.ok?'var(--accent)':'var(--red)'}`,color:status.ok?'var(--accent)':'var(--red)'}}>{status.msg}</div>}
@@ -793,7 +815,7 @@ function DateTab({active,scanning,scanLabel,onStart,inp,lbl}:any) {
   return(
     <div>
       <div style={{background:'var(--surface)',border:'1px solid var(--border)',borderRadius:6,padding:'8px 12px',marginBottom:12,fontSize:9,color:'var(--muted)',lineHeight:1.8}}>
-        Anchor: <span style={{color:'var(--accent)'}}>#{active.anchorId} = {active.anchorDate}</span> · slug: <span style={{color:'var(--accent)'}}>{active.slug}</span> · ~{active.avgPerDay}/day · {active.regressionPoints?.length||0} cal pts
+        Anchor: <span style={{color:'var(--accent)'}}>#{active.idPrefix||''}{active.anchorId} = {active.anchorDate}</span> · slug: <span style={{color:'var(--accent)'}}>{active.slug}</span> · ~{active.avgPerDay}/day · {active.regressionPoints?.length||0} cal pts
       </div>
       {scanning&&scanLabel&&(
         <div style={{background:'var(--surface)',border:'1px solid var(--accent)',borderRadius:6,padding:'7px 12px',marginBottom:10,fontSize:11,color:'var(--accent)',fontWeight:700}}>
@@ -841,8 +863,8 @@ function ManualTab({active,scanning,scanLabel,onStart,inp,lbl}:any) {
       {!scanning&&(
         <>
           <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
-            <div><label style={lbl}>Start ID</label><input type="number" value={startId} onChange={e=>setStartId(e.target.value)} placeholder="e.g. 57700" style={inp}/></div>
-            <div><label style={lbl}>End ID</label><input type="number" value={endId} onChange={e=>setEndId(e.target.value)} placeholder="e.g. 73370" disabled={useAuto} style={{...inp,opacity:useAuto?.4:1}}/></div>
+            <div><label style={lbl}>Start ID</label><input type="text" value={startId} onChange={e=>setStartId(e.target.value)} placeholder="e.g. 57700 or KYT53100" style={inp}/></div>
+            <div><label style={lbl}>End ID</label><input type="text" value={endId} onChange={e=>setEndId(e.target.value)} placeholder="e.g. 73370 or KYT73370" disabled={useAuto} style={{...inp,opacity:useAuto?.4:1}}/></div>
           </div>
           <div style={{background:'var(--surface)',border:'1px solid var(--border)',borderRadius:6,padding:'10px 12px',marginBottom:10,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
             <span style={{fontSize:10,color:'var(--muted)'}}>Auto-detect end (stop after N consecutive misses)</span>
@@ -866,7 +888,8 @@ function ManualTab({active,scanning,scanLabel,onStart,inp,lbl}:any) {
           <button onClick={()=>{
             if(!startId){alert('Enter a Start ID');return}
             if(!useAuto&&!endId){alert('Enter End ID or enable auto-detect');return}
-            onStart(parseInt(startId),parseInt(endId)||0,parseInt(conc),useAuto,parseInt(stopAfter))
+            const parseId=(s:string)=>parseInt(s.replace(/[^0-9]/g,''))||0
+            onStart(parseId(startId),parseId(endId),parseInt(conc),useAuto,parseInt(stopAfter))
           }} style={{width:'100%',background:'var(--accent)',color:'#000',border:'none',padding:11,borderRadius:8,
             fontSize:12,fontWeight:700,letterSpacing:'.06em',textTransform:'uppercase',marginBottom:12,fontFamily:'inherit',cursor:'pointer'}}>
             ▶ START MANUAL SCRAPE
@@ -1049,7 +1072,7 @@ function SettingsTab({brands,active,runs,onDelete,onSync,inp,lbl}:any) {
         <div key={b.id} style={{background:'var(--surface)',border:`1px solid ${b.id===active.id?'var(--accent)':'var(--border)'}`,borderRadius:8,padding:12,marginBottom:8}}>
           <div style={{fontWeight:700,color:'var(--accent)',fontSize:12,marginBottom:2}}>{b.name}</div>
           <div style={{fontSize:9,color:'var(--muted)',marginBottom:8,lineHeight:1.8}}>
-            {b.subdomain}.shiprocket.co · slug: {b.slug} · ~{b.avgPerDay}/day<br/>anchor: #{b.anchorId} ({b.anchorDate}) · {b.regressionPoints?.length||0} cal pts
+            {b.subdomain}.shiprocket.co · slug: {b.slug} · ~{b.avgPerDay}/day<br/>anchor: #{b.idPrefix||''}{b.anchorId} ({b.anchorDate}) · {b.regressionPoints?.length||0} cal pts{b.idPrefix?` · prefix: ${b.idPrefix}`:''}
           </div>
           <button onClick={()=>onDelete(b.id)}
             style={{background:'none',border:'1px solid var(--red)',color:'var(--red)',padding:'5px 12px',borderRadius:4,fontSize:9,fontWeight:700,fontFamily:'inherit',cursor:'pointer'}}>
