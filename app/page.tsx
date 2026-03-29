@@ -737,12 +737,13 @@ function AddBrandForm({onAdd,onCancel,inp,lbl}:any) {
     if(!name||!sub||!oid||!date){setStatus({msg:'Fill all fields',ok:false});return}
     setLoading(true);setStatus(null)
     try{
-      const res=await fetch('/api/proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({subdomain:sub,ids:[parseInt(oid)]})})
+      const res=await fetch('/api/proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({subdomain:sub,ids:[oid.trim()]})})
       const {results}=await res.json()
       const o=results[0]
       if(!o||o==='rl'){setStatus({msg:'Cannot fetch that order. Check subdomain & order ID.',ok:false});setLoading(false);return}
       // Probe 30 nearby IDs to estimate avgPerDay
-      const probeIds=Array.from({length:30},(_,i)=>parseInt(oid)+i+1)
+      const numericBase=parseInt(oid.replace(/[^0-9]/g,''))
+      const probeIds=Array.from({length:30},(_,i)=>idPrefix?`${idPrefix}${numericBase+i+1}`:numericBase+i+1)
       const probeRes=await fetch('/api/proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({subdomain:sub,ids:probeIds})})
       const {results:probeResults}=await probeRes.json()
       const found=probeResults.filter((r:any)=>r&&r!=='rl'&&r.slug===o.slug)
