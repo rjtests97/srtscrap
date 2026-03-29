@@ -18,7 +18,6 @@ function toYMD(s: string) {
 function parseTJ(tj: any, originalId: string | number) {
   if (!tj?.order) return null
   const order = tj.order
-  // Use the order_id from response if available, else use what we passed in
   const orderId = order.order_id || originalId
   if (!orderId) return null
   const acts = tj.tracking_data?.shipment_track_activities ?? []
@@ -41,26 +40,24 @@ function parseTJ(tj: any, originalId: string | number) {
   }
 }
 
-async function tryFetch(url: string, headers: Record<string, string>) {
-  try {
-    const res = await fetch(url, {
-      headers,
-      signal: AbortSignal.timeout(9000),
-    })
-    if (res.status === 429 || res.status === 403 || res.status === 503) return 'rl'
-    if (!res.ok) return null
-    const text = await res.text()
-    if (!text || text.length < 10) return null
-    if (text.trimStart().startsWith('<')) return null // HTML response
-    return JSON.parse(text)
-  } catch {
-    return null
-  }
+function extractFromJson(json: any, originalId: string | number) {
+  if (!json) return null
+  // Try all known response structures
+  const tj = json.tracking_json
+    || json.data?.tracking_json
+    || json.result?.tracking_json
+    || json.response?.tracking_json
+  if (tj?.order) return parseTJ(tj, originalId)
+  // Sometimes the whole response IS the tracking data
+  if (json.order?.order_id) return parseTJ(json, originalId)
+  return null
 }
 
 async function fetchOneOrder(subdomain: string, orderId: string | number) {
   const id = String(orderId)
-  const headers = {
+  const isAlpha = /[A-Za-z]/.test(id)
+
+  const getHeaders = {
     'Accept': 'application/json, text/plain, */*',
     'Accept-Language': 'en-IN,en;q=0.9',
     'Referer': `https://${subdomain}.shiprocket.co/`,
@@ -68,49 +65,96 @@ async function fetchOneOrder(subdomain: string, orderId: string | number) {
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
   }
 
-  // Endpoint 1: standard pocx API (works for numeric IDs like 61000)
-  const r1 = await tryFetch(`https://${subdomain}.shiprocket.co/pocx/tracking/order/${id}`, headers)
-  if (r1 === 'rl') return 'rl'
-  if (r1?.tracking_json) return parseTJ(r1.tracking_json, orderId)
-  if (r1?.data?.tracking_json) return parseTJ(r1.data.tracking_json, orderId)
+  const tryGet = async (url: string) => {
+    try {
+      const res = await fetch(url, { headers: getHeaders, signal: AbortSignal.timeout(8000) })
+      if (res.status === 429 || res.status === 403 || res.status === 503) return 'rl' as const
+      if (!res.ok) return null
+      const text = await res.text()
+      if (!text || text.length < 5 || text.trimStart().startsWith('<')) return null
+      return JSON.parse(text)
+    } catch { return null }
+  }
 
-  // Endpoint 2: v1 API (sometimes used for alphanumeric)
-  const r2 = await tryFetch(`https://${subdomain}.shiprocket.co/api/v1/tracking/order/${id}`, headers)
-  if (r2 === 'rl') return 'rl'
-  if (r2?.tracking_json) return parseTJ(r2.tracking_json, orderId)
-  if (r2?.data?.tracking_json) return parseTJ(r2.data.tracking_json, orderId)
+  const tryPost = async (url: string, body: any) => {
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { ...getHeaders, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(8000),
+      })
+      if (res.status === 429 || res.status === 403 || res.status === 503) return 'rl' as const
+      if (!res.ok) return null
+      const text = await res.text()
+      if (!text || text.length < 5 || text.trimStart().startsWith('<')) return null
+      return JSON.parse(text)
+    } catch { return null }
+  }
 
-  // Endpoint 3: public tracking API (used by the tracking page)
-  const r3 = await tryFetch(`https://${subdomain}.shiprocket.co/api/v1/public/track/order/${id}`, headers)
-  if (r3 === 'rl') return 'rl'
-  if (r3?.tracking_json) return parseTJ(r3.tracking_json, orderId)
-  if (r3?.data?.tracking_json) return parseTJ(r3.data.tracking_json, orderId)
+  // ── GET endpoints ──────────────────────────────────
+  const getUrls = [
+    `https://${subdomain}.shiprocket.co/pocx/tracking/order/${id}`,
+    `https://${subdomain}.shiprocket.co/api/v1/tracking/order/${id}`,
+    `https://${subdomain}.shiprocket.co/api/v1/public/track/order/${id}`,
+    `https://${subdomain}.shiprocket.co/api/external/track/order/${id}`,
+  ]
 
-  // Endpoint 4: try without subdomain via main shiprocket domain
-  const r4 = await tryFetch(`https://shiprocket.co/tracking/api/order/${id}?subdomain=${subdomain}`, {
-    ...headers, 'Referer': `https://${subdomain}.shiprocket.co/`
-  })
-  if (r4 === 'rl') return 'rl'
-  if (r4?.tracking_json) return parseTJ(r4.tracking_json, orderId)
+  for (const url of getUrls) {
+    const r = await tryGet(url)
+    if (r === 'rl') return 'rl'
+    const parsed = extractFromJson(r, orderId)
+    if (parsed) return parsed
+  }
 
-  // Endpoint 5: scrape the tracking page and extract __NEXT_DATA__
+  // ── POST endpoints (used by tracking pages with search forms) ──
+  const postEndpoints = [
+    // Standard tracking search
+    { url: `https://${subdomain}.shiprocket.co/api/v1/external/track`, body: { order_id: id } },
+    { url: `https://${subdomain}.shiprocket.co/api/v1/external/track`, body: { awb: id } },
+    { url: `https://${subdomain}.shiprocket.co/pocx/tracking/search`, body: { order_id: id, type: 'order_id' } },
+    { url: `https://${subdomain}.shiprocket.co/api/v1/tracking/search`, body: { query: id, type: 'order_id' } },
+    { url: `https://${subdomain}.shiprocket.co/api/v1/tracking`, body: { order_id: id } },
+  ]
+
+  for (const { url, body } of postEndpoints) {
+    const r = await tryPost(url, body)
+    if (r === 'rl') return 'rl'
+    const parsed = extractFromJson(r, orderId)
+    if (parsed) return parsed
+  }
+
+  // ── Scrape tracking page HTML ──────────────────────
+  // Last resort: get the page and extract __NEXT_DATA__
   try {
-    const pageRes = await fetch(`https://${subdomain}.shiprocket.co/tracking/order/${id}`, {
-      headers: {
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept-Language': 'en-IN,en;q=0.9',
-      },
-      signal: AbortSignal.timeout(12000),
-    })
+    const pageRes = await fetch(
+      `https://${subdomain}.shiprocket.co/tracking/order/${id}`,
+      {
+        headers: {
+          'Accept': 'text/html,application/xhtml+xml',
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+          'Accept-Language': 'en-IN,en;q=0.9',
+        },
+        signal: AbortSignal.timeout(12000),
+      }
+    )
     if (pageRes.ok) {
       const html = await pageRes.text()
       const m = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/)
       if (m) {
         const nd = JSON.parse(m[1])
         const pp = nd?.props?.pageProps
-        const tj = pp?.trackingData?.tracking_json || pp?.tracking_json || pp?.data?.tracking_json
+        const tj = pp?.trackingData?.tracking_json
+              || pp?.tracking_json
+              || pp?.data?.tracking_json
+              || pp?.initialData?.tracking_json
         if (tj?.order) return parseTJ(tj, orderId)
+
+        // Also check if pageProps has order data in a different shape
+        if (pp?.orderDetails || pp?.trackingDetails) {
+          const details = pp.orderDetails || pp.trackingDetails
+          if (details?.tracking_json) return parseTJ(details.tracking_json, orderId)
+        }
       }
     }
   } catch {}
