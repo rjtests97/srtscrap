@@ -13,23 +13,20 @@ function toYMD(s: string) {
 }
 
 function parseTJ(tj: any, originalId: string|number) {
-  // tj = the tracking_json object
-  if (!tj) return null
+  if (!tj?.order) return null
   const order = tj.order
-  if (!order) return null
   const orderId = order.order_id || originalId
   const acts = tj.tracking_data?.shipment_track_activities ?? []
   const lastAct = acts.length > 0 ? acts[acts.length-1] : null
   const city = lastAct?.location || order.customer_city || order.billing_city || order.customer_state || 'N/A'
   const rawTime = acts[0]?.date || order.order_date || ''
-  const dateYMD = toYMD(order.order_date || '')
   return {
     orderId,
     slug:        tj.company?.slug || '',
     companyName: tj.company?.name || '',
     orderDate:   order.order_date ?? 'N/A',
     orderTime:   rawTime.length >= 16 ? rawTime.slice(11,16) : 'N/A',
-    dateYMD,
+    dateYMD:     toYMD(order.order_date || ''),
     value:       order.order_total ? `Rs.${parseFloat(order.order_total).toFixed(2)}` : 'N/A',
     valueNum:    parseFloat(order.order_total) || 0,
     payment:     order.payment_method ?? 'N/A',
@@ -39,31 +36,43 @@ function parseTJ(tj: any, originalId: string|number) {
   }
 }
 
+const UAS = [
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+]
+let uaIdx = 0
+
 async function fetchOneOrder(subdomain: string, orderId: string|number): Promise<any> {
   const id = String(orderId)
-  const headers = {
+  const ua = UAS[uaIdx % UAS.length]; uaIdx++
+
+  const headers: Record<string,string> = {
     'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'en-IN,en;q=0.9',
-    'Referer': `https://${subdomain}.shiprocket.co/`,
+    'Accept-Language': 'en-IN,en-US;q=0.9,en;q=0.8',
+    'Referer': `https://${subdomain}.shiprocket.co/tracking/order/${id}`,
+    'Origin': `https://${subdomain}.shiprocket.co`,
     'X-Requested-With': 'XMLHttpRequest',
-    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'same-origin',
+    'User-Agent': ua,
+    'Cache-Control': 'no-cache',
   }
 
   try {
     const res = await fetch(
       `https://${subdomain}.shiprocket.co/pocx/tracking/order/${id}`,
-      { headers, signal: AbortSignal.timeout(10000) }
+      { headers, signal: AbortSignal.timeout(12000) }
     )
-    if (res.status === 429 || res.status === 503) return 'rl'
+    if ([429, 503, 502, 403].includes(res.status)) return 'rl'
     if (!res.ok) return null
     const text = await res.text()
-    if (!text || text.length < 5) return 'rl'
-    if (text.trimStart().startsWith('<')) return 'rl'
-    const json = JSON.parse(text)
+    if (!text || text.length < 5 || text.trimStart().startsWith('<')) return 'rl'
+    let json: any
+    try { json = JSON.parse(text) } catch { return 'rl' }
     const tj = json?.tracking_json
-    if (!tj) return null
-    // If order is missing entirely, this is a rate-limit/config-only response
-    if (!tj.order) return null
+    if (!tj || !tj.order) return null
     return parseTJ(tj, orderId)
   } catch (e: any) {
     if (e.name === 'TimeoutError' || e.name === 'AbortError') return 'rl'
@@ -73,6 +82,6 @@ async function fetchOneOrder(subdomain: string, orderId: string|number): Promise
 
 export async function POST(req: NextRequest) {
   const { subdomain, ids } = await req.json() as { subdomain: string; ids: Array<string|number> }
-  const results = await Promise.all(ids.map(id => fetchOneOrder(subdomain, id).catch(()=>null)))
+  const results = await Promise.all(ids.map(id => fetchOneOrder(subdomain, id).catch(() => null)))
   return NextResponse.json({ results })
 }
