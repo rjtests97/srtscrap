@@ -46,6 +46,11 @@ const mergeScanStats=(prev:ScanStats,patch:Partial<ScanStats>):ScanStats=>({
   gapJumps: prev.gapJumps + (patch.gapJumps||0),
   lastMatchedId: patch.lastMatchedId ?? prev.lastMatchedId,
 })
+const normalizeId=(v:any):number=>{
+  const digits=String(v??'').replace(/[^0-9]/g,'')
+  const n=digits?Number(digits):NaN
+  return Number.isFinite(n)&&n>0?Math.floor(n):0
+}
 
 function buildAnalytics(orders:Order[]):Analytics|null {
   if(!orders.length)return null
@@ -424,6 +429,7 @@ export default function App(){
 
   async function startManualScan(startId:number,endId:number,concurrency:number,useAuto:boolean,stopAfter:number){
     if(!active||scanning)return
+    if(!Number.isFinite(startId)||startId<=0){addLog('Invalid start ID. Please enter a real numeric Shiprocket order ID.','err');return}
     const brand=active
     const safeStopAfter=useAuto?Math.max(stopAfter,recommendedAutoStop(concurrency,brand.avgPerDay||0)):stopAfter
     const autoHardCap=startId+Math.max(20000,Math.min(250000,(brand.avgPerDay||0)*45))
@@ -653,7 +659,9 @@ function ManualTab({active,scanning,scanLabel,onStart,inp,lbl}:any){
   const[startId,setStartId]=useState('');const[endId,setEndId]=useState('');const[useAuto,setUseAuto]=useState(false);const[stopAfter,setStopAfter]=useState('500');const[conc,setConc]=useState('5')
   const pfx=active.idPrefix||''
   const recommendedStop=recommendedAutoStop(parseInt(conc)||5,active?.avgPerDay||0)
-  const resumeId=LS.get(`manual_resume_${active?.id}`,'')
+  const storedResume=LS.get(`manual_resume_${active?.id}`,'')
+  const resumeId=normalizeId(storedResume)
+  useEffect(()=>{if(storedResume&&!resumeId&&active?.id)localStorage.removeItem(`manual_resume_${active.id}`)},[storedResume,resumeId,active?.id])
   return(
     <div>
       {scanning&&scanLabel&&<div style={{background:'var(--surface)',border:'1px solid var(--accent)',borderRadius:6,padding:'7px 12px',marginBottom:10,fontSize:11,color:'var(--accent)',fontWeight:700}}>🔍 Scanning: {scanLabel}</div>}
@@ -667,7 +675,7 @@ function ManualTab({active,scanning,scanLabel,onStart,inp,lbl}:any){
             <span style={{fontSize:10,color:'var(--muted)'}}>Auto-detect end (stop after N consecutive misses)</span>
             <input type="checkbox" checked={useAuto} onChange={e=>setUseAuto(e.target.checked)} style={{accentColor:'var(--accent)',width:16,height:16}}/>
           </div>
-          {resumeId&&<div style={{display:'flex',justifyContent:'space-between',alignItems:'center',background:'var(--surface2)',border:'1px solid var(--border)',borderRadius:6,padding:'8px 10px',marginBottom:10,fontSize:10,color:'var(--muted)'}}><span>Resume suggestion: start from #{pfx}{resumeId}</span><button onClick={()=>setStartId(String(resumeId))} style={{background:'none',border:'1px solid var(--accent)',color:'var(--accent)',padding:'4px 8px',borderRadius:4,fontSize:9,fontFamily:'inherit',cursor:'pointer'}}>Use resume ID</button></div>}
+          {resumeId>0&&<div style={{display:'flex',justifyContent:'space-between',alignItems:'center',background:'var(--surface2)',border:'1px solid var(--border)',borderRadius:6,padding:'8px 10px',marginBottom:10,fontSize:10,color:'var(--muted)'}}><span>Resume suggestion: start from #{pfx}{resumeId}</span><button onClick={()=>setStartId(String(resumeId))} style={{background:'none',border:'1px solid var(--accent)',color:'var(--accent)',padding:'4px 8px',borderRadius:4,fontSize:9,fontFamily:'inherit',cursor:'pointer'}}>Use resume ID</button></div>}
           {useAuto&&<div style={{marginBottom:10}}><label style={lbl}>Stop after N misses</label><div style={{display:'flex',alignItems:'center',gap:8}}><input type="number" value={stopAfter} onChange={e=>setStopAfter(e.target.value)} style={{...inp,width:90}}/><span style={{fontSize:9,color:'var(--muted)'}}>Safe floor here: {recommendedStop}. Lower values are auto-raised, and misses are retried once before counting.</span></div></div>}
           <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:12,fontSize:11,color:'var(--muted)'}}>
             <span>Concurrent fetches</span>
@@ -676,8 +684,10 @@ function ManualTab({active,scanning,scanLabel,onStart,inp,lbl}:any){
           <button onClick={()=>{
             if(!startId){alert('Enter a Start ID');return}
             if(!useAuto&&!endId){alert('Enter End ID or enable auto-detect');return}
-            const parseId=(s:string)=>parseInt(s.replace(/[^0-9]/g,''))||0
-            onStart(parseId(startId),parseId(endId),parseInt(conc),useAuto,parseInt(stopAfter))
+            const parsedStart=normalizeId(startId),parsedEnd=normalizeId(endId)
+            if(!parsedStart){alert('Enter a valid numeric Start ID');return}
+            if(!useAuto&&!parsedEnd){alert('Enter a valid numeric End ID');return}
+            onStart(parsedStart,parsedEnd,parseInt(conc),useAuto,parseInt(stopAfter))
           }} style={{width:'100%',background:'var(--accent)',color:'#000',border:'none',padding:11,borderRadius:8,fontSize:12,fontWeight:700,letterSpacing:'.06em',textTransform:'uppercase',marginBottom:12,fontFamily:'inherit',cursor:'pointer'}}>▶ START MANUAL SCRAPE</button>
         </>
       )}
