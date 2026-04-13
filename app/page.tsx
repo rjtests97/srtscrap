@@ -196,7 +196,7 @@ class Scanner {
   async scanManual(startId:number,endId:number,concurrency:number,useAuto:boolean,stopAfter:number,startedAt:number):Promise<Order[]>{
     const orders:Order[]=[],batchDelay=()=>this.rlStreak>0?Math.min(this.rlStreak*1500,15000):300
     const processBatch=async(ids:number[])=>{
-      let batchMatches=0,batchMisses=0
+      let batchMatches=0,batchMisses=0,batchRetryFailures=0
       const results=await this.fetchBatch(ids)
       for(let i=0;i<ids.length&&!this.stopped;i++){
         let o=results[i];scanned++
@@ -210,8 +210,10 @@ class Scanner {
             this.onLog(`#${ids[i]} recovered on retry`,'info')
           }else if(retry==='rl'){
             o='rl'
+            batchRetryFailures++
           }else{
             o=null
+            batchRetryFailures++
           }
         }
         if(o&&o!=='rl'&&o.slug===this.slug){
@@ -223,7 +225,7 @@ class Scanner {
           batchMisses++
         }
       }
-      return { batchMatches, batchMisses }
+      return { batchMatches, batchMisses, batchRetryFailures }
     }
 
     let scanned=0,matched=0
@@ -240,26 +242,46 @@ class Scanner {
     const windowSize=Math.max(250,Math.min(5000,stopAfter))
     const probeStride=Math.max(windowSize,concurrency*100)
     const emptyWindowLimit=3
-    let nextBase=startId,emptyWindows=0,lastMatchedId:number|null=null
+    let nextBase=startId,emptyWindows=0,lastMatchedId:number|null=null,currentConcurrency=concurrency,retryFailureStreak=0,cooldowns=0
     this.onLog(`Auto mode uses verified windows of ${windowSize} IDs with forward probes`,'info')
 
     while(nextBase<=endId&&!this.stopped){
       const windowEnd=Math.min(endId,nextBase+windowSize-1)
-      let windowMatches=0,windowMisses=0
-      for(let base=nextBase;base<=windowEnd&&!this.stopped;base+=concurrency){
-        const ids=Array.from({length:Math.min(concurrency,windowEnd-base+1)},(_,i)=>base+i)
+      let windowMatches=0,windowMisses=0,windowRetryFailures=0
+      for(let base=nextBase;base<=windowEnd&&!this.stopped;base+=currentConcurrency){
+        const ids=Array.from({length:Math.min(currentConcurrency,windowEnd-base+1)},(_,i)=>base+i)
         const res=await processBatch(ids)
         windowMatches+=res.batchMatches
         windowMisses+=res.batchMisses
+        windowRetryFailures+=res.batchRetryFailures
         this.onProgress(scanned,0,matched)
         await sleep(batchDelay())
       }
 
       if(windowMatches>0){
         emptyWindows=0
+        retryFailureStreak=0
+        if(currentConcurrency<concurrency&&windowRetryFailures===0)currentConcurrency=Math.min(concurrency,currentConcurrency+1)
         lastMatchedId=Math.max(lastMatchedId||0,...orders.slice(-windowMatches).map(o=>Scanner.numericPart(o.orderId)))
         nextBase=windowEnd+1
         continue
+      }
+
+      retryFailureStreak+=windowRetryFailures
+      if(windowRetryFailures>=Math.max(25,currentConcurrency*8)){
+        cooldowns++
+        const cooldownMs=Math.min(45000,15000+cooldowns*5000)
+        currentConcurrency=Math.max(1,Math.floor(currentConcurrency/2))
+        this.rlStreak=0
+        this.onLog(`Possible Shiprocket throttling: cooling down ${Math.round(cooldownMs/1000)}s and dropping concurrency to ${currentConcurrency}x`,'info')
+        await sleep(cooldownMs)
+        const resumeProbe=await this.probe(lastMatchedId!==null?lastMatchedId+1:nextBase)
+        if(resumeProbe&&resumeProbe!=='rl'&&resumeProbe.slug===this.slug){
+          this.onLog(`Cooldown probe succeeded near #${Scanner.numericPart(resumeProbe.orderId)} — resuming`,'info')
+          nextBase=Math.max(nextBase,(lastMatchedId!==null?lastMatchedId+1:nextBase))
+          retryFailureStreak=0
+          continue
+        }
       }
 
       const probeIds=[windowEnd+concurrency,windowEnd+Math.floor(probeStride/2),windowEnd+probeStride].filter(id=>id<=endId)
