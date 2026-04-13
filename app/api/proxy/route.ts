@@ -3,37 +3,79 @@ import { NextRequest, NextResponse } from 'next/server'
 export const runtime = 'nodejs'
 
 const MONTHS: Record<string,string> = {Jan:'01',Feb:'02',Mar:'03',Apr:'04',May:'05',Jun:'06',Jul:'07',Aug:'08',Sep:'09',Oct:'10',Nov:'11',Dec:'12'}
+const MONTHS_LONG: Record<string,string> = {January:'01',February:'02',March:'03',April:'04',May:'05',June:'06',July:'07',August:'08',September:'09',October:'10',November:'11',December:'12'}
+
+type ParsedOrder = {
+  orderId: string | number
+  slug: string
+  companyName: string
+  orderDate: string
+  orderTime: string
+  dateYMD: string | null
+  value: string
+  valueNum: number
+  payment: string
+  status: string
+  pincode: string
+  location: string
+}
 
 function toYMD(s: string) {
   if (!s) return null
   const m1 = s.match(/^(\d{1,2})\s+(\w{3})\s+(\d{4})/)
   if (m1) return `${m1[3]}-${MONTHS[m1[2]]||'00'}-${m1[1].padStart(2,'0')}`
+  const mLong = s.match(/^(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})/)
+  if (mLong) return `${mLong[3]}-${MONTHS_LONG[mLong[2]]||'00'}-${mLong[1].padStart(2,'0')}`
   const m2 = s.match(/^(\d{4}-\d{2}-\d{2})/)
   return m2 ? m2[1] : null
 }
 
+function parseOrderPayload(payload: any, originalId: string|number): ParsedOrder | null {
+  if (!payload?.order) return null
+  const order = payload.order
+  const acts = payload.tracking_data?.shipment_track_activities ?? []
+  const lastAct = acts.length > 0 ? acts[0] : null
+  const latestAct = acts.length > 0 ? acts[acts.length-1] : null
+  const city = latestAct?.location || lastAct?.location || order.customer_city || order.billing_city || order.customer_state || 'N/A'
+  const rawTime = latestAct?.date || lastAct?.date || order.order_date || ''
+  const status = payload.shipment_status_text || payload.tracking_data?.shipment_status_text || 'N/A'
+  const valueNum = parseFloat(order.order_total) || 0
+  return {
+    orderId: originalId,
+    slug: payload.company?.slug || '',
+    companyName: payload.company?.name || '',
+    orderDate: order.order_date ?? 'N/A',
+    orderTime: rawTime.length >= 16 ? rawTime.slice(11,16) : 'N/A',
+    dateYMD: toYMD(order.order_date || ''),
+    value: order.order_total ? `Rs.${valueNum.toFixed(2)}` : 'N/A',
+    valueNum,
+    payment: order.payment_method ?? 'N/A',
+    status,
+    pincode: order.customer_pincode ?? 'N/A',
+    location: city,
+  }
+}
+
 function parseTJ(tj: any, originalId: string|number) {
   if (!tj?.order) return null
-  const order = tj.order
-  const orderId = order.order_id || originalId
-  const acts = tj.tracking_data?.shipment_track_activities ?? []
-  const lastAct = acts.length > 0 ? acts[acts.length-1] : null
-  const city = lastAct?.location || order.customer_city || order.billing_city || order.customer_state || 'N/A'
-  const rawTime = acts[0]?.date || order.order_date || ''
-  return {
-    orderId,
-    slug:        tj.company?.slug || '',
-    companyName: tj.company?.name || '',
-    orderDate:   order.order_date ?? 'N/A',
-    orderTime:   rawTime.length >= 16 ? rawTime.slice(11,16) : 'N/A',
-    dateYMD:     toYMD(order.order_date || ''),
-    value:       order.order_total ? `Rs.${parseFloat(order.order_total).toFixed(2)}` : 'N/A',
-    valueNum:    parseFloat(order.order_total) || 0,
-    payment:     order.payment_method ?? 'N/A',
-    status:      tj.shipment_status_text ?? 'N/A',
-    pincode:     order.customer_pincode ?? 'N/A',
-    location:    city,
+  return parseOrderPayload(tj, originalId)
+}
+
+function extractApidata(html: string) {
+  const match = html.match(/var apidata = (\{[\s\S]*?\});/)
+  if (!match) return null
+  try {
+    return JSON.parse(match[1])
+  } catch {
+    return null
   }
+}
+
+function parseTrackingPage(html: string, originalId: string|number) {
+  if (!html || !html.includes('var apidata =')) return null
+  const apidata = extractApidata(html)
+  if (!apidata?.order || !apidata?.company?.slug) return null
+  return parseOrderPayload(apidata, originalId)
 }
 
 const UAS = [
@@ -61,16 +103,29 @@ async function fetchOneOrder(subdomain: string, orderId: string|number): Promise
   }
 
   try {
+    const endpoint = `https://${subdomain}.shiprocket.co/pocx/tracking/order/${id}`
     const res = await fetch(
-      `https://${subdomain}.shiprocket.co/pocx/tracking/order/${id}`,
+      endpoint,
       { headers, signal: AbortSignal.timeout(12000) }
     )
     if ([429, 503, 502, 403].includes(res.status)) return 'rl'
     if (!res.ok) return null
     const text = await res.text()
-    if (!text || text.length < 5 || text.trimStart().startsWith('<')) return 'rl'
+    if (!text || text.length < 5) return null
+    if (text.includes('"tracking_json":{"rider_customer_data_ds":[]}') || text.includes('"tracking_json":{}')) {
+      const fallbackRes = await fetch(
+        `https://${subdomain}.shiprocket.co/tracking/order/${id}`,
+        { headers, signal: AbortSignal.timeout(12000) }
+      )
+      if (!fallbackRes.ok) return null
+      return parseTrackingPage(await fallbackRes.text(), orderId)
+    }
+    if (text.trimStart().startsWith('<')) {
+      if (text.includes('AWB Not Found')) return null
+      return parseTrackingPage(text, orderId)
+    }
     let json: any
-    try { json = JSON.parse(text) } catch { return 'rl' }
+    try { json = JSON.parse(text) } catch { return null }
     const tj = json?.tracking_json
     if (!tj || !tj.order) return null
     return parseTJ(tj, orderId)
