@@ -4,35 +4,71 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 interface Brand { id:string; name:string; subdomain:string; slug:string; companyName:string; anchorId:number; anchorDate:string; avgPerDay:number; regressionPoints:Array<{date:string,id:number}>; idPrefix:string }
 interface Order { orderId:number|string; slug:string; orderDate:string; orderTime:string; dateYMD:string|null; value:string; valueNum:number; payment:string; status:string; pincode:string; location:string }
 interface Run { runId:string; dateRange:string; found:number; orders:Order[]; createdAt:string }
-interface Analytics { totalOrders:number; totalRevenue:number; avgOrderVal:number; codCount:number; prepaidCount:number; codPct:number; topCities:Array<{city:string,count:number}>; daily:Array<{date:string,orders:number,revenue:number,cod:number,prepaid:number}>; hours:Array<{hour:string,count:number}>; valueBuckets:Record<string,number>; velocity:string }
+interface Analytics {
+  totalOrders:number
+  totalRevenue:number
+  avgOrderVal:number
+  codCount:number
+  prepaidCount:number
+  codPct:number
+  topCities:Array<{city:string,count:number}>
+  topPincodes:Array<{pincode:string,count:number}>
+  repeatLocations:Array<{city:string,count:number}>
+  statuses:Array<{status:string,count:number}>
+  daily:Array<{date:string,orders:number,revenue:number,cod:number,prepaid:number}>
+  hours:Array<{hour:string,count:number}>
+  valueBuckets:Record<string,number>
+  velocity:string
+  avgDailyOrders:number
+  avgDailyRevenue:number
+  revenueMomentum:number
+}
+interface ScanStats { retries:number; recovered:number; duplicates:number; gapJumps:number; lastMatchedId:number|null }
 
 const LS = { get:<T,>(k:string,d:T):T=>{try{const v=localStorage.getItem(k);return v?JSON.parse(v):d}catch{return d}}, set:(k:string,v:any)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch{}} }
 const sleep = (ms:number) => new Promise(r=>setTimeout(r,ms))
 const todayStr=()=>{const d=new Date();return`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`}
 const yestStr=()=>{const d=new Date();d.setDate(d.getDate()-1);return`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`}
+const daysAgoStr=(days:number)=>{const d=new Date();d.setDate(d.getDate()-days);return`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`}
+const monthStartStr=()=>{const d=new Date();return`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-01`}
 const sortOrders=(o:Order[])=>[...o].sort((a,b)=>(a.dateYMD||'').localeCompare(b.dateYMD||'')||(a.orderTime||'').localeCompare(b.orderTime||''))
 const fmtRs=(n:number)=>'Rs.'+Math.round(n||0).toLocaleString('en-IN')
 const esc=(v:any)=>`"${String(v??'').replace(/"/g,'""')}"`
 const fmt=(n:number)=>'Rs.'+Number(n||0).toFixed(2)
 const RTO=new Set(['HUB','ETAIL','E-TAIL','SORTING','GATEWAY','DEPOT','FACILITY','WAREHOUSE','PROCESSING','COUNTER','DISPATCH','SURFACE'])
 const isRTO=(c:string)=>{const u=(c||'').toUpperCase().trim();if(!u||u==='N/A')return true;return u.split(/[\s,\-]+/).some(w=>RTO.has(w))}
+const recommendedAutoStop=(concurrency:number,avgPerDay:number)=>Math.max(250,concurrency*100,Math.ceil((avgPerDay||0)*4))
+const uniqueOrders=(orders:Order[])=>Object.values(Object.fromEntries(orders.map(o=>[String(o.orderId),o])))
+const mergeScanStats=(prev:ScanStats,patch:Partial<ScanStats>):ScanStats=>({
+  retries: prev.retries + (patch.retries||0),
+  recovered: prev.recovered + (patch.recovered||0),
+  duplicates: prev.duplicates + (patch.duplicates||0),
+  gapJumps: prev.gapJumps + (patch.gapJumps||0),
+  lastMatchedId: patch.lastMatchedId ?? prev.lastMatchedId,
+})
 
 function buildAnalytics(orders:Order[]):Analytics|null {
   if(!orders.length)return null
   const N=orders.length,rev=orders.reduce((s,r)=>s+(r.valueNum||0),0)
   const cod=orders.filter(r=>(r.payment||'').toUpperCase()==='COD')
-  const cityMap:Record<string,number>={},dayMap:Record<string,any>={},hourMap:Record<string,number>={},valMap:Record<string,number>={'0-500':0,'500-1k':0,'1k-1.5k':0,'1.5k-2k':0,'2k+':0}
+  const cityMap:Record<string,number>={},pinMap:Record<string,number>={},statusMap:Record<string,number>={},dayMap:Record<string,any>={},hourMap:Record<string,number>={},valMap:Record<string,number>={'0-500':0,'500-1k':0,'1k-1.5k':0,'1.5k-2k':0,'2k+':0}
   orders.forEach(r=>{
     const c=(r.location||'N/A').trim();if(!isRTO(c))cityMap[c]=(cityMap[c]||0)+1
+    const pin=(r.pincode||'N/A').trim();if(pin&&pin!=='N/A')pinMap[pin]=(pinMap[pin]||0)+1
+    const status=(r.status||'N/A').trim();statusMap[status]=(statusMap[status]||0)+1
     if(r.dateYMD){if(!dayMap[r.dateYMD])dayMap[r.dateYMD]={orders:0,revenue:0,cod:0,prepaid:0};dayMap[r.dateYMD].orders++;dayMap[r.dateYMD].revenue+=r.valueNum||0;(r.payment||'').toUpperCase()==='COD'?dayMap[r.dateYMD].cod++:dayMap[r.dateYMD].prepaid++}
     if(r.orderTime&&r.orderTime!=='N/A'){const h=r.orderTime.slice(0,2)+'h';hourMap[h]=(hourMap[h]||0)+1}
     const v=r.valueNum||0;if(v<500)valMap['0-500']++;else if(v<1000)valMap['500-1k']++;else if(v<1500)valMap['1k-1.5k']++;else if(v<2000)valMap['1.5k-2k']++;else valMap['2k+']++
   })
   const topCities=Object.entries(cityMap).sort((a,b)=>b[1]-a[1]).slice(0,10).map(([city,count])=>({city,count}))
+  const topPincodes=Object.entries(pinMap).sort((a,b)=>b[1]-a[1]).slice(0,10).map(([pincode,count])=>({pincode,count}))
+  const repeatLocations=Object.entries(cityMap).filter(([,count])=>count>1).sort((a,b)=>b[1]-a[1]).slice(0,8).map(([city,count])=>({city,count}))
+  const statuses=Object.entries(statusMap).sort((a,b)=>b[1]-a[1]).map(([status,count])=>({status,count}))
   const daily=Object.keys(dayMap).sort().map(k=>({date:k,...dayMap[k]}))
   const hours=Object.entries(hourMap).sort((a,b)=>b[1]-a[1]).slice(0,8).map(([h,c])=>({hour:h,count:c}))
-  let velocity='stable';if(daily.length>=6){const rec=daily.slice(-3).reduce((s,d)=>s+d.orders,0)/3,old=daily.slice(0,3).reduce((s,d)=>s+d.orders,0)/3;if(rec>old*1.15)velocity='growing';else if(rec<old*0.85)velocity='shrinking'}
-  return{totalOrders:N,totalRevenue:rev,avgOrderVal:rev/N,codCount:cod.length,prepaidCount:N-cod.length,codPct:Math.round((cod.length/N)*100),topCities,daily,hours,valueBuckets:valMap,velocity}
+  let velocity='stable',revenueMomentum=0
+  if(daily.length>=6){const rec=daily.slice(-3).reduce((s,d)=>s+d.orders,0)/3,old=daily.slice(0,3).reduce((s,d)=>s+d.orders,0)/3;if(rec>old*1.15)velocity='growing';else if(rec<old*0.85)velocity='shrinking';const recRev=daily.slice(-3).reduce((s,d)=>s+d.revenue,0)/3,oldRev=daily.slice(0,3).reduce((s,d)=>s+d.revenue,0)/3;revenueMomentum=oldRev?Math.round(((recRev-oldRev)/oldRev)*100):0}
+  return{totalOrders:N,totalRevenue:rev,avgOrderVal:rev/N,codCount:cod.length,prepaidCount:N-cod.length,codPct:Math.round((cod.length/N)*100),topCities,topPincodes,repeatLocations,statuses,daily,hours,valueBuckets:valMap,velocity,avgDailyOrders:Math.round((N/Math.max(daily.length,1))*10)/10,avgDailyRevenue:rev/Math.max(daily.length,1),revenueMomentum}
 }
 
 function buildCSV(orders:Order[]){let s='Order ID,Date,Time,Value,Payment,Status,Location,Pincode\n';sortOrders(orders).forEach(r=>s+=`${esc(r.orderId)},${esc(r.orderDate)},${esc(r.orderTime)},${esc(r.value)},${esc(r.payment)},${esc(r.status)},${esc(r.location)},${esc(r.pincode)}\n`);return s}
@@ -40,8 +76,11 @@ function buildReport(orders:Order[],brandName:string,dateRange:string){
   const a=buildAnalytics(orders);if(!a)return''
   const fd=(ymd:string)=>{const[y,m,d]=ymd.split('-');return new Date(+y,+m-1,+d).toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'numeric'})}
   let s=`BRAND INTELLIGENCE REPORT\nBrand,${esc(brandName)}\nDate Range,${esc(dateRange)}\nGenerated,${new Date().toLocaleString('en-IN')}\n\n`
-  s+=`SUMMARY\nTotal Orders,${a.totalOrders}\nRevenue,${fmt(a.totalRevenue)}\nAvg Value,${fmt(a.avgOrderVal)}\nCOD,${a.codCount} (${a.codPct}%)\nPrepaid,${a.prepaidCount}\nVelocity,${a.velocity}\n\n`
+  s+=`SUMMARY\nTotal Orders,${a.totalOrders}\nRevenue,${fmt(a.totalRevenue)}\nAvg Value,${fmt(a.avgOrderVal)}\nCOD,${a.codCount} (${a.codPct}%)\nPrepaid,${a.prepaidCount}\nVelocity,${a.velocity}\nAvg Daily Orders,${a.avgDailyOrders}\nAvg Daily Revenue,${fmt(a.avgDailyRevenue)}\nRevenue Momentum,${a.revenueMomentum}%\n\n`
   s+='TOP CITIES\nCity,Orders\n';a.topCities.forEach(c=>s+=`${esc(c.city)},${c.count}\n`)
+  s+='\nTOP PINCODES\nPincode,Orders\n';a.topPincodes.forEach(p=>s+=`${esc(p.pincode)},${p.count}\n`)
+  s+='\nSTATUS BREAKDOWN\nStatus,Orders\n';a.statuses.forEach(st=>s+=`${esc(st.status)},${st.count}\n`)
+  s+='\nREPEAT LOCATIONS\nCity,Orders\n';a.repeatLocations.forEach(c=>s+=`${esc(c.city)},${c.count}\n`)
   s+='\nPEAK HOURS\nHour,Orders\n';a.hours.forEach(h=>s+=`${esc(h.hour)},${h.count}\n`)
   s+='\nVALUE DISTRIBUTION\nBucket,Orders\n';Object.entries(a.valueBuckets).forEach(([k,v])=>s+=`${esc('Rs.'+k)},${v}\n`)
   s+='\nDAILY BREAKDOWN\nDate,Orders,Revenue,COD,Prepaid\n';a.daily.forEach(d=>s+=`${esc(fd(d.date))},${d.orders},${fmt(d.revenue)},${d.cod},${d.prepaid}\n`)
@@ -49,6 +88,11 @@ function buildReport(orders:Order[],brandName:string,dateRange:string){
   return s
 }
 function dlFile(content:string,filename:string){const a=document.createElement('a');a.href='data:text/csv;charset=utf-8,'+encodeURIComponent(content);a.download=filename;a.click()}
+function buildWhatsappSummary(orders:Order[],brandName:string,dateRange:string){
+  const a=buildAnalytics(orders);if(!a)return''
+  const top=a.topCities[0],pin=a.topPincodes[0],status=a.statuses[0]
+  return `📦 *${brandName}*\nRange: ${dateRange}\nOrders: *${a.totalOrders}* | Revenue: *${fmtRs(a.totalRevenue)}*\nAOV: ${fmtRs(a.avgOrderVal)} | COD: ${a.codCount} (${a.codPct}%)\nDaily Avg: ${a.avgDailyOrders} orders | ${fmtRs(a.avgDailyRevenue)}\n`+(top?`Top city: ${top.city} (${top.count})\n`:'')+(pin?`Top pin: ${pin.pincode} (${pin.count})\n`:'')+(status?`Lead status: ${status.status} (${status.count})\n`:'')+`Trend: ${a.velocity} | Revenue momentum: ${a.revenueMomentum}%`
+}
 
 const darkVars={'--bg':'#0d0d0d','--surface':'#161616','--surface2':'#1e1e1e','--border':'#252525','--accent':'#00ff88','--warn':'#ff6b35','--text':'#e8e8e8','--muted':'#555','--red':'#ff4444'}
 const lightVars={'--bg':'#f5f5f0','--surface':'#fff','--surface2':'#efefea','--border':'#ddd','--accent':'#008844','--warn':'#cc5500','--text':'#111','--muted':'#888','--red':'#cc2222'}
@@ -60,10 +104,13 @@ class Scanner {
   private onLog:(m:string,c:string)=>void
   private onProgress:(done:number,total:number,found:number)=>void
   private onOrder:(o:Order)=>void
+  private onStats?:(s:Partial<ScanStats>)=>void
+  private seen=new Set<string>()
 
-  constructor(subdomain:string,slug:string,idPrefix:string,onLog:(m:string,c:string)=>void,onProgress:(done:number,total:number,found:number)=>void,onOrder:(o:Order)=>void){
+  constructor(subdomain:string,slug:string,idPrefix:string,onLog:(m:string,c:string)=>void,onProgress:(done:number,total:number,found:number)=>void,onOrder:(o:Order)=>void,onStats?:(s:Partial<ScanStats>)=>void){
     this.subdomain=subdomain;this.slug=slug;this.idPrefix=idPrefix
     this.onLog=onLog;this.onProgress=onProgress;this.onOrder=onOrder
+    this.onStats=onStats
   }
   stop(){this.stopped=true}
   private toId(n:number):string|number{return this.idPrefix?`${this.idPrefix}${n}`:n}
@@ -155,10 +202,12 @@ class Scanner {
       for(let i=0;i<ids.length&&!this.stopped;i++){
         let o=results[i];scanned++
         if((!o||o==='rl'||o.slug!==this.slug)&&useAuto){
+          this.onStats?.({retries:1})
           await sleep(120)
           const retry=await this.probe(ids[i])
           if(retry&&retry!=='rl'&&retry.slug===this.slug){
             o=retry
+            this.onStats?.({recovered:1})
             this.onLog(`#${ids[i]} recovered on retry`,'info')
           }else if(retry==='rl'){
             o='rl'
@@ -166,8 +215,22 @@ class Scanner {
             o=null
           }
         }
-        if(o&&o!=='rl'&&o.slug===this.slug){orders.push(o);matched++;misses=0;this.onOrder(o);this.onLog(`#${ids[i]}  ${o.orderDate}  ${o.value}  ${o.payment}  ${o.location}`,'ok')}
+        if(o&&o!=='rl'&&o.slug===this.slug){
+          const key=String(o.orderId)
+          if(this.seen.has(key)){this.onStats?.({duplicates:1});continue}
+          this.seen.add(key)
+          orders.push(o);matched++;misses=0;this.onOrder(o);this.onStats?.({lastMatchedId:Scanner.numericPart(o.orderId)});this.onLog(`#${ids[i]}  ${o.orderDate}  ${o.value}  ${o.payment}  ${o.location}`,'ok')
+        }
         else if(o!=='rl'){misses++;if(useAuto&&misses>=stopAfter){this.onLog(`Auto-stopped after ${stopAfter} consecutive confirmed misses`,'info');this.stopped=true}}
+      }
+      if(useAuto&&misses>=Math.max(concurrency*4,12)&&!this.stopped){
+        const probeAhead=base+Math.max(concurrency*10,25)
+        const ahead=await this.probe(probeAhead)
+        if(ahead&&ahead!=='rl'&&ahead.slug===this.slug){
+          misses=0
+          this.onStats?.({gapJumps:1,lastMatchedId:Scanner.numericPart(ahead.orderId)})
+          this.onLog(`Gap jump: found live order at #${probeAhead}, continuing auto scan`,'info')
+        }
       }
       this.onProgress(startId+scanned-1,endId,matched)
       await sleep(batchDelay())
@@ -181,13 +244,14 @@ export default function App(){
   const[light,setLight]=useState(false)
   const[brands,setBrands]=useState<Brand[]>([])
   const[active,setActive]=useState<Brand|null>(null)
-  const[tab,setTab]=useState<'date'|'manual'|'analytics'|'history'|'settings'>('date')
+  const[tab,setTab]=useState<'date'|'manual'|'analytics'|'compare'|'history'|'settings'>('date')
   const[runs,setRuns]=useState<Run[]>([])
   const[lastOrders,setLastOrders]=useState<Order[]>([])
   const[analytics,setAnalytics]=useState<Analytics|null>(null)
   const[scanning,setScanning]=useState(false)
   const[log,setLog]=useState<Array<{msg:string,cls:string}>>([{msg:'Select a date range and click Find & Scrape.',cls:''}])
   const[progress,setProgress]=useState({done:0,total:0,found:0})
+  const[scanStats,setScanStats]=useState<ScanStats>({retries:0,recovered:0,duplicates:0,gapJumps:0,lastMatchedId:null})
   const[startedAt,setStartedAt]=useState(0)
   const[scanLabel,setScanLabel]=useState('')
   const[showAdd,setShowAdd]=useState(false)
@@ -210,13 +274,14 @@ export default function App(){
   function deleteBrand(id:string){if(!confirm('Delete this brand and all data?'))return;const u=brands.filter(b=>b.id!==id);setBrands(u);LS.set('brands',u);localStorage.removeItem(`runs_${id}`);const n=u[0]||null;setActive(n);if(n)loadRuns(n);else{setRuns([]);setLastOrders([]);setAnalytics(null)}}
 
   function saveRun(brand:Brand,orders:Order[],label:string){
-    if(!orders.length)return
-    const run:Run={runId:Date.now().toString(),dateRange:label,found:orders.length,orders,createdAt:new Date().toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'numeric'})}
+    const cleaned=uniqueOrders(orders)
+    if(!cleaned.length)return
+    const run:Run={runId:Date.now().toString(),dateRange:label,found:cleaned.length,orders:cleaned,createdAt:new Date().toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'numeric'})}
     const updated=[run,...LS.get<Run[]>(`runs_${brand.id}`,[])].slice(0,50)
-    LS.set(`runs_${brand.id}`,updated);setRuns(updated);setLastOrders(orders);setAnalytics(buildAnalytics(orders))
+    LS.set(`runs_${brand.id}`,updated);setRuns(updated);setLastOrders(cleaned);setAnalytics(buildAnalytics(cleaned))
     const toNum=(id:number|string)=>typeof id==='number'?id:parseInt(String(id).replace(/[^0-9]/g,''))||0
     const byDate:Record<string,{min:number,max:number}>={}
-    orders.forEach(o=>{if(!o.dateYMD)return;const n=toNum(o.orderId);if(!byDate[o.dateYMD])byDate[o.dateYMD]={min:n,max:n};else{byDate[o.dateYMD].min=Math.min(byDate[o.dateYMD].min,n);byDate[o.dateYMD].max=Math.max(byDate[o.dateYMD].max,n)}})
+    cleaned.forEach(o=>{if(!o.dateYMD)return;const n=toNum(o.orderId);if(!byDate[o.dateYMD])byDate[o.dateYMD]={min:n,max:n};else{byDate[o.dateYMD].min=Math.min(byDate[o.dateYMD].min,n);byDate[o.dateYMD].max=Math.max(byDate[o.dateYMD].max,n)}})
     const newPts=Object.entries(byDate).map(([date,{min,max}])=>({date,id:Math.round((min+max)/2)}))
     const merged=Object.values(Object.fromEntries([...(brand.regressionPoints||[]),...newPts].map(p=>[p.date,p]))).sort((a:any,b:any)=>a.date.localeCompare(b.date)) as Array<{date:string,id:number}>
     let newAvg=brand.avgPerDay
@@ -224,7 +289,7 @@ export default function App(){
     const u2={...brand,regressionPoints:merged.slice(-30),avgPerDay:newAvg}
     setActive(u2);setBrands(brands.map(b=>b.id===brand.id?u2:b));LS.set('brands',brands.map(b=>b.id===brand.id?u2:b))
     const url=LS.get(`sheets_${brand.id}`,'')
-    if(url&&orders.length>0)syncToSheets(url,orders).then(n=>n>0&&addLog(`✓ Sheets: ${n} rows synced`,'ok'))
+    if(url&&cleaned.length>0)syncToSheets(url,cleaned).then(n=>n>0&&addLog(`✓ Sheets: ${n} rows synced`,'ok'))
   }
 
   async function syncToSheets(url:string,orders:Order[]):Promise<number>{
@@ -256,10 +321,11 @@ export default function App(){
     if(!active||scanning)return
     const brand=active
     setScanning(true);setLog([]);ordersRef.current=[];rateWindow.current=[]
+    setScanStats({retries:0,recovered:0,duplicates:0,gapJumps:0,lastMatchedId:null})
     setProgress({done:0,total:0,found:0});setStartedAt(Date.now());setScanLabel(`${fromDate} → ${toDate}`)
     if('wakeLock' in navigator){try{(navigator as any).wakeLock.request('screen').catch(()=>{})}catch{}}
     addLog('⚠ Keep this tab active — switching tabs may pause the scan','info')
-    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]})
+    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)))
     scannerRef.current=scanner
     try{
       addLog(`Finding boundaries for ${fromDate} → ${toDate}...`,'info')
@@ -280,16 +346,20 @@ export default function App(){
   async function startManualScan(startId:number,endId:number,concurrency:number,useAuto:boolean,stopAfter:number){
     if(!active||scanning)return
     const brand=active
+    const safeStopAfter=useAuto?Math.max(stopAfter,recommendedAutoStop(concurrency,brand.avgPerDay||0)):stopAfter
     setScanning(true);setLog([]);ordersRef.current=[];rateWindow.current=[]
+    setScanStats({retries:0,recovered:0,duplicates:0,gapJumps:0,lastMatchedId:null})
     setProgress({done:0,total:useAuto?0:endId-startId+1,found:0});const sa=Date.now();setStartedAt(sa);setScanLabel(`#${brand.idPrefix||''}${startId}–${useAuto?'auto':'#'+(brand.idPrefix||'')+endId}`)
     addLog(`Manual: #${brand.idPrefix||''}${startId}–${useAuto?'auto':'#'+(brand.idPrefix||'')+endId} | ${concurrency}x`,'info')
-    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]})
+    if(useAuto&&safeStopAfter!==stopAfter)addLog(`Raised auto-stop from ${stopAfter} to ${safeStopAfter} for safer scanning`,'info')
+    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)))
     scannerRef.current=scanner
     try{
       const maxId=useAuto?startId+100000:endId
-      const orders=await scanner.scanManual(startId,maxId,concurrency,useAuto,stopAfter,sa)
+      const orders=await scanner.scanManual(startId,maxId,concurrency,useAuto,safeStopAfter,sa)
       const dates=orders.map(r=>r.dateYMD).filter(Boolean).sort()
       const label=dates.length<2?'manual':`${dates[0]} to ${dates[dates.length-1]}`
+      if(orders.length>0){const highest=Math.max(...orders.map(o=>parseInt(String(o.orderId).replace(/[^0-9]/g,''))||0));LS.set(`manual_resume_${brand.id}`,highest+1)}
       if(orders.length>0)saveRun(brand,orders,label)
       addLog(`✓ Done: ${label} — ${orders.length} orders`,'ok')
     }catch(e:any){
@@ -341,9 +411,9 @@ export default function App(){
         <>
           <DashboardStrip runs={runs}/>
           <div style={{display:'flex',borderBottom:'1px solid var(--border)',marginBottom:16,overflowX:'auto'}}>
-            {(['date','manual','analytics','history','settings'] as const).map(t=>(
+            {(['date','manual','analytics','compare','history','settings'] as const).map(t=>(
               <button key={t} onClick={()=>setTab(t)} style={{background:'none',border:'none',borderBottom:`2px solid ${tab===t?'var(--accent)':'transparent'}`,color:tab===t?'var(--accent)':'var(--muted)',fontSize:10,fontWeight:700,letterSpacing:'.08em',textTransform:'uppercase',padding:'8px 14px',cursor:'pointer',marginBottom:-1,whiteSpace:'nowrap',fontFamily:'inherit'}}>
-                {t==='date'?'By Date':t.charAt(0).toUpperCase()+t.slice(1)}
+                {t==='date'?'By Date':t==='compare'?'Compare':t.charAt(0).toUpperCase()+t.slice(1)}
               </button>
             ))}
           </div>
@@ -358,6 +428,13 @@ export default function App(){
                     <span>{progress.done.toLocaleString()} / {progress.total?progress.total.toLocaleString():'?'} — <b style={{color:'var(--accent)'}}>{progress.found} found</b></span>
                     <span style={{color:'var(--accent)'}}>{eta?`ETA: ${eta}`:''}</span>
                   </div>
+                  <div style={{display:'flex',gap:10,flexWrap:'wrap',fontSize:9,color:'var(--muted)',marginBottom:6}}>
+                    <span>Retries: <b style={{color:'var(--accent)'}}>{scanStats.retries}</b></span>
+                    <span>Recovered: <b style={{color:'var(--accent)'}}>{scanStats.recovered}</b></span>
+                    <span>Gap jumps: <b style={{color:'var(--accent)'}}>{scanStats.gapJumps}</b></span>
+                    <span>Duplicates skipped: <b style={{color:'var(--accent)'}}>{scanStats.duplicates}</b></span>
+                    {scanStats.lastMatchedId&&<span>Last live ID: <b style={{color:'var(--accent)'}}>#{active?.idPrefix||''}{scanStats.lastMatchedId}</b></span>}
+                  </div>
                   <div style={{background:'var(--surface)',border:'1px solid var(--border)',borderRadius:4,height:6,overflow:'hidden'}}>
                     <div style={{height:'100%',background:'var(--accent)',width:`${pct.toFixed(1)}%`,transition:'width .3s',borderRadius:4}}/>
                   </div>
@@ -371,12 +448,13 @@ export default function App(){
                 <div style={{display:'flex',gap:8}}>
                   <button onClick={()=>dlFile(buildCSV(lastOrders),`${active.name}_export.csv`)} style={{flex:1,background:'var(--surface)',border:'1px solid var(--border)',color:'var(--text)',padding:9,borderRadius:6,fontSize:11,fontWeight:700,fontFamily:'inherit',cursor:'pointer'}}>↓ CSV ({lastOrders.length})</button>
                   <button onClick={()=>dlFile(buildReport(lastOrders,active.name,scanLabel||'export'),`${active.name}_report.csv`)} style={{flex:1,background:'var(--surface)',border:'1px solid var(--border)',color:'var(--text)',padding:9,borderRadius:6,fontSize:11,fontWeight:700,fontFamily:'inherit',cursor:'pointer'}}>↓ Full Report</button>
-                  <button onClick={()=>{const a2=buildAnalytics(lastOrders);if(!a2)return;;const top=a2.topCities[0];const txt=`📦 *${active.name}*\nOrders: *${a2.totalOrders}* | Revenue: *${fmtRs(a2.totalRevenue)}*\nCOD: ${a2.codCount} (${a2.codPct}%) | Avg: ${fmtRs(a2.avgOrderVal)}\n`+(top?`🏆 ${top.city} (${top.count})\n`:'')+`📈 ${a2.velocity}`;navigator.clipboard.writeText(txt).then(()=>addLog('WA summary copied!','ok'))}} style={{flex:1,background:'var(--surface)',border:'1px solid #25d366',color:'#25d366',padding:9,borderRadius:6,fontSize:11,fontWeight:700,fontFamily:'inherit',cursor:'pointer'}}>📱 WA</button>
+                  <button onClick={()=>navigator.clipboard.writeText(buildWhatsappSummary(lastOrders,active.name,scanLabel||'export')).then(()=>addLog('WA summary copied!','ok'))} style={{flex:1,background:'var(--surface)',border:'1px solid #25d366',color:'#25d366',padding:9,borderRadius:6,fontSize:11,fontWeight:700,fontFamily:'inherit',cursor:'pointer'}}>📱 WA</button>
                 </div>
               )}
             </>
           )}
           {tab==='analytics'&&<AnalyticsTab analytics={analytics}/>}
+          {tab==='compare'&&<CompareTab brands={brands}/>}
           {tab==='history'&&<HistoryTab runs={runs} brandName={active.name} onClear={()=>{localStorage.removeItem(`runs_${active.id}`);setRuns([]);setLastOrders([]);setAnalytics(null)}}/>}
           {tab==='settings'&&<SettingsTab brands={brands} active={active} runs={runs} onDelete={deleteBrand} onSync={(url:string,orders:Order[])=>syncToSheets(url,orders)} inp={inp} lbl={lbl}/>}
         </>
@@ -412,9 +490,12 @@ function AddBrandForm({onAdd,onCancel,inp,lbl}:any){
   return(
     <div style={{background:'var(--surface)',border:'1px solid var(--accent)',borderRadius:10,padding:20,marginBottom:16}}>
       <div style={{fontSize:11,fontWeight:700,color:'var(--accent)',letterSpacing:'.08em',textTransform:'uppercase',marginBottom:14}}>+ Add New Brand</div>
+      <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:8,marginBottom:14,fontSize:9}}>
+        {['1. Paste URL','2. Verify one live order','3. Save calibrated brand'].map(step=><div key={step} style={{background:'var(--surface2)',border:'1px solid var(--border)',borderRadius:6,padding:'8px 10px',color:'var(--muted)'}}>{step}</div>)}
+      </div>
       <div style={{display:'grid',gap:10}}>
         <div><label style={lbl}>Shiprocket URL (auto-fills subdomain)</label><input value={url} onChange={e=>handleUrl(e.target.value)} placeholder="https://everlasting.shiprocket.co/" style={inp}/></div>
-        <div style={{background:'var(--surface2)',border:'1px solid var(--border)',borderRadius:6,padding:'8px 10px',fontSize:9,color:'var(--warn)'}}>⚠ Use <b>order ID</b> from Shiprocket dashboard — NOT the tracking ID from courier</div>
+        <div style={{background:'var(--surface2)',border:'1px solid var(--border)',borderRadius:6,padding:'8px 10px',fontSize:9,color:'var(--warn)',lineHeight:1.8}}>⚠ Use <b>order ID</b> from Shiprocket dashboard — NOT the courier tracking ID.<br/>Tip: choose a recent known order so calibration finds nearby orders faster.</div>
         <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
           <div><label style={lbl}>Brand Name</label><input value={name} onChange={e=>setName(e.target.value)} placeholder="e.g. Everlasting" style={inp}/></div>
           <div><label style={lbl}>Subdomain</label><input value={sub} onChange={e=>setSub(e.target.value)} placeholder="e.g. everlasting" style={inp}/></div>
@@ -455,6 +536,7 @@ function DashboardStrip({runs}:{runs:Run[]}){
 
 function DateTab({active,scanning,scanLabel,onStart,inp,lbl}:any){
   const[from,setFrom]=useState(yestStr());const[to,setTo]=useState(todayStr());const[conc,setConc]=useState('5')
+  const presetBtn=(label:string,f:string,t:string)=><button key={label} onClick={()=>{setFrom(f);setTo(t)}} style={{background:'var(--surface)',border:'1px solid var(--border)',color:'var(--muted)',padding:'6px 10px',borderRadius:20,fontSize:9,fontFamily:'inherit',cursor:'pointer'}}>{label}</button>
   return(
     <div>
       <div style={{background:'var(--surface)',border:'1px solid var(--border)',borderRadius:6,padding:'8px 12px',marginBottom:12,fontSize:9,color:'var(--muted)',lineHeight:1.8}}>
@@ -463,6 +545,13 @@ function DateTab({active,scanning,scanLabel,onStart,inp,lbl}:any){
       {scanning&&scanLabel&&<div style={{background:'var(--surface)',border:'1px solid var(--accent)',borderRadius:6,padding:'7px 12px',marginBottom:10,fontSize:11,color:'var(--accent)',fontWeight:700}}>🔍 Scanning: {scanLabel}</div>}
       {!scanning&&(
         <>
+          <div style={{display:'flex',gap:6,flexWrap:'wrap',marginBottom:10}}>
+            {presetBtn('Today',todayStr(),todayStr())}
+            {presetBtn('Yesterday',yestStr(),yestStr())}
+            {presetBtn('Last 7 Days',daysAgoStr(6),todayStr())}
+            {presetBtn('Last 30 Days',daysAgoStr(29),todayStr())}
+            {presetBtn('MTD',monthStartStr(),todayStr())}
+          </div>
           <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
             <div><label style={lbl}>From</label><input type="date" value={from} onChange={e=>setFrom(e.target.value)} style={inp}/></div>
             <div><label style={lbl}>To</label><input type="date" value={to} onChange={e=>setTo(e.target.value)} style={inp}/></div>
@@ -482,6 +571,8 @@ function DateTab({active,scanning,scanLabel,onStart,inp,lbl}:any){
 function ManualTab({active,scanning,scanLabel,onStart,inp,lbl}:any){
   const[startId,setStartId]=useState('');const[endId,setEndId]=useState('');const[useAuto,setUseAuto]=useState(false);const[stopAfter,setStopAfter]=useState('500');const[conc,setConc]=useState('5')
   const pfx=active.idPrefix||''
+  const recommendedStop=recommendedAutoStop(parseInt(conc)||5,active?.avgPerDay||0)
+  const resumeId=LS.get(`manual_resume_${active?.id}`,'')
   return(
     <div>
       {scanning&&scanLabel&&<div style={{background:'var(--surface)',border:'1px solid var(--accent)',borderRadius:6,padding:'7px 12px',marginBottom:10,fontSize:11,color:'var(--accent)',fontWeight:700}}>🔍 Scanning: {scanLabel}</div>}
@@ -495,7 +586,8 @@ function ManualTab({active,scanning,scanLabel,onStart,inp,lbl}:any){
             <span style={{fontSize:10,color:'var(--muted)'}}>Auto-detect end (stop after N consecutive misses)</span>
             <input type="checkbox" checked={useAuto} onChange={e=>setUseAuto(e.target.checked)} style={{accentColor:'var(--accent)',width:16,height:16}}/>
           </div>
-          {useAuto&&<div style={{marginBottom:10}}><label style={lbl}>Stop after N misses</label><div style={{display:'flex',alignItems:'center',gap:8}}><input type="number" value={stopAfter} onChange={e=>setStopAfter(e.target.value)} style={{...inp,width:90}}/><span style={{fontSize:9,color:'var(--muted)'}}>Tip: use 500+ at 5x to avoid false stops from rate limits</span></div></div>}
+          {resumeId&&<div style={{display:'flex',justifyContent:'space-between',alignItems:'center',background:'var(--surface2)',border:'1px solid var(--border)',borderRadius:6,padding:'8px 10px',marginBottom:10,fontSize:10,color:'var(--muted)'}}><span>Resume suggestion: start from #{pfx}{resumeId}</span><button onClick={()=>setStartId(String(resumeId))} style={{background:'none',border:'1px solid var(--accent)',color:'var(--accent)',padding:'4px 8px',borderRadius:4,fontSize:9,fontFamily:'inherit',cursor:'pointer'}}>Use resume ID</button></div>}
+          {useAuto&&<div style={{marginBottom:10}}><label style={lbl}>Stop after N misses</label><div style={{display:'flex',alignItems:'center',gap:8}}><input type="number" value={stopAfter} onChange={e=>setStopAfter(e.target.value)} style={{...inp,width:90}}/><span style={{fontSize:9,color:'var(--muted)'}}>Safe floor here: {recommendedStop}. Lower values are auto-raised, and misses are retried once before counting.</span></div></div>}
           <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:12,fontSize:11,color:'var(--muted)'}}>
             <span>Concurrent fetches</span>
             <select value={conc} onChange={e=>setConc(e.target.value)} style={{...inp,width:'auto',padding:'5px 8px',fontSize:11}}>{['3','5','8','10'].map(v=><option key={v} value={v}>{v}</option>)}</select>
@@ -518,7 +610,7 @@ function AnalyticsTab({analytics}:{analytics:Analytics|null}){
   return(
     <div style={{display:'grid',gap:12}}>
       <div style={{display:'grid',gridTemplateColumns:'repeat(2,1fr)',gap:8}}>
-        {[['Total Orders',String(a.totalOrders),''],['Total Revenue',fmtRs(a.totalRevenue),''],['Avg Order Value',fmtRs(a.avgOrderVal),`Trend: ${a.velocity}`],['COD vs Prepaid',`${a.codCount} / ${a.prepaidCount}`,`${a.codPct}% COD`]].map(([l,v,s])=>(
+        {[['Total Orders',String(a.totalOrders),`Daily avg ${a.avgDailyOrders}`],['Total Revenue',fmtRs(a.totalRevenue),`Daily avg ${fmtRs(a.avgDailyRevenue)}`],['Avg Order Value',fmtRs(a.avgOrderVal),`Trend: ${a.velocity}`],['COD vs Prepaid',`${a.codCount} / ${a.prepaidCount}`,`${a.codPct}% COD`],['Revenue Momentum',`${a.revenueMomentum}%`,'Recent vs early window'],['Tracked Statuses',String(a.statuses.length),'Distinct status labels']].map(([l,v,s])=>(
           <div key={l} style={{background:'var(--surface)',border:'1px solid var(--border)',borderRadius:8,padding:'10px 12px'}}>
             <div style={{fontSize:8,color:'var(--muted)',textTransform:'uppercase',letterSpacing:'.08em',marginBottom:4}}>{l}</div>
             <div style={{fontSize:16,fontWeight:700,color:'var(--accent)'}}>{v}</div>
@@ -527,6 +619,9 @@ function AnalyticsTab({analytics}:{analytics:Analytics|null}){
         ))}
       </div>
       <Sec title="Top Cities (excl. courier hubs)">{a.topCities.slice(0,8).map(c=><Row key={c.city} label={c.city} value={String(c.count)}/>)}</Sec>
+      <Sec title="Top Pincodes">{a.topPincodes.slice(0,8).map(p=><Row key={p.pincode} label={p.pincode} value={String(p.count)}/>)}</Sec>
+      <Sec title="Status Breakdown">{a.statuses.slice(0,8).map(s=><Row key={s.status} label={s.status} value={String(s.count)}/>)}</Sec>
+      <Sec title="Repeat Locations">{a.repeatLocations.length?a.repeatLocations.map(c=><Row key={c.city} label={c.city} value={String(c.count)}/>):<div style={{fontSize:10,color:'var(--muted)'}}>No repeat customer locations detected yet.</div>}</Sec>
       <Sec title="Peak Order Hours"><div style={{display:'flex',flexWrap:'wrap',gap:6}}>{a.hours.map(h=><div key={h.hour} style={{background:'var(--surface2)',border:'1px solid var(--border)',borderRadius:4,padding:'4px 10px',fontSize:10}}><b style={{color:'var(--accent)'}}>{h.hour}</b><span style={{color:'var(--muted)',marginLeft:6}}>{h.count}</span></div>)}</div></Sec>
       <Sec title="Value Distribution">{Object.entries(a.valueBuckets).map(([k,v])=><Row key={k} label={`Rs.${k}`} value={String(v)}/>)}</Sec>
       <Sec title="Daily Breakdown">
@@ -540,6 +635,34 @@ function AnalyticsTab({analytics}:{analytics:Analytics|null}){
 }
 function Sec({title,children}:{title:string,children:React.ReactNode}){return<div style={{background:'var(--surface)',border:'1px solid var(--border)',borderRadius:8,padding:'10px 12px'}}><div style={{fontSize:8,color:'var(--muted)',textTransform:'uppercase',letterSpacing:'.08em',marginBottom:8}}>{title}</div>{children}</div>}
 function Row({label,value}:{label:string,value:string}){return<div style={{display:'flex',justifyContent:'space-between',fontSize:11,padding:'3px 0',borderBottom:'1px solid var(--border)'}}><span style={{color:'var(--text)'}}>{label}</span><span style={{color:'var(--accent)',fontWeight:700}}>{value}</span></div>}
+
+function CompareTab({brands}:{brands:Brand[]}){
+  const snapshots=brands.map(b=>{
+    const runs=LS.get<Run[]>(`runs_${b.id}`,[])
+    const latest=runs[0],prev=runs[1]
+    const latestA=latest?buildAnalytics(uniqueOrders(latest.orders)):null
+    const prevA=prev?buildAnalytics(uniqueOrders(prev.orders)):null
+    const delta=latestA&&prevA?latestA.totalOrders-prevA.totalOrders:null
+    return latestA?{brand:b,latest,latestA,prevA,delta}:null
+  }).filter(Boolean) as Array<{brand:Brand;latest:Run;latestA:Analytics;prevA:Analytics|null;delta:number|null}>
+  if(!snapshots.length)return<div style={{textAlign:'center',padding:'40px 20px',color:'var(--muted)',fontSize:11}}>Run scans for multiple brands to compare them here.</div>
+  const ranked=[...snapshots].sort((a,b)=>b.latestA.totalOrders-a.latestA.totalOrders)
+  return(
+    <div style={{display:'grid',gap:12}}>
+      <Sec title="Latest Brand Snapshot">
+        <div style={{overflowX:'auto'}}><table style={{width:'100%',fontSize:10,borderCollapse:'collapse'}}>
+          <thead><tr>{['Brand','Range','Orders','Revenue','AOV','COD %','Velocity','Run Delta'].map(h=><th key={h} style={{textAlign:h==='Brand'||h==='Range'?'left':'right',padding:'4px 8px',borderBottom:'1px solid var(--border)',color:'var(--muted)',fontWeight:600}}>{h}</th>)}</tr></thead>
+          <tbody>{ranked.map(({brand,latest,latestA,delta})=><tr key={brand.id} style={{borderBottom:'1px solid var(--border)'}}><td style={{padding:'6px 8px',color:'var(--accent)',fontWeight:700}}>{brand.name}</td><td style={{padding:'6px 8px',color:'var(--muted)'}}>{latest.dateRange}</td><td style={{padding:'6px 8px',textAlign:'right'}}>{latestA.totalOrders}</td><td style={{padding:'6px 8px',textAlign:'right'}}>{fmtRs(latestA.totalRevenue)}</td><td style={{padding:'6px 8px',textAlign:'right'}}>{fmtRs(latestA.avgOrderVal)}</td><td style={{padding:'6px 8px',textAlign:'right'}}>{latestA.codPct}%</td><td style={{padding:'6px 8px',textAlign:'right',color:'var(--accent)'}}>{latestA.velocity}</td><td style={{padding:'6px 8px',textAlign:'right',color:delta===null?'var(--muted)':delta>=0?'var(--accent)':'var(--warn)'}}>{delta===null?'--':`${delta>=0?'+':''}${delta}`}</td></tr>)}</tbody>
+        </table></div>
+      </Sec>
+      <Sec title="Brand Movement Summary">
+        <div style={{display:'grid',gap:8}}>
+          {ranked.map(({brand,latestA,delta})=><div key={brand.id} style={{fontSize:10,color:'var(--muted)',lineHeight:1.8}}><b style={{color:'var(--accent)'}}>{brand.name}</b> is {latestA.velocity} with {latestA.totalOrders} orders, {fmtRs(latestA.totalRevenue)} revenue, {latestA.codPct}% COD and {delta===null?'no prior run for comparison':`${delta>=0?'an increase':'a drop'} of ${Math.abs(delta)} orders vs previous run`}.</div>)}
+        </div>
+      </Sec>
+    </div>
+  )
+}
 
 function HistoryTab({runs,brandName,onClear}:{runs:Run[],brandName:string,onClear:()=>void}){
   if(!runs.length)return<div style={{textAlign:'center',padding:'40px 20px',color:'var(--muted)',fontSize:11}}>No runs yet.</div>
