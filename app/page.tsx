@@ -195,9 +195,8 @@ class Scanner {
 
   async scanManual(startId:number,endId:number,concurrency:number,useAuto:boolean,stopAfter:number,startedAt:number):Promise<Order[]>{
     const orders:Order[]=[],batchDelay=()=>this.rlStreak>0?Math.min(this.rlStreak*1500,15000):300
-    let scanned=0,matched=0,misses=0
-    for(let base=startId;base<=endId&&!this.stopped;base+=concurrency){
-      const ids=Array.from({length:Math.min(concurrency,endId-base+1)},(_,i)=>base+i)
+    const processBatch=async(ids:number[])=>{
+      let batchMatches=0,batchMisses=0
       const results=await this.fetchBatch(ids)
       for(let i=0;i<ids.length&&!this.stopped;i++){
         let o=results[i];scanned++
@@ -219,22 +218,80 @@ class Scanner {
           const key=String(o.orderId)
           if(this.seen.has(key)){this.onStats?.({duplicates:1});continue}
           this.seen.add(key)
-          orders.push(o);matched++;misses=0;this.onOrder(o);this.onStats?.({lastMatchedId:Scanner.numericPart(o.orderId)});this.onLog(`#${ids[i]}  ${o.orderDate}  ${o.value}  ${o.payment}  ${o.location}`,'ok')
-        }
-        else if(o!=='rl'){misses++;if(useAuto&&misses>=stopAfter){this.onLog(`Auto-stopped after ${stopAfter} consecutive confirmed misses`,'info');this.stopped=true}}
-      }
-      if(useAuto&&misses>=Math.max(concurrency*4,12)&&!this.stopped){
-        const probeAhead=base+Math.max(concurrency*10,25)
-        const ahead=await this.probe(probeAhead)
-        if(ahead&&ahead!=='rl'&&ahead.slug===this.slug){
-          misses=0
-          this.onStats?.({gapJumps:1,lastMatchedId:Scanner.numericPart(ahead.orderId)})
-          this.onLog(`Gap jump: found live order at #${probeAhead}, continuing auto scan`,'info')
+          orders.push(o);matched++;batchMatches++;this.onOrder(o);this.onStats?.({lastMatchedId:Scanner.numericPart(o.orderId)});this.onLog(`#${ids[i]}  ${o.orderDate}  ${o.value}  ${o.payment}  ${o.location}`,'ok')
+        }else if(o!=='rl'){
+          batchMisses++
         }
       }
-      this.onProgress(startId+scanned-1,endId,matched)
-      await sleep(batchDelay())
+      return { batchMatches, batchMisses }
     }
+
+    let scanned=0,matched=0
+    if(!useAuto){
+      for(let base=startId;base<=endId&&!this.stopped;base+=concurrency){
+        const ids=Array.from({length:Math.min(concurrency,endId-base+1)},(_,i)=>base+i)
+        await processBatch(ids)
+        this.onProgress(startId+scanned-1,endId,matched)
+        await sleep(batchDelay())
+      }
+      return orders
+    }
+
+    const windowSize=Math.max(250,Math.min(5000,stopAfter))
+    const probeStride=Math.max(windowSize,concurrency*100)
+    const emptyWindowLimit=3
+    let nextBase=startId,emptyWindows=0,lastMatchedId:number|null=null
+    this.onLog(`Auto mode uses verified windows of ${windowSize} IDs with forward probes`,'info')
+
+    while(nextBase<=endId&&!this.stopped){
+      const windowEnd=Math.min(endId,nextBase+windowSize-1)
+      let windowMatches=0,windowMisses=0
+      for(let base=nextBase;base<=windowEnd&&!this.stopped;base+=concurrency){
+        const ids=Array.from({length:Math.min(concurrency,windowEnd-base+1)},(_,i)=>base+i)
+        const res=await processBatch(ids)
+        windowMatches+=res.batchMatches
+        windowMisses+=res.batchMisses
+        this.onProgress(scanned,0,matched)
+        await sleep(batchDelay())
+      }
+
+      if(windowMatches>0){
+        emptyWindows=0
+        lastMatchedId=Math.max(lastMatchedId||0,...orders.slice(-windowMatches).map(o=>Scanner.numericPart(o.orderId)))
+        nextBase=windowEnd+1
+        continue
+      }
+
+      const probeIds=[windowEnd+concurrency,windowEnd+Math.floor(probeStride/2),windowEnd+probeStride].filter(id=>id<=endId)
+      let recoveredAhead:number|null=null
+      for(const pid of probeIds){
+        const ahead=await this.probe(pid)
+        if(ahead&&ahead!=='rl'&&ahead.slug===this.slug){
+          recoveredAhead=Scanner.numericPart(ahead.orderId)
+          break
+        }
+        await sleep(80)
+      }
+
+      if(recoveredAhead!==null){
+        emptyWindows=0
+        lastMatchedId=recoveredAhead
+        const jumpBase=Math.max(windowEnd+1,recoveredAhead-Math.max(concurrency*2,20))
+        this.onStats?.({gapJumps:1,lastMatchedId:recoveredAhead})
+        this.onLog(`Gap jump: skipped sparse region and re-anchored near #${recoveredAhead}`,'info')
+        nextBase=jumpBase
+        continue
+      }
+
+      emptyWindows++
+      this.onLog(`Verified empty window ${emptyWindows}/${emptyWindowLimit} at #${nextBase}-#${windowEnd}`,'info')
+      if(lastMatchedId!==null&&emptyWindows>=emptyWindowLimit){
+        this.onLog(`Auto-stopped after ${emptyWindowLimit} consecutive verified empty windows beyond #${lastMatchedId}`,'info')
+        break
+      }
+      nextBase=windowEnd+1
+    }
+
     return orders
   }
 }
@@ -347,15 +404,17 @@ export default function App(){
     if(!active||scanning)return
     const brand=active
     const safeStopAfter=useAuto?Math.max(stopAfter,recommendedAutoStop(concurrency,brand.avgPerDay||0)):stopAfter
+    const autoHardCap=startId+Math.max(20000,Math.min(250000,(brand.avgPerDay||0)*45))
     setScanning(true);setLog([]);ordersRef.current=[];rateWindow.current=[]
     setScanStats({retries:0,recovered:0,duplicates:0,gapJumps:0,lastMatchedId:null})
     setProgress({done:0,total:useAuto?0:endId-startId+1,found:0});const sa=Date.now();setStartedAt(sa);setScanLabel(`#${brand.idPrefix||''}${startId}–${useAuto?'auto':'#'+(brand.idPrefix||'')+endId}`)
     addLog(`Manual: #${brand.idPrefix||''}${startId}–${useAuto?'auto':'#'+(brand.idPrefix||'')+endId} | ${concurrency}x`,'info')
     if(useAuto&&safeStopAfter!==stopAfter)addLog(`Raised auto-stop from ${stopAfter} to ${safeStopAfter} for safer scanning`,'info')
+    if(useAuto)addLog(`Auto hard cap set to #${brand.idPrefix||''}${autoHardCap} based on current brand velocity`,'info')
     const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)))
     scannerRef.current=scanner
     try{
-      const maxId=useAuto?startId+100000:endId
+      const maxId=useAuto?autoHardCap:endId
       const orders=await scanner.scanManual(startId,maxId,concurrency,useAuto,safeStopAfter,sa)
       const dates=orders.map(r=>r.dateYMD).filter(Boolean).sort()
       const label=dates.length<2?'manual':`${dates[0]} to ${dates[dates.length-1]}`
