@@ -244,15 +244,17 @@ class Scanner {
       return orders
     }
 
-    const windowSize=Math.max(250,Math.min(5000,stopAfter))
-    const probeStride=Math.max(windowSize,concurrency*100)
+    const normalWindowSize=Math.max(250,Math.min(5000,stopAfter))
     const emptyWindowLimit=3
-    let nextBase=startId,emptyWindows=0,lastMatchedId:number|null=null,currentConcurrency=concurrency,retryFailureStreak=0,cooldowns=0
-    this.onLog(`Auto mode uses verified windows of ${windowSize} IDs with forward probes`,'info')
+    let nextBase=startId,emptyWindows=0,lastMatchedId:number|null=null,currentConcurrency=concurrency,retryFailureStreak=0,cooldowns=0,lowSlowMode=false,cleanWindows=0
+    this.onLog(`Auto mode uses verified windows of ${normalWindowSize} IDs with forward probes`,'info')
 
     while(nextBase<=endId&&!this.stopped){
+      const windowSize=lowSlowMode?Math.max(25,currentConcurrency*20):normalWindowSize
+      const probeStride=lowSlowMode?Math.max(60,currentConcurrency*40):Math.max(windowSize,concurrency*100)
       const windowEnd=Math.min(endId,nextBase+windowSize-1)
       let windowMatches=0,windowMisses=0,windowRetryFailures=0
+      this.onLog(`${lowSlowMode?'Low-slow':'Auto'} window: #${nextBase}-#${windowEnd} at ${currentConcurrency}x`,'info')
       for(let base=nextBase;base<=windowEnd&&!this.stopped;base+=currentConcurrency){
         const ids=Array.from({length:Math.min(currentConcurrency,windowEnd-base+1)},(_,i)=>base+i)
         const res=await processBatch(ids)
@@ -266,19 +268,28 @@ class Scanner {
       if(windowMatches>0){
         emptyWindows=0
         retryFailureStreak=0
-        if(currentConcurrency<concurrency&&windowRetryFailures===0)currentConcurrency=Math.min(concurrency,currentConcurrency+1)
+        cleanWindows++
+        if(lowSlowMode&&cleanWindows>=2&&windowRetryFailures===0){
+          currentConcurrency=Math.min(concurrency,currentConcurrency+1)
+          if(currentConcurrency>=Math.min(3,concurrency)){lowSlowMode=false;this.onLog('Exiting low-slow mode and resuming normal scan speed','info')}
+        }else if(!lowSlowMode&&currentConcurrency<concurrency&&windowRetryFailures===0){
+          currentConcurrency=Math.min(concurrency,currentConcurrency+1)
+        }
         lastMatchedId=Math.max(lastMatchedId||0,...orders.slice(-windowMatches).map(o=>Scanner.numericPart(o.orderId)))
         nextBase=windowEnd+1
         continue
       }
 
       retryFailureStreak+=windowRetryFailures
-      if(windowRetryFailures>=Math.max(25,currentConcurrency*8)){
+      const throttleLikely=windowRetryFailures>=Math.max(lowSlowMode?8:12,currentConcurrency*4)||(scanned>=50&&windowRetryFailures>Math.max(windowMatches,3))
+      if(throttleLikely){
         cooldowns++
-        const cooldownMs=Math.min(45000,15000+cooldowns*5000)
-        currentConcurrency=Math.max(1,Math.floor(currentConcurrency/2))
+        lowSlowMode=true
+        cleanWindows=0
+        const cooldownMs=Math.min(30000,8000+cooldowns*4000)
+        currentConcurrency=1
         this.rlStreak=0
-        this.onLog(`Possible Shiprocket throttling: cooling down ${Math.round(cooldownMs/1000)}s and dropping concurrency to ${currentConcurrency}x`,'info')
+        this.onLog(`Possible Shiprocket throttling: cooling down ${Math.round(cooldownMs/1000)}s and switching to low-slow mode at 1x`,'info')
         await sleep(cooldownMs)
         const resumeProbe=await this.probe(lastMatchedId!==null?lastMatchedId+1:nextBase)
         if(resumeProbe&&resumeProbe!=='rl'&&resumeProbe.slug===this.slug){
@@ -287,6 +298,7 @@ class Scanner {
           retryFailureStreak=0
           continue
         }
+        this.onLog('Cooldown probe still weak, continuing in low-slow mode with short verified windows','info')
       }
 
       const probeIds=[windowEnd+concurrency,windowEnd+Math.floor(probeStride/2),windowEnd+probeStride].filter(id=>id<=endId)
