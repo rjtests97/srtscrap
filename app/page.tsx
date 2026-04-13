@@ -153,9 +153,21 @@ class Scanner {
       const ids=Array.from({length:Math.min(concurrency,endId-base+1)},(_,i)=>base+i)
       const results=await this.fetchBatch(ids)
       for(let i=0;i<ids.length&&!this.stopped;i++){
-        const o=results[i];scanned++
+        let o=results[i];scanned++
+        if((!o||o==='rl'||o.slug!==this.slug)&&useAuto){
+          await sleep(120)
+          const retry=await this.probe(ids[i])
+          if(retry&&retry!=='rl'&&retry.slug===this.slug){
+            o=retry
+            this.onLog(`#${ids[i]} recovered on retry`,'info')
+          }else if(retry==='rl'){
+            o='rl'
+          }else{
+            o=null
+          }
+        }
         if(o&&o!=='rl'&&o.slug===this.slug){orders.push(o);matched++;misses=0;this.onOrder(o);this.onLog(`#${ids[i]}  ${o.orderDate}  ${o.value}  ${o.payment}  ${o.location}`,'ok')}
-        else if(o!=='rl'){misses++;if(useAuto&&misses>=stopAfter){this.onLog(`Auto-stopped after ${stopAfter} consecutive misses`,'info');this.stopped=true}}
+        else if(o!=='rl'){misses++;if(useAuto&&misses>=stopAfter){this.onLog(`Auto-stopped after ${stopAfter} consecutive confirmed misses`,'info');this.stopped=true}}
       }
       this.onProgress(startId+scanned-1,endId,matched)
       await sleep(batchDelay())
