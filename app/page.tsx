@@ -246,7 +246,7 @@ class Scanner {
 
     const normalWindowSize=Math.max(250,Math.min(5000,stopAfter))
     const emptyWindowLimit=3
-    let nextBase=startId,emptyWindows=0,lastMatchedId:number|null=null,currentConcurrency=concurrency,retryFailureStreak=0,cooldowns=0,lowSlowMode=false,cleanWindows=0
+    let nextBase=startId,emptyWindows=0,lastMatchedId:number|null=null,currentConcurrency=concurrency,retryFailureStreak=0,cooldowns=0,lowSlowMode=false,cleanWindows=0,stallScans=0
     this.onLog(`Auto mode uses verified windows of ${normalWindowSize} IDs with forward probes`,'info')
 
     while(nextBase<=endId&&!this.stopped){
@@ -268,6 +268,7 @@ class Scanner {
       if(windowMatches>0){
         emptyWindows=0
         retryFailureStreak=0
+        stallScans=0
         cleanWindows++
         if(lowSlowMode&&cleanWindows>=2&&windowRetryFailures===0){
           currentConcurrency=Math.min(concurrency,currentConcurrency+1)
@@ -281,6 +282,17 @@ class Scanner {
       }
 
       retryFailureStreak+=windowRetryFailures
+      stallScans+=windowMisses+windowRetryFailures
+      if(lastMatchedId!==null&&stallScans>=Math.max(40,currentConcurrency*20)){
+        lowSlowMode=true
+        cleanWindows=0
+        currentConcurrency=1
+        const reanchorBase=lastMatchedId+1
+        this.onLog(`Frontier stalled after ${stallScans} non-progress scans beyond #${lastMatchedId}; re-anchoring at #${reanchorBase} in low-slow mode`,'info')
+        stallScans=0
+        nextBase=reanchorBase
+        continue
+      }
       const throttleLikely=windowRetryFailures>=Math.max(lowSlowMode?8:12,currentConcurrency*4)||(scanned>=50&&windowRetryFailures>Math.max(windowMatches,3))
       if(throttleLikely){
         cooldowns++
