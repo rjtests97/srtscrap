@@ -103,75 +103,99 @@ const darkVars={'--bg':'#0d0d0d','--surface':'#161616','--surface2':'#1e1e1e','-
 const lightVars={'--bg':'#f5f5f0','--surface':'#fff','--surface2':'#efefea','--border':'#ddd','--accent':'#008844','--warn':'#cc5500','--text':'#111','--muted':'#888','--red':'#cc2222'}
 
 // ── Scanner ───────────────────────────────────────────
+// KEY INSIGHT: Every order ID on brand.shiprocket.co belongs to THAT brand.
+// Null = order doesn't exist yet (end of orders). 'rl' = rate limited (retry).
+// Never stop on rate limits — cooldown and resume always.
 class Scanner {
   private subdomain:string; private slug:string; private idPrefix:string
-  private stopped=false; private rlStreak=0
+  public stopped=false; private rlStreak=0
   private onLog:(m:string,c:string)=>void
   private onProgress:(done:number,total:number,found:number)=>void
   private onOrder:(o:Order)=>void
   private onStats?:(s:Partial<ScanStats>)=>void
-  private seen=new Set<string>()
 
-  constructor(subdomain:string,slug:string,idPrefix:string,onLog:(m:string,c:string)=>void,onProgress:(done:number,total:number,found:number)=>void,onOrder:(o:Order)=>void,onStats?:(s:Partial<ScanStats>)=>void){
+  constructor(subdomain:string,slug:string,idPrefix:string,
+    onLog:(m:string,c:string)=>void,
+    onProgress:(done:number,total:number,found:number)=>void,
+    onOrder:(o:Order)=>void,
+    onStats?:(s:Partial<ScanStats>)=>void
+  ){
     this.subdomain=subdomain;this.slug=slug;this.idPrefix=idPrefix
-    this.onLog=onLog;this.onProgress=onProgress;this.onOrder=onOrder
-    this.onStats=onStats
+    this.onLog=onLog;this.onProgress=onProgress;this.onOrder=onOrder;this.onStats=onStats
   }
+
   stop(){this.stopped=true}
   private toId(n:number):string|number{return this.idPrefix?`${this.idPrefix}${n}`:n}
-  static numericPart(id:number|string):number{if(typeof id==='number')return id;const m=String(id).match(/(\d+)$/);return m?parseInt(m[1]):0}
-
-  async fetchBatch(ids:number[]):Promise<Array<Order|null|'rl'>>{
-    if(this.stopped)return ids.map(()=>null)
-    if(this.rlStreak>0){
-      const w=Math.min(this.rlStreak*1500,12000)
-      this.onLog(`Rate limit (streak ${this.rlStreak}) — waiting ${(w/1000).toFixed(1)}s...`,'info')
-      await sleep(w)
-    }
-    if(this.stopped)return ids.map(()=>null)
-    try{
-      const orderIds=ids.map(n=>this.toId(n))
-      const res=await fetch('/api/proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({subdomain:this.subdomain,ids:orderIds})})
-      if(!res.ok){this.rlStreak++;return ids.map(()=>'rl')}
-      const{results}=await res.json()
-      // Count rl vs successful
-      const rlCount=results.filter((r:any)=>r==='rl').length
-      const okCount=results.filter((r:any)=>r&&r!=='rl').length
-      if(rlCount>0&&okCount===0)this.rlStreak++
-      else if(okCount>0)this.rlStreak=Math.max(0,this.rlStreak-1)
-      return results
-    }catch(e:any){
-      this.onLog(`Fetch error: ${e.message}`,'err')
-      this.rlStreak++
-      return ids.map(()=>null)
-    }
+  static numericPart(id:number|string):number{
+    if(typeof id==='number')return id
+    const m=String(id).match(/(\d+)$/)
+    return m?parseInt(m[1]):0
   }
 
-  async probe(id:number):Promise<Order|null|'rl'>{const r=await this.fetchBatch([id]);return r[0]}
+  // Single call to proxy — returns results or all-'rl' on any HTTP failure
+  private async callProxy(ids:number[]):Promise<Array<Order|null|'rl'>>{
+    try{
+      const orderIds=ids.map(n=>this.toId(n))
+      const res=await fetch('/api/proxy',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({subdomain:this.subdomain,ids:orderIds})
+      })
+      if(!res.ok)return ids.map(()=>'rl' as const)
+      const{results}=await res.json()
+      return results
+    }catch{return ids.map(()=>'rl' as const)}
+  }
 
-  async walkToBracket(refId:number,refDate:string,targetDate:string,logPrefix:string):Promise<{lo:number,hi:number}>{
+  // Fetch with infinite retry on rate limit — escalating cooldowns, never gives up
+  private async fetchBatch(ids:number[]):Promise<Array<Order|null|'rl'>>{
+    if(this.stopped)return ids.map(()=>null)
+    const COOLDOWNS=[5,15,30,60,120,180,300] // seconds
+    let attempt=0
+    while(!this.stopped){
+      const results=await this.callProxy(ids)
+      // If even one result is not 'rl', the call succeeded
+      if(results.some(r=>r!=='rl')){
+        if(this.rlStreak>0){this.rlStreak=0;this.onLog('Connection restored — resuming scan','ok')}
+        return results
+      }
+      // All rate limited
+      attempt++
+      this.rlStreak++
+      this.onStats?.({retries:1})
+      const waitSec=COOLDOWNS[Math.min(attempt-1,COOLDOWNS.length-1)]
+      const label=waitSec>=60?Math.round(waitSec/60)+'m':waitSec+'s'
+      this.onLog('Rate limited (x'+attempt+') — waiting '+label+' then resuming...','info')
+      for(let t=0;t<waitSec*1000&&!this.stopped;t+=500)await sleep(Math.min(500,waitSec*1000-t))
+    }
+    return ids.map(()=>null)
+  }
+
+  private async probe(id:number):Promise<Order|null|'rl'>{
+    const r=await this.callProxy([id]);return r[0]
+  }
+
+  // Walk from a known point to find the ID bracket around a target date
+  async walkToBracket(refId:number,refDate:string,targetDate:string,label:string):Promise<{lo:number,hi:number}>{
     const forward=targetDate>refDate
-    let lo=refId,hi=refId,lastFoundId:number|string=refId,lastFoundDate=refDate,missesAfterLastFound=0
-    const numId=(o:Order)=>Scanner.numericPart(o.orderId)
-    this.onLog(`${logPrefix}: walking ${forward?'→':'←'} from #${this.idPrefix}${refId} (${refDate})`,'info')
+    let lo=refId,hi=refId,lastId=refId,consNulls=0
+    this.onLog(label+': walking '+(forward?'forward':'back')+' from #'+this.idPrefix+refId+' ('+refDate+')','info')
     for(let i=1;i<=400&&!this.stopped;i++){
       const pid=forward?refId+i*500:Math.max(1,refId-i*500)
       const o=await this.probe(pid)
-      if(o&&o!=='rl'&&o.slug===this.slug&&o.dateYMD){
-        lastFoundId=o.orderId;lastFoundDate=o.dateYMD;missesAfterLastFound=0
-        this.onLog(`  #${o.orderId} = ${o.orderDate}`,'info')
+      if(o&&o!=='rl'&&o.dateYMD){
+        consNulls=0;lastId=Scanner.numericPart(o.orderId)
+        this.onLog('  #'+o.orderId+' = '+o.orderDate,'info')
         if(forward){
-          if(o.dateYMD>=targetDate){hi=numId(o);break}
-          lo=numId(o)
-          const daysLeft=(new Date(targetDate+'T00:00:00').getTime()-new Date(o.dateYMD+'T00:00:00').getTime())/86400000
-          if(daysLeft<=5){hi=numId(o)+3000;break}
+          if(o.dateYMD>=targetDate){hi=lastId;break}
+          lo=lastId
+          if((new Date(targetDate+'T00:00:00').getTime()-new Date(o.dateYMD+'T00:00:00').getTime())/86400000<=5){hi=lastId+3000;break}
         }else{
-          if(o.dateYMD<targetDate){lo=numId(o);break}
-          hi=numId(o)
+          if(o.dateYMD<targetDate){lo=lastId;break}
+          hi=lastId
         }
-      }else{
-        missesAfterLastFound++
-        if(forward&&lo>refId&&missesAfterLastFound>=4){hi=Scanner.numericPart(lastFoundId)+1500;break}
+      }else if(o===null){
+        consNulls++
+        if(forward&&lo>refId&&consNulls>=4){hi=lastId+1500;break}
       }
       await sleep(60)
       if(!forward&&pid<=1)break
@@ -180,98 +204,112 @@ class Scanner {
     return{lo,hi}
   }
 
-  async findBoundaries(anchorId:number,anchorDate:string,regressionPoints:Array<{date:string,id:number}>,fromDate:string,toDate:string):Promise<{scanStart:number,scanEnd:number}>{
-    const pts=[{date:anchorDate,id:anchorId},...regressionPoints].filter(p=>p.date&&p.id>0).sort((a,b)=>a.date.localeCompare(b.date))
-    const closest=(t:string)=>pts.reduce((best,p)=>Math.abs(new Date(p.date+'T00:00:00').getTime()-new Date(t+'T00:00:00').getTime())<Math.abs(new Date(best.date+'T00:00:00').getTime()-new Date(t+'T00:00:00').getTime())?p:best,pts[0])
-    const refFrom=closest(fromDate)
-    const fromBracket=await this.walkToBracket(refFrom.id,refFrom.date,fromDate,'fromDate')
+  async findBoundaries(anchorId:number,anchorDate:string,regPts:Array<{date:string,id:number}>,fromDate:string,toDate:string):Promise<{scanStart:number,scanEnd:number}>{
+    const pts=[{date:anchorDate,id:anchorId},...regPts].filter(p=>p.date&&p.id>0).sort((a,b)=>a.date.localeCompare(b.date))
+    const closest=(t:string)=>pts.reduce((b,p)=>
+      Math.abs(new Date(p.date+'T00:00:00').getTime()-new Date(t+'T00:00:00').getTime())<
+      Math.abs(new Date(b.date+'T00:00:00').getTime()-new Date(t+'T00:00:00').getTime())?p:b,pts[0])
+    const rF=closest(fromDate)
+    const fromB=await this.walkToBracket(rF.id,rF.date,fromDate,'fromDate')
     if(this.stopped)return{scanStart:0,scanEnd:0}
-    const toRef=fromBracket.lo>closest(toDate).id?{id:fromBracket.lo,date:fromDate}:closest(toDate)
-    const toBracket=await this.walkToBracket(toRef.id,toRef.date,toDate,'toDate')
-    const scanStart=Math.max(1,fromBracket.lo-100)
-    const scanEnd=toBracket.hi+100
-    this.onLog(`✓ Range: #${this.idPrefix}${scanStart}–#${this.idPrefix}${scanEnd} (${scanEnd-scanStart+1} IDs)`,'ok')
+    const rT=fromB.lo>closest(toDate).id?{id:fromB.lo,date:fromDate}:closest(toDate)
+    const toB=await this.walkToBracket(rT.id,rT.date,toDate,'toDate')
+    const scanStart=Math.max(1,fromB.lo-100)
+    const scanEnd=toB.hi+100
+    this.onLog('Range: #'+this.idPrefix+scanStart+' to #'+this.idPrefix+scanEnd+' ('+( scanEnd-scanStart+1)+' IDs)','ok')
     return{scanStart,scanEnd}
   }
 
-  private static BURST = 40
-  private static REST  = 3000
+  // Scan IDs in bursts with mandatory rest between bursts
+  // Burst = scan N IDs fast; Rest = pause so Shiprocket rate limit resets
+  // On RL during a burst: fetchBatch handles it internally with cooldown
+  private static BURST=80   // IDs per burst
+  private static REST=3000  // ms rest between bursts (3s)
 
   async scanRange(scanStart:number,scanEnd:number,fromDate:string,toDate:string,concurrency:number,startedAt:number):Promise<Order[]>{
     const orders:Order[]=[]
     let scanned=0,matched=0,burst=0
+    const total=scanEnd-scanStart+1
 
     for(let base=scanStart;base<=scanEnd&&!this.stopped;){
       const burstEnd=Math.min(base+Scanner.BURST-1,scanEnd)
       burst++
-      this.onLog('Burst '+burst+': #'+this.toId(base)+'..#'+this.toId(burstEnd),'info')
+      this.onLog('Burst '+burst+': #'+this.toId(base)+' → #'+this.toId(burstEnd),'info')
 
       for(let b=base;b<=burstEnd&&!this.stopped;b+=concurrency){
         const ids=Array.from({length:Math.min(concurrency,burstEnd-b+1)},(_,i)=>b+i)
         const results=await this.fetchBatch(ids)
         for(let i=0;i<ids.length;i++){
           const o=results[i];scanned++
-          if(o&&o!=='rl'&&o.slug===this.slug&&o.dateYMD&&o.dateYMD>=fromDate&&o.dateYMD<=toDate){
+          // On brand's own tracking page: all non-null results are brand orders
+          if(o&&o!=='rl'&&o.dateYMD&&o.dateYMD>=fromDate&&o.dateYMD<=toDate){
             orders.push(o);matched++;this.onOrder(o)
             this.onLog('#'+ids[i]+'  '+o.orderDate+'  '+o.value+'  '+o.payment+'  '+o.location+'  '+o.pincode,'ok')
           }
         }
         this.onProgress(scanStart+scanned-1,scanEnd,matched)
-        await sleep(150)
+        await sleep(100)
       }
 
       base=burstEnd+1
       if(base>scanEnd||this.stopped)break
 
-      const pct=Math.round(scanned/(scanEnd-scanStart+1)*100)
-      this.onLog('Rest '+Scanner.REST/1000+'s... (burst '+burst+' done, '+matched+' found, '+pct+'% complete)','info')
-      this.onStats?.({retries:this.rlStreak,lastMatchedId:Scanner.numericPart(orders[orders.length-1]?.orderId??0)})
+      const pct=Math.round(scanned/total*100)
+      this.onLog('Rest '+(Scanner.REST/1000)+'s — burst '+burst+' done | '+matched+' found | '+pct+'% complete','info')
+      this.onStats?.({lastMatchedId:matched>0?Scanner.numericPart(orders[orders.length-1].orderId):null})
       for(let t=0;t<Scanner.REST&&!this.stopped;t+=300)await sleep(Math.min(300,Scanner.REST-t))
     }
     return orders
   }
 
+  // Manual scan: keep going until stopAfter consecutive MISSING IDs (nulls, not rate limits)
+  // 'rl' results don't count as misses — fetchBatch handles them with cooldown
   async scanManual(startId:number,endId:number,concurrency:number,useAuto:boolean,stopAfter:number,startedAt:number):Promise<Order[]>{
     const orders:Order[]=[]
-    let scanned=0,matched=0,misses=0,burst=0
+    let scanned=0,matched=0,consNulls=0,burst=0
 
     for(let base=startId;base<=endId&&!this.stopped;){
       const burstEnd=Math.min(base+Scanner.BURST-1,endId)
       burst++
-      this.onLog('Burst '+burst+': #'+this.toId(base)+'..#'+this.toId(burstEnd),'info')
+      this.onLog('Burst '+burst+': #'+this.toId(base)+' → #'+this.toId(burstEnd),'info')
 
       for(let b=base;b<=burstEnd&&!this.stopped;b+=concurrency){
         const ids=Array.from({length:Math.min(concurrency,burstEnd-b+1)},(_,i)=>b+i)
         const results=await this.fetchBatch(ids)
+
         for(let i=0;i<ids.length&&!this.stopped;i++){
           const o=results[i];scanned++
-          if(o&&o!=='rl'&&o.slug===this.slug){
-            orders.push(o);matched++;misses=0
+          if(o==='rl') continue  // rate limited — fetchBatch already waited, just skip counting
+          if(o!==null){
+            // Got an order — record it
+            orders.push(o);matched++;consNulls=0
             this.onStats?.({lastMatchedId:Scanner.numericPart(o.orderId)})
             this.onOrder(o)
             this.onLog('#'+ids[i]+'  '+o.orderDate+'  '+o.value+'  '+o.payment+'  '+o.location,'ok')
-          }else if(o!=='rl'){
-            misses++
-            if(useAuto&&misses>=stopAfter){
-              this.onLog('Auto-stopped: '+stopAfter+' consecutive misses','info')
+          }else if(o===null){
+            // Truly missing ID — increment miss counter
+            consNulls++
+            if(useAuto&&consNulls>=stopAfter){
+              this.onLog('Auto-stopped: '+stopAfter+' consecutive missing IDs (last order: #'+this.toId(ids[i]-consNulls)+')','ok')
               this.stopped=true
             }
           }
         }
         this.onProgress(startId+scanned-1,endId,matched)
-        await sleep(150)
+        await sleep(100)
       }
 
       base=burstEnd+1
       if(base>endId||this.stopped)break
 
-      this.onLog('Rest '+Scanner.REST/1000+'s... ('+matched+' found, '+misses+' consecutive misses)','info')
+      this.onLog('Rest '+(Scanner.REST/1000)+'s — burst '+burst+' | '+matched+' found | '+consNulls+' null streak','info')
       this.onStats?.({retries:this.rlStreak})
       for(let t=0;t<Scanner.REST&&!this.stopped;t+=300)await sleep(Math.min(300,Scanner.REST-t))
     }
     return orders
   }
 }
+
 
 // ── App ───────────────────────────────────────────────
 export default function App(){
@@ -381,19 +419,17 @@ export default function App(){
     if(!active||scanning)return
     if(!Number.isFinite(startId)||startId<=0){addLog('Invalid start ID. Please enter a real numeric Shiprocket order ID.','err');return}
     const brand=active
-    const safeStopAfter=useAuto?Math.max(stopAfter,recommendedAutoStop(concurrency,brand.avgPerDay||0)):stopAfter
     const autoHardCap=startId+Math.max(20000,Math.min(250000,(brand.avgPerDay||0)*45))
     setScanning(true);setLog([]);ordersRef.current=[];rateWindow.current=[]
     setScanStats({retries:0,recovered:0,duplicates:0,gapJumps:0,lastMatchedId:null})
     setProgress({done:0,total:useAuto?0:endId-startId+1,found:0});const sa=Date.now();setStartedAt(sa);setScanLabel(`#${brand.idPrefix||''}${startId}–${useAuto?'auto':'#'+(brand.idPrefix||'')+endId}`)
-    addLog(`Manual: #${brand.idPrefix||''}${startId}–${useAuto?'auto':'#'+(brand.idPrefix||'')+endId} | ${concurrency}x`,'info')
-    if(useAuto&&safeStopAfter!==stopAfter)addLog(`Raised auto-stop from ${stopAfter} to ${safeStopAfter} for safer scanning`,'info')
-    if(useAuto)addLog(`Auto hard cap set to #${brand.idPrefix||''}${autoHardCap} based on current brand velocity`,'info')
+    addLog(`Manual: #${brand.idPrefix||''}${startId}–${useAuto?'auto':'#'+(brand.idPrefix||'')+endId} | ${concurrency}x | stop after ${stopAfter} misses`,'info')
+    if(useAuto)addLog(`Hard cap: #${brand.idPrefix||''}${autoHardCap}`,'info')
     const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)))
     scannerRef.current=scanner
     try{
       const maxId=useAuto?autoHardCap:endId
-      const orders=await scanner.scanManual(startId,maxId,concurrency,useAuto,safeStopAfter,sa)
+      const orders=await scanner.scanManual(startId,maxId,concurrency,useAuto,stopAfter,sa)
       const dates=orders.map(r=>r.dateYMD).filter(Boolean).sort()
       const label=dates.length<2?'manual':`${dates[0]} to ${dates[dates.length-1]}`
       if(orders.length>0){const highest=Math.max(...orders.map(o=>parseInt(String(o.orderId).replace(/[^0-9]/g,''))||0));LS.set(`manual_resume_${brand.id}`,highest+1)}
@@ -640,7 +676,7 @@ function ManualTab({active,scanning,scanLabel,onStart,inp,lbl}:any){
             <input type="checkbox" checked={useAuto} onChange={e=>setUseAuto(e.target.checked)} style={{accentColor:'var(--accent)',width:16,height:16}}/>
           </div>
           {resumeId>0&&<div style={{display:'flex',justifyContent:'space-between',alignItems:'center',background:'var(--surface2)',border:'1px solid var(--border)',borderRadius:6,padding:'8px 10px',marginBottom:10,fontSize:10,color:'var(--muted)'}}><span>Resume suggestion: start from #{pfx}{resumeId}</span><button onClick={()=>setStartId(String(resumeId))} style={{background:'none',border:'1px solid var(--accent)',color:'var(--accent)',padding:'4px 8px',borderRadius:4,fontSize:9,fontFamily:'inherit',cursor:'pointer'}}>Use resume ID</button></div>}
-          {useAuto&&<div style={{marginBottom:10}}><label style={lbl}>Stop after N misses</label><div style={{display:'flex',alignItems:'center',gap:8}}><input type="number" value={stopAfter} onChange={e=>setStopAfter(e.target.value)} style={{...inp,width:90}}/><span style={{fontSize:9,color:'var(--muted)'}}>Safe floor here: {recommendedStop}. Lower values are auto-raised, and misses are retried once before counting.</span></div></div>}
+          {useAuto&&<div style={{marginBottom:10}}><label style={lbl}>Stop after N misses</label><div style={{display:'flex',alignItems:'center',gap:8}}><input type="number" value={stopAfter} onChange={e=>setStopAfter(e.target.value)} style={{...inp,width:90}}/><span style={{fontSize:9,color:'var(--muted)'}}>Recommended: {recommendedStop} for this brand at {conc}x. Too low = early stop. Too high = slow.</span></div></div>}
           <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:12,fontSize:11,color:'var(--muted)'}}>
             <span>Concurrent fetches</span>
             <select value={conc} onChange={e=>setConc(e.target.value)} style={{...inp,width:'auto',padding:'5px 8px',fontSize:11}}>{['3','5','8','10'].map(v=><option key={v} value={v}>{v}</option>)}</select>
@@ -651,7 +687,8 @@ function ManualTab({active,scanning,scanLabel,onStart,inp,lbl}:any){
             const parsedStart=normalizeId(startId),parsedEnd=normalizeId(endId)
             if(!parsedStart){alert('Enter a valid numeric Start ID');return}
             if(!useAuto&&!parsedEnd){alert('Enter a valid numeric End ID');return}
-            onStart(parsedStart,parsedEnd,parseInt(conc),useAuto,parseInt(stopAfter))
+            const sa=Math.max(50,parseInt(stopAfter)||500)
+            onStart(parsedStart,parsedEnd,parseInt(conc),useAuto,sa)
           }} style={{width:'100%',background:'var(--accent)',color:'#000',border:'none',padding:11,borderRadius:8,fontSize:12,fontWeight:700,letterSpacing:'.06em',textTransform:'uppercase',marginBottom:12,fontFamily:'inherit',cursor:'pointer'}}>▶ START MANUAL SCRAPE</button>
         </>
       )}
