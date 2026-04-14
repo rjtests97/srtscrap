@@ -18,8 +18,7 @@ export async function POST(req: NextRequest) {
     }
 
     const apiRes = await fetch(`https://${sub}.shiprocket.co/pocx/tracking/order/${id}`, {
-      headers,
-      signal: AbortSignal.timeout(12000),
+      headers, signal: AbortSignal.timeout(12000),
     })
     const apiText = await apiRes.text()
     result.apiStatus = apiRes.status
@@ -38,8 +37,7 @@ export async function POST(req: NextRequest) {
     }
 
     const pageRes = await fetch(`https://${sub}.shiprocket.co/tracking/order/${id}`, {
-      headers,
-      signal: AbortSignal.timeout(12000),
+      headers, signal: AbortSignal.timeout(12000),
     })
     const pageText = await pageRes.text()
     result.pageStatus = pageRes.status
