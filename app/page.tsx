@@ -241,8 +241,8 @@ class Scanner {
         const results=await this.fetchBatch(ids)
         for(let i=0;i<ids.length;i++){
           const o=results[i];scanned++
-          // On brand's own tracking page: all non-null results are brand orders
-          if(o&&o!=='rl'&&o.dateYMD&&o.dateYMD>=fromDate&&o.dateYMD<=toDate){
+          if(o==='rl') continue  // fetchBatch handled the cooldown
+          if(o!==null&&o.dateYMD&&o.dateYMD>=fromDate&&o.dateYMD<=toDate){
             orders.push(o);matched++;this.onOrder(o)
             this.onLog('#'+ids[i]+'  '+o.orderDate+'  '+o.value+'  '+o.payment+'  '+o.location+'  '+o.pincode,'ok')
           }
@@ -267,6 +267,29 @@ class Scanner {
   async scanManual(startId:number,endId:number,concurrency:number,useAuto:boolean,stopAfter:number,startedAt:number):Promise<Order[]>{
     const orders:Order[]=[]
     let scanned=0,matched=0,consNulls=0,burst=0
+    let lastKnownGoodId:number|null=null   // last ID that returned a real order
+    let lastKnownGoodOrder:Order|null=null  // used to verify if nulls are RL or genuine
+
+    // Verify whether consecutive nulls are rate-limiting or genuine end-of-orders
+    // Re-fetches a known-good ID; if it also returns null now → rate limiting
+    const verifyNotRateLimited=async():Promise<boolean>=>{
+      if(!lastKnownGoodId)return true // no reference point, assume genuine
+      this.onLog('Verifying: re-checking #'+this.toId(lastKnownGoodId)+' (last known good order)...','info')
+      const check=await this.callProxy([lastKnownGoodId])
+      const r=check[0]
+      if(r===null){
+        // Known-good ID is also returning null → definitely rate limited
+        this.onLog('Confirmed rate limited (known order #'+this.toId(lastKnownGoodId)+' also returned null)','info')
+        return false
+      }
+      if(r!=='rl'&&r!==null){
+        this.onLog('Verified working — consecutive nulls are genuine missing IDs','info')
+        return true
+      }
+      // 'rl' response → also rate limited
+      this.onLog('Confirmed rate limited (got rl on verification probe)','info')
+      return false
+    }
 
     for(let base=startId;base<=endId&&!this.stopped;){
       const burstEnd=Math.min(base+Scanner.BURST-1,endId)
@@ -279,19 +302,32 @@ class Scanner {
 
         for(let i=0;i<ids.length&&!this.stopped;i++){
           const o=results[i];scanned++
-          if(o==='rl') continue  // rate limited — fetchBatch already waited, just skip counting
+          if(o==='rl') continue  // fetchBatch already did cooldown, just skip
           if(o!==null){
-            // Got an order — record it
             orders.push(o);matched++;consNulls=0
+            lastKnownGoodId=ids[i];lastKnownGoodOrder=o
             this.onStats?.({lastMatchedId:Scanner.numericPart(o.orderId)})
             this.onOrder(o)
             this.onLog('#'+ids[i]+'  '+o.orderDate+'  '+o.value+'  '+o.payment+'  '+o.location,'ok')
-          }else if(o===null){
-            // Truly missing ID — increment miss counter
+          }else{
             consNulls++
+            // Hit the stopAfter threshold — verify before stopping
             if(useAuto&&consNulls>=stopAfter){
-              this.onLog('Auto-stopped: '+stopAfter+' consecutive missing IDs (last order: #'+this.toId(ids[i]-consNulls)+')','ok')
-              this.stopped=true
+              this.onLog(stopAfter+' consecutive nulls — verifying if rate limited or genuine end...','info')
+              const genuine=await verifyNotRateLimited()
+              if(genuine){
+                this.onLog('Auto-stopped: genuine end of orders after #'+this.toId(lastKnownGoodId??startId)+' ('+matched+' orders found)','ok')
+                this.stopped=true
+              }else{
+                // Rate limited — do a long cooldown then reset null counter and continue
+                const cooldownSec=120
+                this.onLog('Rate-limited nulls detected — cooling down '+cooldownSec+'s then resuming from #'+this.toId(ids[i]+1)+'...','info')
+                for(let t=0;t<cooldownSec*1000&&!this.stopped;t+=500)await sleep(Math.min(500,cooldownSec*1000-t))
+                if(!this.stopped){
+                  consNulls=0  // reset null counter — those were RL not genuine
+                  this.onLog('Resuming scan after cooldown (nulls reset)','ok')
+                }
+              }
             }
           }
         }
@@ -676,7 +712,7 @@ function ManualTab({active,scanning,scanLabel,onStart,inp,lbl}:any){
             <input type="checkbox" checked={useAuto} onChange={e=>setUseAuto(e.target.checked)} style={{accentColor:'var(--accent)',width:16,height:16}}/>
           </div>
           {resumeId>0&&<div style={{display:'flex',justifyContent:'space-between',alignItems:'center',background:'var(--surface2)',border:'1px solid var(--border)',borderRadius:6,padding:'8px 10px',marginBottom:10,fontSize:10,color:'var(--muted)'}}><span>Resume suggestion: start from #{pfx}{resumeId}</span><button onClick={()=>setStartId(String(resumeId))} style={{background:'none',border:'1px solid var(--accent)',color:'var(--accent)',padding:'4px 8px',borderRadius:4,fontSize:9,fontFamily:'inherit',cursor:'pointer'}}>Use resume ID</button></div>}
-          {useAuto&&<div style={{marginBottom:10}}><label style={lbl}>Stop after N misses</label><div style={{display:'flex',alignItems:'center',gap:8}}><input type="number" value={stopAfter} onChange={e=>setStopAfter(e.target.value)} style={{...inp,width:90}}/><span style={{fontSize:9,color:'var(--muted)'}}>Recommended: {recommendedStop} for this brand at {conc}x. Too low = early stop. Too high = slow.</span></div></div>}
+          {useAuto&&<div style={{marginBottom:10}}><label style={lbl}>Stop after N misses</label><div style={{display:'flex',alignItems:'center',gap:8}}><input type="number" value={stopAfter} onChange={e=>setStopAfter(e.target.value)} style={{...inp,width:90}}/><span style={{fontSize:9,color:'var(--muted)'}}>Recommended: {recommendedStop}+. Hits threshold → verifies if rate-limited → cooldowns and resumes automatically.</span></div></div>}
           <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:12,fontSize:11,color:'var(--muted)'}}>
             <span>Concurrent fetches</span>
             <select value={conc} onChange={e=>setConc(e.target.value)} style={{...inp,width:'auto',padding:'5px 8px',fontSize:11}}>{['3','5','8','10'].map(v=><option key={v} value={v}>{v}</option>)}</select>
@@ -687,7 +723,7 @@ function ManualTab({active,scanning,scanLabel,onStart,inp,lbl}:any){
             const parsedStart=normalizeId(startId),parsedEnd=normalizeId(endId)
             if(!parsedStart){alert('Enter a valid numeric Start ID');return}
             if(!useAuto&&!parsedEnd){alert('Enter a valid numeric End ID');return}
-            const sa=Math.max(50,parseInt(stopAfter)||500)
+            const sa=Math.max(100,parseInt(stopAfter)||500)
             onStart(parsedStart,parsedEnd,parseInt(conc),useAuto,sa)
           }} style={{width:'100%',background:'var(--accent)',color:'#000',border:'none',padding:11,borderRadius:8,fontSize:12,fontWeight:700,letterSpacing:'.06em',textTransform:'uppercase',marginBottom:12,fontFamily:'inherit',cursor:'pointer'}}>▶ START MANUAL SCRAPE</button>
         </>
