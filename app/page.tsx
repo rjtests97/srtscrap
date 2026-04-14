@@ -103,9 +103,16 @@ const darkVars={'--bg':'#0d0d0d','--surface':'#161616','--surface2':'#1e1e1e','-
 const lightVars={'--bg':'#f5f5f0','--surface':'#fff','--surface2':'#efefea','--border':'#ddd','--accent':'#008844','--warn':'#cc5500','--text':'#111','--muted':'#888','--red':'#cc2222'}
 
 // ── Scanner ───────────────────────────────────────────
-// KEY INSIGHT: Every order ID on brand.shiprocket.co belongs to THAT brand.
-// Null = order doesn't exist yet (end of orders). 'rl' = rate limited (retry).
-// Never stop on rate limits — cooldown and resume always.
+// Architecture:
+//   - callProxy: raw HTTP, returns 'rl' on any failure
+//   - fetchBatch: wraps callProxy, handles RL with escalating cooldowns, never gives up
+//   - scanManual / scanRange: burst-rest rhythm with adaptive throttling
+//
+// KEY: On minnies.shiprocket.co every response belongs to Minnies.
+//   null = ID doesn't exist yet (genuine gap or end of orders)
+//   'rl' = rate limited (retry)
+//   Order = valid order
+
 class Scanner {
   private subdomain:string; private slug:string; private idPrefix:string
   public stopped=false; private rlStreak=0
@@ -118,8 +125,7 @@ class Scanner {
     onLog:(m:string,c:string)=>void,
     onProgress:(done:number,total:number,found:number)=>void,
     onOrder:(o:Order)=>void,
-    onStats?:(s:Partial<ScanStats>)=>void
-  ){
+    onStats?:(s:Partial<ScanStats>)=>void){
     this.subdomain=subdomain;this.slug=slug;this.idPrefix=idPrefix
     this.onLog=onLog;this.onProgress=onProgress;this.onOrder=onOrder;this.onStats=onStats
   }
@@ -132,13 +138,12 @@ class Scanner {
     return m?parseInt(m[1]):0
   }
 
-  // Single call to proxy — returns results or all-'rl' on any HTTP failure
+  // Raw proxy call — returns 'rl' on any failure/rate-limit
   private async callProxy(ids:number[]):Promise<Array<Order|null|'rl'>>{
     try{
-      const orderIds=ids.map(n=>this.toId(n))
       const res=await fetch('/api/proxy',{
         method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({subdomain:this.subdomain,ids:orderIds})
+        body:JSON.stringify({subdomain:this.subdomain,ids:ids.map(n=>this.toId(n))})
       })
       if(!res.ok)return ids.map(()=>'rl' as const)
       const{results}=await res.json()
@@ -146,26 +151,34 @@ class Scanner {
     }catch{return ids.map(()=>'rl' as const)}
   }
 
-  // Fetch with infinite retry on rate limit — escalating cooldowns, never gives up
-  private async fetchBatch(ids:number[]):Promise<Array<Order|null|'rl'>>{
+  // Wait with stop-check every 500ms, log countdown every 30s
+  private async wait(ms:number,label:string):Promise<void>{
+    const start=Date.now()
+    const total=ms
+    for(let elapsed=0;elapsed<total&&!this.stopped;elapsed=Date.now()-start){
+      const remaining=Math.ceil((total-elapsed)/1000)
+      if(elapsed===0||remaining%30===0)
+        this.onLog(label+' — '+remaining+'s remaining...','info')
+      await sleep(Math.min(500,total-elapsed))
+    }
+  }
+
+  // Fetch with infinite retry on RL — escalating cooldowns: 10s,30s,60s,120s,180s,300s
+  async fetchBatch(ids:number[]):Promise<Array<Order|null|'rl'>>{
     if(this.stopped)return ids.map(()=>null)
-    const COOLDOWNS=[5,15,30,60,120,180,300] // seconds
+    const WAITS=[10,30,60,120,180,300]
     let attempt=0
     while(!this.stopped){
       const results=await this.callProxy(ids)
-      // If even one result is not 'rl', the call succeeded
       if(results.some(r=>r!=='rl')){
-        if(this.rlStreak>0){this.rlStreak=0;this.onLog('Connection restored — resuming scan','ok')}
+        if(this.rlStreak>0){this.rlStreak=0;this.onLog('Connection restored','ok')}
         return results
       }
-      // All rate limited
-      attempt++
-      this.rlStreak++
+      attempt++;this.rlStreak++
       this.onStats?.({retries:1})
-      const waitSec=COOLDOWNS[Math.min(attempt-1,COOLDOWNS.length-1)]
-      const label=waitSec>=60?Math.round(waitSec/60)+'m':waitSec+'s'
-      this.onLog('Rate limited (x'+attempt+') — waiting '+label+' then resuming...','info')
-      for(let t=0;t<waitSec*1000&&!this.stopped;t+=500)await sleep(Math.min(500,waitSec*1000-t))
+      const waitSec=WAITS[Math.min(attempt-1,WAITS.length-1)]
+      this.onLog('Rate limited (x'+attempt+') — waiting '+waitSec+'s','info')
+      await this.wait(waitSec*1000,'Cooldown')
     }
     return ids.map(()=>null)
   }
@@ -174,11 +187,11 @@ class Scanner {
     const r=await this.callProxy([id]);return r[0]
   }
 
-  // Walk from a known point to find the ID bracket around a target date
+  // Boundary walk for By Date scan
   async walkToBracket(refId:number,refDate:string,targetDate:string,label:string):Promise<{lo:number,hi:number}>{
     const forward=targetDate>refDate
     let lo=refId,hi=refId,lastId=refId,consNulls=0
-    this.onLog(label+': walking '+(forward?'forward':'back')+' from #'+this.idPrefix+refId+' ('+refDate+')','info')
+    this.onLog(label+': walking '+(forward?'→':'←')+' from #'+this.idPrefix+refId,'info')
     for(let i=1;i<=400&&!this.stopped;i++){
       const pid=forward?refId+i*500:Math.max(1,refId-i*500)
       const o=await this.probe(pid)
@@ -214,133 +227,153 @@ class Scanner {
     if(this.stopped)return{scanStart:0,scanEnd:0}
     const rT=fromB.lo>closest(toDate).id?{id:fromB.lo,date:fromDate}:closest(toDate)
     const toB=await this.walkToBracket(rT.id,rT.date,toDate,'toDate')
-    const scanStart=Math.max(1,fromB.lo-100)
-    const scanEnd=toB.hi+100
-    this.onLog('Range: #'+this.idPrefix+scanStart+' to #'+this.idPrefix+scanEnd+' ('+( scanEnd-scanStart+1)+' IDs)','ok')
+    const scanStart=Math.max(1,fromB.lo-100),scanEnd=toB.hi+100
+    this.onLog('Range: #'+this.idPrefix+scanStart+' to #'+this.idPrefix+scanEnd+' ('+(scanEnd-scanStart+1)+' IDs)','ok')
     return{scanStart,scanEnd}
   }
 
-  // Scan IDs in bursts with mandatory rest between bursts
-  // Burst = scan N IDs fast; Rest = pause so Shiprocket rate limit resets
-  // On RL during a burst: fetchBatch handles it internally with cooldown
-  private static BURST=80   // IDs per burst
-  private static REST=3000  // ms rest between bursts (3s)
+  // Adaptive burst controller
+  // Starts at BURST_MAX, halves on RL cooldown, recovers slowly
+  private static BURST_MAX=80
+  private static BURST_MIN=10
+  private static REST_BASE=3000  // ms between bursts
 
   async scanRange(scanStart:number,scanEnd:number,fromDate:string,toDate:string,concurrency:number,startedAt:number):Promise<Order[]>{
     const orders:Order[]=[]
-    let scanned=0,matched=0,burst=0
+    let scanned=0,matched=0,burstNum=0
+    let burstSize=Scanner.BURST_MAX
     const total=scanEnd-scanStart+1
 
     for(let base=scanStart;base<=scanEnd&&!this.stopped;){
-      const burstEnd=Math.min(base+Scanner.BURST-1,scanEnd)
-      burst++
-      this.onLog('Burst '+burst+': #'+this.toId(base)+' → #'+this.toId(burstEnd),'info')
+      const burstEnd=Math.min(base+burstSize-1,scanEnd)
+      burstNum++
+      this.onLog('Burst '+burstNum+' (sz='+burstSize+'): #'+this.toId(base)+' → #'+this.toId(burstEnd),'info')
 
+      let rlInBurst=0
       for(let b=base;b<=burstEnd&&!this.stopped;b+=concurrency){
         const ids=Array.from({length:Math.min(concurrency,burstEnd-b+1)},(_,i)=>b+i)
         const results=await this.fetchBatch(ids)
         for(let i=0;i<ids.length;i++){
           const o=results[i];scanned++
-          if(o==='rl') continue  // fetchBatch handled the cooldown
+          if(o==='rl'){rlInBurst++;continue}
           if(o!==null&&o.dateYMD&&o.dateYMD>=fromDate&&o.dateYMD<=toDate){
             orders.push(o);matched++;this.onOrder(o)
             this.onLog('#'+ids[i]+'  '+o.orderDate+'  '+o.value+'  '+o.payment+'  '+o.location+'  '+o.pincode,'ok')
           }
         }
         this.onProgress(scanStart+scanned-1,scanEnd,matched)
-        await sleep(100)
+        await sleep(120)
+      }
+
+      // Adapt burst size based on RL hits
+      if(rlInBurst>0){
+        burstSize=Math.max(Scanner.BURST_MIN,Math.floor(burstSize/2))
+        this.onLog('Throttling detected — reduced burst to '+burstSize+' IDs','info')
+      }else if(burstSize<Scanner.BURST_MAX){
+        burstSize=Math.min(Scanner.BURST_MAX,burstSize+10)
       }
 
       base=burstEnd+1
       if(base>scanEnd||this.stopped)break
 
       const pct=Math.round(scanned/total*100)
-      this.onLog('Rest '+(Scanner.REST/1000)+'s — burst '+burst+' done | '+matched+' found | '+pct+'% complete','info')
+      const rest=rlInBurst>0?Scanner.REST_BASE*2:Scanner.REST_BASE
+      this.onLog('Rest '+(rest/1000)+'s — burst '+burstNum+' | '+matched+' found | '+pct+'%','info')
       this.onStats?.({lastMatchedId:matched>0?Scanner.numericPart(orders[orders.length-1].orderId):null})
-      for(let t=0;t<Scanner.REST&&!this.stopped;t+=300)await sleep(Math.min(300,Scanner.REST-t))
+      for(let t=0;t<rest&&!this.stopped;t+=300)await sleep(Math.min(300,rest-t))
     }
     return orders
   }
 
-  // Manual scan: keep going until stopAfter consecutive MISSING IDs (nulls, not rate limits)
-  // 'rl' results don't count as misses — fetchBatch handles them with cooldown
   async scanManual(startId:number,endId:number,concurrency:number,useAuto:boolean,stopAfter:number,startedAt:number):Promise<Order[]>{
     const orders:Order[]=[]
-    let scanned=0,matched=0,consNulls=0,burst=0
-    let lastKnownGoodId:number|null=null   // last ID that returned a real order
-    let lastKnownGoodOrder:Order|null=null  // used to verify if nulls are RL or genuine
+    let scanned=0,matched=0,consNulls=0,burstNum=0
+    let lastGoodId:number|null=null
+    // Adaptive burst: shrinks on RL, recovers after clean bursts
+    let burstSize=Scanner.BURST_MAX
+    let cleanBursts=0      // consecutive bursts with no RL
+    let rlCooldowns=0      // total RL cooldowns taken (for escalating wait)
 
-    // Verify whether consecutive nulls are rate-limiting or genuine end-of-orders
-    // Re-fetches a known-good ID; if it also returns null now → rate limiting
-    const verifyNotRateLimited=async():Promise<boolean>=>{
-      if(!lastKnownGoodId)return true // no reference point, assume genuine
-      this.onLog('Verifying: re-checking #'+this.toId(lastKnownGoodId)+' (last known good order)...','info')
-      const check=await this.callProxy([lastKnownGoodId])
-      const r=check[0]
-      if(r===null){
-        // Known-good ID is also returning null → definitely rate limited
-        this.onLog('Confirmed rate limited (known order #'+this.toId(lastKnownGoodId)+' also returned null)','info')
-        return false
-      }
-      if(r!=='rl'&&r!==null){
-        this.onLog('Verified working — consecutive nulls are genuine missing IDs','info')
-        return true
-      }
-      // 'rl' response → also rate limited
-      this.onLog('Confirmed rate limited (got rl on verification probe)','info')
-      return false
+    // Check if a known-good ID still works — if not, we're rate-limited
+    const isRateLimited=async():Promise<boolean>=>{
+      if(!lastGoodId)return false
+      this.onLog('Verifying #'+this.toId(lastGoodId)+'...','info')
+      const r=(await this.callProxy([lastGoodId]))[0]
+      const rl=(r===null||r==='rl')
+      this.onLog(rl?'Rate limited confirmed':'Working fine — nulls are genuine','info')
+      return rl
     }
 
     for(let base=startId;base<=endId&&!this.stopped;){
-      const burstEnd=Math.min(base+Scanner.BURST-1,endId)
-      burst++
-      this.onLog('Burst '+burst+': #'+this.toId(base)+' → #'+this.toId(burstEnd),'info')
+      const burstEnd=Math.min(base+burstSize-1,endId)
+      burstNum++
+      this.onLog('Burst '+burstNum+' (sz='+burstSize+'): #'+this.toId(base)+' → #'+this.toId(burstEnd),'info')
 
+      let rlInBurst=0
       for(let b=base;b<=burstEnd&&!this.stopped;b+=concurrency){
         const ids=Array.from({length:Math.min(concurrency,burstEnd-b+1)},(_,i)=>b+i)
         const results=await this.fetchBatch(ids)
 
         for(let i=0;i<ids.length&&!this.stopped;i++){
           const o=results[i];scanned++
-          if(o==='rl') continue  // fetchBatch already did cooldown, just skip
+          if(o==='rl'){rlInBurst++;continue}
           if(o!==null){
-            orders.push(o);matched++;consNulls=0
-            lastKnownGoodId=ids[i];lastKnownGoodOrder=o
+            orders.push(o);matched++;consNulls=0;cleanBursts=0
+            lastGoodId=ids[i]
             this.onStats?.({lastMatchedId:Scanner.numericPart(o.orderId)})
             this.onOrder(o)
             this.onLog('#'+ids[i]+'  '+o.orderDate+'  '+o.value+'  '+o.payment+'  '+o.location,'ok')
           }else{
             consNulls++
-            // Hit the stopAfter threshold — verify before stopping
+            // Reached null threshold — check if rate-limited before stopping/waiting
             if(useAuto&&consNulls>=stopAfter){
-              this.onLog(stopAfter+' consecutive nulls — verifying if rate limited or genuine end...','info')
-              const genuine=await verifyNotRateLimited()
-              if(genuine){
-                this.onLog('Auto-stopped: genuine end of orders after #'+this.toId(lastKnownGoodId??startId)+' ('+matched+' orders found)','ok')
+              const rl=await isRateLimited()
+              if(!rl){
+                // Genuine end
+                this.onLog('Genuine end of orders after '+matched+' orders','ok')
                 this.stopped=true
-              }else{
-                // Rate limited — do a long cooldown then reset null counter and continue
-                const cooldownSec=120
-                this.onLog('Rate-limited nulls detected — cooling down '+cooldownSec+'s then resuming from #'+this.toId(ids[i]+1)+'...','info')
-                for(let t=0;t<cooldownSec*1000&&!this.stopped;t+=500)await sleep(Math.min(500,cooldownSec*1000-t))
-                if(!this.stopped){
-                  consNulls=0  // reset null counter — those were RL not genuine
-                  this.onLog('Resuming scan after cooldown (nulls reset)','ok')
-                }
+                break
               }
+              // Rate limited — escalating cooldown
+              rlCooldowns++
+              cleanBursts=0
+              // Cooldown escalates: 120s, 180s, 300s, 300s, ...
+              const coolSec=[120,180,300,300,300][Math.min(rlCooldowns-1,4)]
+              this.onLog('Rate-limit cooldown #'+rlCooldowns+' — waiting '+coolSec+'s then resuming...','info')
+              await this.wait(coolSec*1000,'Cooldown')
+              if(this.stopped)break
+              // After cooldown: shrink burst size and reset null counter
+              burstSize=Math.max(Scanner.BURST_MIN,Math.floor(burstSize/2))
+              consNulls=0
+              this.onLog('Resuming with smaller bursts (sz='+burstSize+')','ok')
             }
           }
         }
         this.onProgress(startId+scanned-1,endId,matched)
-        await sleep(100)
+        await sleep(120)
+      }
+
+      // Adapt burst size based on this burst's health
+      if(rlInBurst>0){
+        burstSize=Math.max(Scanner.BURST_MIN,Math.floor(burstSize/2))
+        cleanBursts=0
+        this.onLog('RL in burst — reduced size to '+burstSize,'info')
+      }else{
+        cleanBursts++
+        if(cleanBursts>=3&&burstSize<Scanner.BURST_MAX){
+          burstSize=Math.min(Scanner.BURST_MAX,burstSize+20)
+          this.onLog('Clean burst streak — increased size to '+burstSize,'info')
+        }
       }
 
       base=burstEnd+1
       if(base>endId||this.stopped)break
 
-      this.onLog('Rest '+(Scanner.REST/1000)+'s — burst '+burst+' | '+matched+' found | '+consNulls+' null streak','info')
+      // Longer rest after RL cooldowns to let rate limit fully reset
+      const rest=rlCooldowns>0?Scanner.REST_BASE*2:Scanner.REST_BASE
+      this.onLog('Rest '+(rest/1000)+'s — burst '+burstNum+' | '+matched+' found | '+consNulls+' null streak','info')
       this.onStats?.({retries:this.rlStreak})
-      for(let t=0;t<Scanner.REST&&!this.stopped;t+=300)await sleep(Math.min(300,Scanner.REST-t))
+      for(let t=0;t<rest&&!this.stopped;t+=300)await sleep(Math.min(300,rest-t))
     }
     return orders
   }
