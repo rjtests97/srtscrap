@@ -154,19 +154,20 @@ class Scanner {
   // Wait with stop-check every 500ms, log countdown every 30s
   private async wait(ms:number,label:string):Promise<void>{
     const start=Date.now()
-    const total=ms
-    for(let elapsed=0;elapsed<total&&!this.stopped;elapsed=Date.now()-start){
-      const remaining=Math.ceil((total-elapsed)/1000)
-      if(elapsed===0||remaining%30===0)
-        this.onLog(label+' — '+remaining+'s remaining...','info')
-      await sleep(Math.min(500,total-elapsed))
+    this.onLog(label+': '+Math.ceil(ms/1000)+'s...','info')
+    let lastLog=0
+    for(let elapsed=0;elapsed<ms&&!this.stopped;elapsed=Date.now()-start){
+      const remaining=Math.ceil((ms-elapsed)/1000)
+      if(elapsed-lastLog>=30000){lastLog=elapsed;this.onLog(label+': '+remaining+'s remaining','info')}
+      await sleep(Math.min(500,ms-elapsed))
     }
+    if(!this.stopped)this.onLog(label+' done','info')
   }
 
   // Fetch with infinite retry on RL — escalating cooldowns: 10s,30s,60s,120s,180s,300s
   async fetchBatch(ids:number[]):Promise<Array<Order|null|'rl'>>{
     if(this.stopped)return ids.map(()=>null)
-    const WAITS=[10,30,60,120,180,300]
+    const WAITS=[10,20,40,60,90,120]
     let attempt=0
     while(!this.stopped){
       const results=await this.callProxy(ids)
@@ -338,7 +339,7 @@ class Scanner {
               rlCooldowns++
               cleanBursts=0
               // Cooldown escalates: 120s, 180s, 300s, 300s, ...
-              const coolSec=[120,180,300,300,300][Math.min(rlCooldowns-1,4)]
+              const coolSec=[30,60,90,180,300][Math.min(rlCooldowns-1,4)]
               this.onLog('Rate-limit cooldown #'+rlCooldowns+' — waiting '+coolSec+'s then resuming...','info')
               await this.wait(coolSec*1000,'Cooldown')
               if(this.stopped)break
