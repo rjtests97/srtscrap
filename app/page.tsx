@@ -194,168 +194,81 @@ class Scanner {
     return{scanStart,scanEnd}
   }
 
+  private static BURST = 40
+  private static REST  = 3000
+
   async scanRange(scanStart:number,scanEnd:number,fromDate:string,toDate:string,concurrency:number,startedAt:number):Promise<Order[]>{
-    const total=scanEnd-scanStart+1,orders:Order[]=[],batchDelay=()=>this.rlStreak>0?Math.min(this.rlStreak*1200,10000):200
-    let scanned=0,matched=0
-    for(let base=scanStart;base<=scanEnd&&!this.stopped;base+=concurrency){
-      const ids=Array.from({length:Math.min(concurrency,scanEnd-base+1)},(_,i)=>base+i)
-      const results=await this.fetchBatch(ids)
-      for(let i=0;i<ids.length;i++){
-        const o=results[i];scanned++
-        if(o&&o!=='rl'&&o.slug===this.slug&&o.dateYMD&&o.dateYMD>=fromDate&&o.dateYMD<=toDate){orders.push(o);matched++;this.onOrder(o);this.onLog(`#${ids[i]}  ${o.orderDate}  ${o.value}  ${o.payment}  ${o.location}  ${o.pincode}`,'ok')}
+    const orders:Order[]=[]
+    let scanned=0,matched=0,burst=0
+
+    for(let base=scanStart;base<=scanEnd&&!this.stopped;){
+      const burstEnd=Math.min(base+Scanner.BURST-1,scanEnd)
+      burst++
+      this.onLog('Burst '+burst+': #'+this.toId(base)+'..#'+this.toId(burstEnd),'info')
+
+      for(let b=base;b<=burstEnd&&!this.stopped;b+=concurrency){
+        const ids=Array.from({length:Math.min(concurrency,burstEnd-b+1)},(_,i)=>b+i)
+        const results=await this.fetchBatch(ids)
+        for(let i=0;i<ids.length;i++){
+          const o=results[i];scanned++
+          if(o&&o!=='rl'&&o.slug===this.slug&&o.dateYMD&&o.dateYMD>=fromDate&&o.dateYMD<=toDate){
+            orders.push(o);matched++;this.onOrder(o)
+            this.onLog('#'+ids[i]+'  '+o.orderDate+'  '+o.value+'  '+o.payment+'  '+o.location+'  '+o.pincode,'ok')
+          }
+        }
+        this.onProgress(scanStart+scanned-1,scanEnd,matched)
+        await sleep(150)
       }
-      this.onProgress(scanStart+scanned-1,scanEnd,matched)
-      if(scanned%200===0)this.onLog(`Scanned ${scanned.toLocaleString()} IDs, ${matched} found (ID #${ids[ids.length-1]})...`,'info')
-      await sleep(batchDelay())
+
+      base=burstEnd+1
+      if(base>scanEnd||this.stopped)break
+
+      const pct=Math.round(scanned/(scanEnd-scanStart+1)*100)
+      this.onLog('Rest '+Scanner.REST/1000+'s... (burst '+burst+' done, '+matched+' found, '+pct+'% complete)','info')
+      this.onStats?.({retries:this.rlStreak,lastMatchedId:Scanner.numericPart(orders[orders.length-1]?.orderId??0)})
+      for(let t=0;t<Scanner.REST&&!this.stopped;t+=300)await sleep(Math.min(300,Scanner.REST-t))
     }
     return orders
   }
 
   async scanManual(startId:number,endId:number,concurrency:number,useAuto:boolean,stopAfter:number,startedAt:number):Promise<Order[]>{
-    const orders:Order[]=[],batchDelay=()=>this.rlStreak>0?Math.min(this.rlStreak*1200,10000):200
-    const processBatch=async(ids:number[])=>{
-      let batchMatches=0,batchMisses=0,batchRetryFailures=0
-      const results=await this.fetchBatch(ids)
-      for(let i=0;i<ids.length&&!this.stopped;i++){
-        let o=results[i];scanned++
-        if((!o||o==='rl'||o.slug!==this.slug)&&useAuto){
-          this.onStats?.({retries:1})
-          await sleep(120)
-          const retry=await this.probe(ids[i])
-          if(retry&&retry!=='rl'&&retry.slug===this.slug){
-            o=retry
-            this.onStats?.({recovered:1})
-            this.onLog(`#${ids[i]} recovered on retry`,'info')
-          }else if(retry==='rl'){
-            o='rl'
-            batchRetryFailures++
-          }else{
-            o=null
-            batchRetryFailures++
+    const orders:Order[]=[]
+    let scanned=0,matched=0,misses=0,burst=0
+
+    for(let base=startId;base<=endId&&!this.stopped;){
+      const burstEnd=Math.min(base+Scanner.BURST-1,endId)
+      burst++
+      this.onLog('Burst '+burst+': #'+this.toId(base)+'..#'+this.toId(burstEnd),'info')
+
+      for(let b=base;b<=burstEnd&&!this.stopped;b+=concurrency){
+        const ids=Array.from({length:Math.min(concurrency,burstEnd-b+1)},(_,i)=>b+i)
+        const results=await this.fetchBatch(ids)
+        for(let i=0;i<ids.length&&!this.stopped;i++){
+          const o=results[i];scanned++
+          if(o&&o!=='rl'&&o.slug===this.slug){
+            orders.push(o);matched++;misses=0
+            this.onStats?.({lastMatchedId:Scanner.numericPart(o.orderId)})
+            this.onOrder(o)
+            this.onLog('#'+ids[i]+'  '+o.orderDate+'  '+o.value+'  '+o.payment+'  '+o.location,'ok')
+          }else if(o!=='rl'){
+            misses++
+            if(useAuto&&misses>=stopAfter){
+              this.onLog('Auto-stopped: '+stopAfter+' consecutive misses','info')
+              this.stopped=true
+            }
           }
         }
-        if(o&&o!=='rl'&&o.slug===this.slug){
-          const key=String(o.orderId)
-          if(this.seen.has(key)){this.onStats?.({duplicates:1});continue}
-          this.seen.add(key)
-          orders.push(o);matched++;batchMatches++;this.onOrder(o);this.onStats?.({lastMatchedId:Scanner.numericPart(o.orderId)});this.onLog(`#${ids[i]}  ${o.orderDate}  ${o.value}  ${o.payment}  ${o.location}`,'ok')
-        }else if(o!=='rl'){
-          batchMisses++
-        }
-      }
-      return { batchMatches, batchMisses, batchRetryFailures }
-    }
-
-    let scanned=0,matched=0
-    if(!useAuto){
-      for(let base=startId;base<=endId&&!this.stopped;base+=concurrency){
-        const ids=Array.from({length:Math.min(concurrency,endId-base+1)},(_,i)=>base+i)
-        await processBatch(ids)
         this.onProgress(startId+scanned-1,endId,matched)
-        await sleep(batchDelay())
+        await sleep(150)
       }
-      return orders
+
+      base=burstEnd+1
+      if(base>endId||this.stopped)break
+
+      this.onLog('Rest '+Scanner.REST/1000+'s... ('+matched+' found, '+misses+' consecutive misses)','info')
+      this.onStats?.({retries:this.rlStreak})
+      for(let t=0;t<Scanner.REST&&!this.stopped;t+=300)await sleep(Math.min(300,Scanner.REST-t))
     }
-
-    const normalWindowSize=Math.max(250,Math.min(5000,stopAfter))
-    const emptyWindowLimit=3
-    let nextBase=startId,emptyWindows=0,lastMatchedId:number|null=null,currentConcurrency=concurrency,retryFailureStreak=0,cooldowns=0,lowSlowMode=false,cleanWindows=0,stallScans=0
-    this.onLog(`Auto mode uses verified windows of ${normalWindowSize} IDs with forward probes`,'info')
-
-    while(nextBase<=endId&&!this.stopped){
-      const windowSize=lowSlowMode?Math.max(25,currentConcurrency*20):normalWindowSize
-      const probeStride=lowSlowMode?Math.max(60,currentConcurrency*40):Math.max(windowSize,concurrency*100)
-      const windowEnd=Math.min(endId,nextBase+windowSize-1)
-      let windowMatches=0,windowMisses=0,windowRetryFailures=0
-      this.onLog(`${lowSlowMode?'Low-slow':'Auto'} window: #${nextBase}-#${windowEnd} at ${currentConcurrency}x`,'info')
-      for(let base=nextBase;base<=windowEnd&&!this.stopped;base+=currentConcurrency){
-        const ids=Array.from({length:Math.min(currentConcurrency,windowEnd-base+1)},(_,i)=>base+i)
-        const res=await processBatch(ids)
-        windowMatches+=res.batchMatches
-        windowMisses+=res.batchMisses
-        windowRetryFailures+=res.batchRetryFailures
-        this.onProgress(scanned,0,matched)
-        await sleep(batchDelay())
-      }
-
-      if(windowMatches>0){
-        emptyWindows=0
-        retryFailureStreak=0
-        stallScans=0
-        cleanWindows++
-        if(lowSlowMode&&cleanWindows>=2&&windowRetryFailures===0){
-          currentConcurrency=Math.min(concurrency,currentConcurrency+1)
-          if(currentConcurrency>=Math.min(3,concurrency)){lowSlowMode=false;this.onLog('Exiting low-slow mode and resuming normal scan speed','info')}
-        }else if(!lowSlowMode&&currentConcurrency<concurrency&&windowRetryFailures===0){
-          currentConcurrency=Math.min(concurrency,currentConcurrency+1)
-        }
-        lastMatchedId=Math.max(lastMatchedId||0,...orders.slice(-windowMatches).map(o=>Scanner.numericPart(o.orderId)))
-        nextBase=windowEnd+1
-        continue
-      }
-
-      retryFailureStreak+=windowRetryFailures
-      stallScans+=windowMisses+windowRetryFailures
-      if(lastMatchedId!==null&&stallScans>=Math.max(40,currentConcurrency*20)){
-        lowSlowMode=true
-        cleanWindows=0
-        currentConcurrency=1
-        const reanchorBase=lastMatchedId+1
-        this.onLog(`Frontier stalled after ${stallScans} non-progress scans beyond #${lastMatchedId}; re-anchoring at #${reanchorBase} in low-slow mode`,'info')
-        stallScans=0
-        nextBase=reanchorBase
-        continue
-      }
-      const throttleLikely=windowRetryFailures>=Math.max(lowSlowMode?8:12,currentConcurrency*4)||(scanned>=50&&windowRetryFailures>Math.max(windowMatches,3))
-      if(throttleLikely){
-        cooldowns++
-        lowSlowMode=true
-        cleanWindows=0
-        const cooldownMs=Math.min(30000,8000+cooldowns*4000)
-        currentConcurrency=1
-        this.rlStreak=0
-        this.onLog(`Possible Shiprocket throttling: cooling down ${Math.round(cooldownMs/1000)}s and switching to low-slow mode at 1x`,'info')
-        await sleep(cooldownMs)
-        const resumeProbe=await this.probe(lastMatchedId!==null?lastMatchedId+1:nextBase)
-        if(resumeProbe&&resumeProbe!=='rl'&&resumeProbe.slug===this.slug){
-          this.onLog(`Cooldown probe succeeded near #${Scanner.numericPart(resumeProbe.orderId)} — resuming`,'info')
-          nextBase=Math.max(nextBase,(lastMatchedId!==null?lastMatchedId+1:nextBase))
-          retryFailureStreak=0
-          continue
-        }
-        this.onLog('Cooldown probe still weak, continuing in low-slow mode with short verified windows','info')
-      }
-
-      const probeIds=[windowEnd+concurrency,windowEnd+Math.floor(probeStride/2),windowEnd+probeStride].filter(id=>id<=endId)
-      let recoveredAhead:number|null=null
-      for(const pid of probeIds){
-        const ahead=await this.probe(pid)
-        if(ahead&&ahead!=='rl'&&ahead.slug===this.slug){
-          recoveredAhead=Scanner.numericPart(ahead.orderId)
-          break
-        }
-        await sleep(80)
-      }
-
-      if(recoveredAhead!==null){
-        emptyWindows=0
-        lastMatchedId=recoveredAhead
-        const jumpBase=Math.max(windowEnd+1,recoveredAhead-Math.max(concurrency*2,20))
-        this.onStats?.({gapJumps:1,lastMatchedId:recoveredAhead})
-        this.onLog(`Gap jump: skipped sparse region and re-anchored near #${recoveredAhead}`,'info')
-        nextBase=jumpBase
-        continue
-      }
-
-      emptyWindows++
-      this.onLog(`Verified empty window ${emptyWindows}/${emptyWindowLimit} at #${nextBase}-#${windowEnd}`,'info')
-      if(lastMatchedId!==null&&emptyWindows>=emptyWindowLimit){
-        this.onLog(`Auto-stopped after ${emptyWindowLimit} consecutive verified empty windows beyond #${lastMatchedId}`,'info')
-        break
-      }
-      nextBase=windowEnd+1
-    }
-
     return orders
   }
 }
@@ -552,12 +465,9 @@ export default function App(){
                     <span>{progress.done.toLocaleString()} / {progress.total?progress.total.toLocaleString():'?'} — <b style={{color:'var(--accent)'}}>{progress.found} found</b></span>
                     <span style={{color:'var(--accent)'}}>{eta?`ETA: ${eta}`:''}</span>
                   </div>
-                  <div style={{display:'flex',gap:10,flexWrap:'wrap',fontSize:9,color:'var(--muted)',marginBottom:6}}>
-                    <span>Retries: <b style={{color:'var(--accent)'}}>{scanStats.retries}</b></span>
-                    <span>Recovered: <b style={{color:'var(--accent)'}}>{scanStats.recovered}</b></span>
-                    <span>Gap jumps: <b style={{color:'var(--accent)'}}>{scanStats.gapJumps}</b></span>
-                    <span>Duplicates skipped: <b style={{color:'var(--accent)'}}>{scanStats.duplicates}</b></span>
-                    {scanStats.lastMatchedId&&<span>Last live ID: <b style={{color:'var(--accent)'}}>#{active?.idPrefix||''}{scanStats.lastMatchedId}</b></span>}
+                  <div style={{display:'flex',gap:12,flexWrap:'wrap',fontSize:9,color:'var(--muted)',marginBottom:5}}>
+                    <span>Retries: <b style={{color:scanStats.retries>50?'var(--red)':scanStats.retries>10?'var(--warn)':'var(--text)'}}>{scanStats.retries}</b></span>
+                    <span>Last live: <b style={{color:'var(--accent)'}}>{scanStats.lastMatchedId?('#'+(active?.idPrefix||'')+scanStats.lastMatchedId):'—'}</b></span>
                   </div>
                   <div style={{background:'var(--surface)',border:'1px solid var(--border)',borderRadius:4,height:6,overflow:'hidden'}}>
                     <div style={{height:'100%',background:'var(--accent)',width:`${pct.toFixed(1)}%`,transition:'width .3s',borderRadius:4}}/>
