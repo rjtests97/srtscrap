@@ -123,16 +123,28 @@ class Scanner {
 
   async fetchBatch(ids:number[]):Promise<Array<Order|null|'rl'>>{
     if(this.stopped)return ids.map(()=>null)
-    if(this.rlStreak>0){const w=Math.min(this.rlStreak*2000,30000);if(this.rlStreak===1)this.onLog(`Rate limit — waiting ${w/1000}s...`,'info');await sleep(w)}
+    if(this.rlStreak>0){
+      const w=Math.min(this.rlStreak*1500,12000)
+      this.onLog(`Rate limit (streak ${this.rlStreak}) — waiting ${(w/1000).toFixed(1)}s...`,'info')
+      await sleep(w)
+    }
+    if(this.stopped)return ids.map(()=>null)
     try{
       const orderIds=ids.map(n=>this.toId(n))
       const res=await fetch('/api/proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({subdomain:this.subdomain,ids:orderIds})})
       if(!res.ok){this.rlStreak++;return ids.map(()=>'rl')}
       const{results}=await res.json()
-      const hasRl=results.some((r:any)=>r==='rl')
-      if(hasRl)this.rlStreak++;else this.rlStreak=Math.max(0,this.rlStreak-1)
+      // Count rl vs successful
+      const rlCount=results.filter((r:any)=>r==='rl').length
+      const okCount=results.filter((r:any)=>r&&r!=='rl').length
+      if(rlCount>0&&okCount===0)this.rlStreak++
+      else if(okCount>0)this.rlStreak=Math.max(0,this.rlStreak-1)
       return results
-    }catch{this.rlStreak++;return ids.map(()=>null)}
+    }catch(e:any){
+      this.onLog(`Fetch error: ${e.message}`,'err')
+      this.rlStreak++
+      return ids.map(()=>null)
+    }
   }
 
   async probe(id:number):Promise<Order|null|'rl'>{const r=await this.fetchBatch([id]);return r[0]}
@@ -183,7 +195,7 @@ class Scanner {
   }
 
   async scanRange(scanStart:number,scanEnd:number,fromDate:string,toDate:string,concurrency:number,startedAt:number):Promise<Order[]>{
-    const total=scanEnd-scanStart+1,orders:Order[]=[],batchDelay=()=>this.rlStreak>0?Math.min(this.rlStreak*1500,15000):300
+    const total=scanEnd-scanStart+1,orders:Order[]=[],batchDelay=()=>this.rlStreak>0?Math.min(this.rlStreak*1200,10000):200
     let scanned=0,matched=0
     for(let base=scanStart;base<=scanEnd&&!this.stopped;base+=concurrency){
       const ids=Array.from({length:Math.min(concurrency,scanEnd-base+1)},(_,i)=>base+i)
@@ -193,13 +205,14 @@ class Scanner {
         if(o&&o!=='rl'&&o.slug===this.slug&&o.dateYMD&&o.dateYMD>=fromDate&&o.dateYMD<=toDate){orders.push(o);matched++;this.onOrder(o);this.onLog(`#${ids[i]}  ${o.orderDate}  ${o.value}  ${o.payment}  ${o.location}  ${o.pincode}`,'ok')}
       }
       this.onProgress(scanStart+scanned-1,scanEnd,matched)
+      if(scanned%200===0)this.onLog(`Scanned ${scanned.toLocaleString()} IDs, ${matched} found (ID #${ids[ids.length-1]})...`,'info')
       await sleep(batchDelay())
     }
     return orders
   }
 
   async scanManual(startId:number,endId:number,concurrency:number,useAuto:boolean,stopAfter:number,startedAt:number):Promise<Order[]>{
-    const orders:Order[]=[],batchDelay=()=>this.rlStreak>0?Math.min(this.rlStreak*1500,15000):300
+    const orders:Order[]=[],batchDelay=()=>this.rlStreak>0?Math.min(this.rlStreak*1200,10000):200
     const processBatch=async(ids:number[])=>{
       let batchMatches=0,batchMisses=0,batchRetryFailures=0
       const results=await this.fetchBatch(ids)
