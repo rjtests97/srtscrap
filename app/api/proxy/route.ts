@@ -85,54 +85,85 @@ const UAS = [
 ]
 let uaIdx = 0
 
+async function fetchTrackingPage(subdomain: string, id: string, headers: Record<string,string>, originalId: string|number) {
+  const fallbackRes = await fetch(
+    `https://${subdomain}.shiprocket.co/tracking/order/${id}`,
+    { headers, signal: AbortSignal.timeout(12000) }
+  )
+  if (!fallbackRes.ok) return null
+  return parseTrackingPage(await fallbackRes.text(), originalId)
+}
+
 async function fetchOneOrder(subdomain: string, orderId: string|number): Promise<any> {
   const id = String(orderId)
-  const ua = UAS[uaIdx % UAS.length]; uaIdx++
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const ua = UAS[uaIdx % UAS.length]; uaIdx++
+    const headers: Record<string,string> = {
+      'Accept': 'application/json, text/plain, */*',
+      'Accept-Language': 'en-IN,en-US;q=0.9,en;q=0.8',
+      'Referer': `https://${subdomain}.shiprocket.co/tracking/order/${id}`,
+      'Origin': `https://${subdomain}.shiprocket.co`,
+      'X-Requested-With': 'XMLHttpRequest',
+      'Sec-Fetch-Dest': 'empty',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Site': 'same-origin',
+      'User-Agent': ua,
+      'Cache-Control': 'no-cache',
+    }
 
-  const headers: Record<string,string> = {
-    'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'en-IN,en-US;q=0.9,en;q=0.8',
-    'Referer': `https://${subdomain}.shiprocket.co/tracking/order/${id}`,
-    'Origin': `https://${subdomain}.shiprocket.co`,
-    'X-Requested-With': 'XMLHttpRequest',
-    'Sec-Fetch-Dest': 'empty',
-    'Sec-Fetch-Mode': 'cors',
-    'Sec-Fetch-Site': 'same-origin',
-    'User-Agent': ua,
-    'Cache-Control': 'no-cache',
-  }
-
-  try {
-    const endpoint = `https://${subdomain}.shiprocket.co/pocx/tracking/order/${id}`
-    const res = await fetch(
-      endpoint,
-      { headers, signal: AbortSignal.timeout(12000) }
-    )
-    if ([429, 503, 502, 403].includes(res.status)) return 'rl'
-    if (!res.ok) return null
-    const text = await res.text()
-    if (!text || text.length < 5) return null
-    if (text.includes('"tracking_json":{"rider_customer_data_ds":[]}') || text.includes('"tracking_json":{}')) {
-      const fallbackRes = await fetch(
-        `https://${subdomain}.shiprocket.co/tracking/order/${id}`,
+    try {
+      const endpoint = `https://${subdomain}.shiprocket.co/pocx/tracking/order/${id}`
+      const res = await fetch(
+        endpoint,
         { headers, signal: AbortSignal.timeout(12000) }
       )
-      if (!fallbackRes.ok) return null
-      return parseTrackingPage(await fallbackRes.text(), orderId)
+      if ([429, 503, 502, 403].includes(res.status)) {
+        if (attempt < 2) continue
+        return 'rl'
+      }
+      if (!res.ok) {
+        if (attempt < 2) continue
+        return null
+      }
+      const text = await res.text()
+      if (!text || text.length < 5) {
+        if (attempt < 2) continue
+        return null
+      }
+      if (text.includes('"tracking_json":{"rider_customer_data_ds":[]}') || text.includes('"tracking_json":{}')) {
+        const fallback = await fetchTrackingPage(subdomain, id, headers, orderId)
+        if (fallback || attempt === 2) return fallback
+        continue
+      }
+      if (text.trimStart().startsWith('<')) {
+        if (text.includes('AWB Not Found')) return null
+        const parsed = parseTrackingPage(text, orderId)
+        if (parsed || attempt === 2) return parsed
+        continue
+      }
+      let json: any
+      try { json = JSON.parse(text) } catch {
+        const fallback = await fetchTrackingPage(subdomain, id, headers, orderId)
+        if (fallback || attempt === 2) return fallback
+        continue
+      }
+      const tj = json?.tracking_json
+      if (!tj || !tj.order) {
+        const fallback = await fetchTrackingPage(subdomain, id, headers, orderId)
+        if (fallback || attempt === 2) return fallback
+        continue
+      }
+      return parseTJ(tj, orderId)
+    } catch (e: any) {
+      if (e.name === 'TimeoutError' || e.name === 'AbortError') {
+        if (attempt < 2) continue
+        return 'rl'
+      }
+      if (attempt < 2) continue
+      return null
     }
-    if (text.trimStart().startsWith('<')) {
-      if (text.includes('AWB Not Found')) return null
-      return parseTrackingPage(text, orderId)
-    }
-    let json: any
-    try { json = JSON.parse(text) } catch { return null }
-    const tj = json?.tracking_json
-    if (!tj || !tj.order) return null
-    return parseTJ(tj, orderId)
-  } catch (e: any) {
-    if (e.name === 'TimeoutError' || e.name === 'AbortError') return 'rl'
-    return null
   }
+  return null
 }
 
 export async function POST(req: NextRequest) {

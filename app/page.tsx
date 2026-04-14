@@ -579,22 +579,39 @@ function AddBrandForm({onAdd,onCancel,inp,lbl}:any){
   const[url,setUrl]=useState('');const[name,setName]=useState('');const[sub,setSub]=useState('')
   const[oid,setOid]=useState('');const[date,setDate]=useState('');const[status,setStatus]=useState<{msg:string,ok:boolean}|null>(null);const[loading,setLoading]=useState(false)
   function handleUrl(v:string){setUrl(v);const m=v.match(/https?:\/\/([^.]+)\.shiprocket\.co/);if(m){setSub(m[1]);if(!name)setName(m[1].charAt(0).toUpperCase()+m[1].slice(1))}}
+  const normalizeDateInput=(v:string)=>{
+    if(/^\d{4}-\d{2}-\d{2}$/.test(v))return v
+    const m=v.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/)
+    return m?`${m[3]}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}`:v
+  }
+  async function fetchKnownOrder(currentSub:string,currentOid:string){
+    for(let attempt=0;attempt<3;attempt++){
+      const res=await fetch('/api/proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({subdomain:currentSub,ids:[currentOid.trim()]})})
+      const{results}=await res.json();const o=results[0]
+      if(o&&o!=='rl')return o
+      await sleep(500*(attempt+1))
+    }
+    const debugRes=await fetch('/api/debug',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({subdomain:currentSub,orderId:currentOid.trim()})})
+    const dbg=await debugRes.json()
+    if(dbg?.pageSlug)return{slug:dbg.pageSlug,companyName:name||currentSub,orderDate:dbg.pageOrderDate||'N/A'}
+    return null
+  }
   async function add(){
     if(!name||!sub||!oid||!date){setStatus({msg:'Fill all fields',ok:false});return}
     setLoading(true);setStatus(null)
     try{
-      const res=await fetch('/api/proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({subdomain:sub,ids:[oid.trim()]})})
-      const{results}=await res.json();const o=results[0]
-      if(!o||o==='rl'){setStatus({msg:'Cannot fetch that order. Check subdomain & order ID.',ok:false});setLoading(false);return}
+      const normalizedDate=normalizeDateInput(date)
+      const o=await fetchKnownOrder(sub,oid)
+      if(!o){setStatus({msg:'Cannot fetch that order right now. Shiprocket may be throttling. Try again in 30-60s or use another recent known order.',ok:false});setLoading(false);return}
       const prefixMatch=oid.trim().match(/^([A-Za-z]+)/)
       const detectedPrefix=prefixMatch?prefixMatch[1].toUpperCase():''
-      const numericBase=parseInt(oid.replace(/[^0-9]/g,''))
+      const numericBase=normalizeId(oid)
       const probeIds=Array.from({length:30},(_,i)=>detectedPrefix?`${detectedPrefix}${numericBase+i+1}`:numericBase+i+1)
       const probeRes=await fetch('/api/proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({subdomain:sub,ids:probeIds})})
       const{results:pr}=await probeRes.json()
       const found=pr.filter((r:any)=>r&&r!=='rl'&&r.slug===o.slug)
       const avgPerDay=found.length>0?Math.min(2000,Math.max(5,Math.round((found.length/30)*2000))):30
-      onAdd({id:Date.now().toString(),name,subdomain:sub,slug:o.slug,companyName:o.companyName,anchorId:numericBase,anchorDate:date,avgPerDay,regressionPoints:[],idPrefix:detectedPrefix})
+      onAdd({id:Date.now().toString(),name,subdomain:sub,slug:o.slug,companyName:o.companyName||name,anchorId:numericBase,anchorDate:normalizedDate,avgPerDay,regressionPoints:[],idPrefix:detectedPrefix})
     }catch(e:any){setStatus({msg:e.message,ok:false})}
     setLoading(false)
   }
@@ -613,7 +630,7 @@ function AddBrandForm({onAdd,onCancel,inp,lbl}:any){
         </div>
         <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
           <div><label style={lbl}>One Known Order ID</label><input type="text" value={oid} onChange={e=>setOid(e.target.value)} placeholder="e.g. 437470 or KYT47000" style={inp}/></div>
-          <div><label style={lbl}>That Order's Date</label><input type="date" value={date} onChange={e=>setDate(e.target.value)} style={inp}/></div>
+          <div><label style={lbl}>That Order's Date</label><input type="date" value={date} onChange={e=>setDate(normalizeDateInput(e.target.value))} style={inp}/></div>
         </div>
         {status&&<div style={{padding:'8px 10px',borderRadius:6,fontSize:11,background:status.ok?'#00ff8815':'#ff444415',border:`1px solid ${status.ok?'var(--accent)':'var(--red)'}`,color:status.ok?'var(--accent)':'var(--red)'}}>{status.msg}</div>}
         <div style={{display:'flex',gap:8}}>
