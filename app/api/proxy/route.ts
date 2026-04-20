@@ -15,97 +15,54 @@ function toYMD(s: string) {
   return m2 ? m2[1] : null
 }
 
-function buildOrder(tj: any, originalId: string|number) {
-  if (!tj) return null
-  const order = tj.order
-  if (!order) return null
-  const acts = tj.tracking_data?.shipment_track_activities ?? []
+// Extract var apidata = {...} from page HTML using brace-counting
+function extractApidata(html: string): any {
+  const marker = 'var apidata = '
+  const idx = html.indexOf(marker)
+  if (idx < 0) return null
+  const start = html.indexOf('{', idx)
+  if (start < 0) return null
+  let depth = 0, i = start
+  while (i < html.length) {
+    if (html[i] === '{') depth++
+    else if (html[i] === '}') { depth--; if (depth === 0) break }
+    i++
+  }
+  try { return JSON.parse(html.slice(start, i + 1)) } catch { return null }
+}
+
+function parseApidata(apidata: any, originalId: string|number): any {
+  if (!apidata) return null
+  const order = apidata.order
+  const company = apidata.company
+  const slug = company?.slug || ''
+  const orderDate = order?.order_date || ''
+  if (!orderDate) return null
+
+  const acts = apidata.tracking_data?.shipment_track_activities ?? []
   const lastAct = acts.length > 0 ? acts[acts.length-1] : null
-  const city = lastAct?.location || order.customer_city || order.billing_city || order.customer_state || 'N/A'
-  const rawTime = acts[0]?.date || order.order_date || ''
-  const orderDate = order.order_date ?? 'N/A'
-  const slug = tj.company?.slug || ''
-  if (!orderDate || orderDate === 'N/A') return null
+  const city = lastAct?.location || order?.customer_city || order?.billing_city || order?.customer_state || 'N/A'
+  const rawTime = acts[0]?.date || orderDate || ''
+
+  // order_total and payment_method are hidden when show_pii=0
+  // They no longer exist in the public tracking page response
+  const orderTotal = order?.order_total || null
+  const paymentMethod = order?.payment_method || null
+
   return {
     orderId:     originalId,
     slug,
-    companyName: tj.company?.name || '',
-    orderDate,
+    companyName: company?.name || '',
+    orderDate:   orderDate,
     orderTime:   rawTime.length >= 16 ? rawTime.slice(11,16) : 'N/A',
     dateYMD:     toYMD(orderDate),
-    value:       order.order_total ? `Rs.${parseFloat(order.order_total).toFixed(2)}` : 'N/A',
-    valueNum:    parseFloat(order.order_total) || 0,
-    payment:     order.payment_method ?? 'N/A',
-    status:      tj.shipment_status_text ?? 'N/A',
-    pincode:     order.customer_pincode ?? 'N/A',
+    value:       orderTotal ? `Rs.${parseFloat(orderTotal).toFixed(2)}` : 'N/A',
+    valueNum:    parseFloat(orderTotal||'0') || 0,
+    payment:     paymentMethod || 'N/A',
+    status:      apidata.shipment_status_text || 'N/A',
+    pincode:     order?.customer_pincode || 'N/A',
     location:    city,
   }
-}
-
-// Extract tracking_json from page HTML — tries multiple known patterns
-function extractFromHtml(html: string, originalId: string|number) {
-  // Pattern 1: apidata = {...} (old Shiprocket page format)
-  const apiDataPatterns = [
-    /var\s+apidata\s*=\s*'([^']+)'/,
-    /var\s+apidata\s*=\s*"([^"]+)"/,
-    /apidata\s*=\s*'([^']+)'/,
-    /apidata\s*=\s*({[\s\S]+?});/,
-    /"apidata"\s*:\s*({[\s\S]+?})\s*[,}]/,
-  ]
-  for (const pat of apiDataPatterns) {
-    const m = html.match(pat)
-    if (m) {
-      try {
-        const raw = m[1].startsWith('{') ? m[1] : decodeURIComponent(m[1])
-        const json = JSON.parse(raw)
-        const tj = json?.tracking_json || json
-        const result = buildOrder(tj, originalId)
-        if (result) return result
-      } catch {}
-    }
-  }
-
-  // Pattern 2: __NEXT_DATA__ (newer Next.js pages)
-  const ndMatch = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/)
-  if (ndMatch) {
-    try {
-      const nd = JSON.parse(ndMatch[1])
-      const pp = nd?.props?.pageProps
-      const tj = pp?.trackingData?.tracking_json || pp?.tracking_json || pp?.data?.tracking_json
-      const result = buildOrder(tj, originalId)
-      if (result) return result
-    } catch {}
-  }
-
-  // Pattern 3: window.__SR_DATA__ or similar global vars
-  const globalPatterns = [
-    /window\.__SR_DATA__\s*=\s*({[\s\S]+?});/,
-    /window\.__TRACKING_DATA__\s*=\s*({[\s\S]+?});/,
-    /self\.__apiData\s*=\s*({[\s\S]+?});/,
-  ]
-  for (const pat of globalPatterns) {
-    const m = html.match(pat)
-    if (m) {
-      try {
-        const json = JSON.parse(m[1])
-        const tj = json?.tracking_json || json
-        const result = buildOrder(tj, originalId)
-        if (result) return result
-      } catch {}
-    }
-  }
-
-  // Pattern 4: tracking_json embedded as JSON string anywhere in page
-  const tjMatch = html.match(/"tracking_json"\s*:\s*({[\s\S]+?"company"[\s\S]+?"order"\s*:\s*{[\s\S]+?}[\s\S]+?})\s*[,}]/)
-  if (tjMatch) {
-    try {
-      const tj = JSON.parse(tjMatch[1])
-      const result = buildOrder(tj, originalId)
-      if (result) return result
-    } catch {}
-  }
-
-  return null
 }
 
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
@@ -113,34 +70,7 @@ const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (
 async function fetchOneOrder(subdomain: string, orderId: string|number): Promise<any> {
   const id = String(orderId)
 
-  // Step 1: Try the JSON API first (fast, ~300ms)
-  try {
-    const res = await fetch(`https://${subdomain}.shiprocket.co/pocx/tracking/order/${id}`, {
-      headers: {
-        'Accept': 'application/json, text/plain, */*',
-        'Referer': `https://${subdomain}.shiprocket.co/tracking/order/${id}`,
-        'Origin': `https://${subdomain}.shiprocket.co`,
-        'X-Requested-With': 'XMLHttpRequest',
-        'User-Agent': UA,
-      },
-      signal: AbortSignal.timeout(8000),
-    })
-    if (res.status === 429 || res.status === 403 || res.status === 503) return 'rl'
-    if (res.ok) {
-      const text = await res.text()
-      if (text && !text.startsWith('<')) {
-        const json = JSON.parse(text)
-        const tj = json?.tracking_json
-        // Only use if it has actual order data
-        if (tj?.order?.order_id) {
-          const result = buildOrder(tj, orderId)
-          if (result) return result
-        }
-      }
-    }
-  } catch {}
-
-  // Step 2: Fetch the tracking page HTML and parse it
+  // Primary: fetch the HTML tracking page and extract apidata
   try {
     const res = await fetch(`https://${subdomain}.shiprocket.co/tracking/order/${id}`, {
       headers: {
@@ -153,8 +83,52 @@ async function fetchOneOrder(subdomain: string, orderId: string|number): Promise
     if (res.status === 429 || res.status === 503 || res.status === 403) return 'rl'
     if (!res.ok) return null
     const html = await res.text()
-    const result = extractFromHtml(html, orderId)
-    if (result) return result
+    const apidata = extractApidata(html)
+    if (apidata?.order?.order_date) {
+      return parseApidata(apidata, orderId)
+    }
+  } catch {}
+
+  // Fallback: old /pocx/ JSON API (may still work for some brands)
+  try {
+    const res = await fetch(`https://${subdomain}.shiprocket.co/pocx/tracking/order/${id}`, {
+      headers: {
+        'Accept': 'application/json',
+        'Referer': `https://${subdomain}.shiprocket.co/`,
+        'X-Requested-With': 'XMLHttpRequest',
+        'User-Agent': UA,
+      },
+      signal: AbortSignal.timeout(8000),
+    })
+    if (res.status === 429 || res.status === 403 || res.status === 503) return 'rl'
+    if (res.ok) {
+      const text = await res.text()
+      if (text && !text.startsWith('<')) {
+        const json = JSON.parse(text)
+        const tj = json?.tracking_json
+        if (tj?.order?.order_date) {
+          const order = tj.order
+          const acts = tj.tracking_data?.shipment_track_activities ?? []
+          const lastAct = acts.length > 0 ? acts[acts.length-1] : null
+          const city = lastAct?.location || order.customer_city || order.billing_city || 'N/A'
+          const rawTime = acts[0]?.date || order.order_date || ''
+          return {
+            orderId:     orderId,
+            slug:        tj.company?.slug || '',
+            companyName: tj.company?.name || '',
+            orderDate:   order.order_date,
+            orderTime:   rawTime.length >= 16 ? rawTime.slice(11,16) : 'N/A',
+            dateYMD:     toYMD(order.order_date),
+            value:       order.order_total ? `Rs.${parseFloat(order.order_total).toFixed(2)}` : 'N/A',
+            valueNum:    parseFloat(order.order_total) || 0,
+            payment:     order.payment_method || 'N/A',
+            status:      tj.shipment_status_text || 'N/A',
+            pincode:     order.customer_pincode || 'N/A',
+            location:    city,
+          }
+        }
+      }
+    }
   } catch {}
 
   return null
@@ -162,6 +136,15 @@ async function fetchOneOrder(subdomain: string, orderId: string|number): Promise
 
 export async function POST(req: NextRequest) {
   const { subdomain, ids } = await req.json() as { subdomain: string; ids: Array<string|number> }
-  const results = await Promise.all(ids.map(id => fetchOneOrder(subdomain, id).catch(() => null)))
+  // Fetch sequentially to avoid overwhelming Shiprocket (page scraping is heavier)
+  const results: any[] = []
+  for (const id of ids) {
+    if (results.filter(r => r === 'rl').length > ids.length / 2) {
+      // More than half rate limited — return all remaining as rl
+      results.push(...ids.slice(results.length).map(() => 'rl'))
+      break
+    }
+    results.push(await fetchOneOrder(subdomain, id).catch(() => null))
+  }
   return NextResponse.json({ results })
 }
