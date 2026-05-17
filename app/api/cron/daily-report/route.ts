@@ -161,12 +161,26 @@ async function walkToDate(
   return { lo, hi }
 }
 
-// ── Scan one day of orders ────────────────────────────
+// ── Batch fetch via /api/proxy (reuses same HTML scraping logic, but batched) ──
+async function fetchBatch(origin: string, ids: number[]): Promise<Array<any>> {
+  try {
+    const res = await fetch(`${origin}/api/proxy`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subdomain: SUBDOMAIN, ids: ids.map(id => ID_PREFIX ? `${ID_PREFIX}${id}` : id) }),
+      signal: AbortSignal.timeout(30000),
+    })
+    if (!res.ok) return ids.map(() => 'rl')
+    const { results } = await res.json()
+    return results
+  } catch { return ids.map(() => 'rl') }
+}
 async function scanDay(
   dateStr: string,
   anchorId: number,
   anchorDate: string,
-  regPts: Array<{date:string,id:number}>
+  regPts: Array<{date:string,id:number}>,
+  origin: string
 ): Promise<{ orders: any[]; newRegPts: Array<{date:string,id:number}> }> {
   // Find best reference point
   const pts = [{ date: anchorDate, id: anchorId }, ...regPts]
@@ -194,27 +208,41 @@ async function scanDay(
 
   // Burst scan
   const orders: any[] = []
-  const BURST = 50, REST = 2000, CONCURRENCY = 3
+  // Use /api/proxy for batch fetching — 10 IDs per call, much faster
+  const BATCH = 10, BURST = 50, REST = 3000
   let rlStreak = 0
+  const RL_WAITS = [15, 30, 60, 90, 120]
 
   for (let base = scanStart; base <= scanEnd; ) {
     const burstEnd = Math.min(base + BURST - 1, scanEnd)
 
-    for (let b = base; b <= burstEnd; b += CONCURRENCY) {
-      const ids = Array.from({ length: Math.min(CONCURRENCY, burstEnd - b + 1) }, (_, i) => b + i)
-      const results = await Promise.all(ids.map(id => fetchOrder(id)))
+    for (let b = base; b <= burstEnd; b += BATCH) {
+      const ids = Array.from({ length: Math.min(BATCH, burstEnd - b + 1) }, (_, i) => b + i)
+      let results = await fetchBatch(origin, ids)
 
-      for (let i = 0; i < ids.length; i++) {
-        const o = results[i]
-        if (o === 'rl') { rlStreak++; continue }
-        rlStreak = Math.max(0, rlStreak - 1)
-        if (o && o.dateYMD === dateStr) orders.push(o)
+      // If all RL, apply cooldown and retry once
+      if (results.every(r => r === 'rl')) {
+        rlStreak++
+        const wait = RL_WAITS[Math.min(rlStreak - 1, RL_WAITS.length - 1)]
+        console.log(`RL streak=${rlStreak} waiting ${wait}s`)
+        await sleep(wait * 1000)
+        results = await fetchBatch(origin, ids)
       }
-      await sleep(rlStreak > 0 ? Math.min(rlStreak * 3000, 15000) : 150)
+
+      for (const o of results) {
+        if (o && o !== 'rl') {
+          rlStreak = Math.max(0, rlStreak - 1)
+          if (o.dateYMD === dateStr) orders.push(o)
+        }
+      }
+      await sleep(rlStreak > 0 ? 2000 : 600)  // 600ms between batches = ~17 req/s max
     }
 
     base = burstEnd + 1
-    if (base <= scanEnd) await sleep(REST)
+    if (base <= scanEnd) {
+      console.log(`Burst done (${base-BURST}-${burstEnd}): ${orders.length} found. Rest ${REST/1000}s`)
+      await sleep(REST)
+    }
   }
 
   // Update regression points from found orders
@@ -282,7 +310,7 @@ export async function GET(req: NextRequest) {
     }
 
     // Scan yesterday
-    const { orders: yestOrders, newRegPts } = await scanDay(yest, ANCHOR_ID, ANCHOR_DATE, regPts)
+    const { orders: yestOrders, newRegPts } = await scanDay(yest, ANCHOR_ID, ANCHOR_DATE, regPts, `https://${req.headers.get('host')}`)
     saveRegPts(newRegPts)
 
     // Save this run
