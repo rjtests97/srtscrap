@@ -92,6 +92,45 @@ function buildReport(orders:Order[],brandName:string,dateRange:string){
   s+='\nFULL ORDER LIST\nOrder ID,Date,Time,Value,Payment,Status,Location,Pincode\n';sortOrders(orders).forEach(r=>s+=`${esc(r.orderId)},${esc(r.orderDate)},${esc(r.orderTime)},${esc(r.value)},${esc(r.payment)},${esc(r.status)},${esc(r.location)},${esc(r.pincode)}\n`)
   return s
 }
+// ── Telegram ─────────────────────────────────────────
+async function sendTelegramMsg(token:string, chatId:string, text:string){
+  await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({chat_id:chatId,text,parse_mode:'HTML'})
+  })
+}
+async function sendTelegramDoc(token:string, chatId:string, filename:string, csvContent:string, caption:string){
+  const form=new FormData()
+  form.append('chat_id',chatId)
+  form.append('caption',caption)
+  form.append('document',new Blob([csvContent],{type:'text/csv'}),filename)
+  await fetch(`https://api.telegram.org/bot${token}/sendDocument`,{method:'POST',body:form})
+}
+function buildTelegramReport(orders:Order[], brandName:string, label:string, yest:string, wStart:string, mStart:string, today:string):string{
+  const inRange=(arr:Order[],from:string,to:string)=>arr.filter(o=>o.dateYMD&&o.dateYMD>=from&&o.dateYMD<=to)
+  const stats=(arr:Order[])=>{
+    const rev=arr.reduce((s,o)=>s+(o.valueNum||0),0)
+    const cod=arr.filter(o=>(o.payment||'').toUpperCase()==='COD').length
+    return{count:arr.length,rev:Math.round(rev),cod,prepaid:arr.length-cod,avg:arr.length?Math.round(rev/arr.length):0}
+  }
+  const fmt=(n:number)=>n>=100000?`₹${(n/100000).toFixed(1)}L`:n>=1000?`₹${(n/1000).toFixed(1)}k`:`₹${n}`
+  const fd=(d:string)=>new Date(d+'T00:00:00').toLocaleDateString('en-IN',{day:'numeric',month:'short'})
+  const y=stats(inRange(orders,yest,yest))
+  const w=stats(inRange(orders,wStart,today))
+  const m=stats(inRange(orders,mStart,today))
+  const cityMap:Record<string,number>={}
+  inRange(orders,yest,yest).forEach(o=>{const c=o.location;if(c&&c!=='N/A')cityMap[c]=(cityMap[c]||0)+1})
+  const top=Object.entries(cityMap).sort((a,b)=>b[1]-a[1]).slice(0,3).map(([c,n])=>`${c} (${n})`).join(' · ')
+  const yLine=y.count>0?[
+    `📦 ${y.count} orders | ${fmt(y.rev)} | Avg ₹${y.avg}`,
+    `💳 COD: ${y.cod} (${y.count?Math.round(y.cod/y.count*100):0}%) · Prepaid: ${y.prepaid}`,
+    top?`📍 ${top}`:''
+  ].filter(Boolean).join('\n'):'No orders found'
+  return [`🌅 <b>Morning Report</b> — ${brandName}`,'',`📅 <b>Yesterday</b> (${fd(yest)})`,yLine,'',
+    `📊 <b>Week to Date</b> (from ${fd(wStart)}): <b>${w.count}</b> orders · ${fmt(w.rev)}`,
+    `📈 <b>Month to Date</b>: <b>${m.count}</b> orders · ${fmt(m.rev)}`].join('\n')
+}
+
 function dlFile(content:string,filename:string){const a=document.createElement('a');a.href='data:text/csv;charset=utf-8,'+encodeURIComponent(content);a.download=filename;a.click()}
 function buildWhatsappSummary(orders:Order[],brandName:string,dateRange:string){
   const a=buildAnalytics(orders);if(!a)return''
@@ -103,113 +142,63 @@ const darkVars={'--bg':'#0d0d0d','--surface':'#161616','--surface2':'#1e1e1e','-
 const lightVars={'--bg':'#f5f5f0','--surface':'#fff','--surface2':'#efefea','--border':'#ddd','--accent':'#008844','--warn':'#cc5500','--text':'#111','--muted':'#888','--red':'#cc2222'}
 
 // ── Scanner ───────────────────────────────────────────
-// Architecture:
-//   - callProxy: raw HTTP, returns 'rl' on any failure
-//   - fetchBatch: wraps callProxy, handles RL with escalating cooldowns, never gives up
-//   - scanManual / scanRange: burst-rest rhythm with adaptive throttling
-//
-// KEY: On minnies.shiprocket.co every response belongs to Minnies.
-//   null = ID doesn't exist yet (genuine gap or end of orders)
-//   'rl' = rate limited (retry)
-//   Order = valid order
-
 class Scanner {
   private subdomain:string; private slug:string; private idPrefix:string
-  public stopped=false; private rlStreak=0
+  private stopped=false; private rlStreak=0
   private onLog:(m:string,c:string)=>void
   private onProgress:(done:number,total:number,found:number)=>void
   private onOrder:(o:Order)=>void
   private onStats?:(s:Partial<ScanStats>)=>void
+  private seen=new Set<string>()
 
-  constructor(subdomain:string,slug:string,idPrefix:string,
-    onLog:(m:string,c:string)=>void,
-    onProgress:(done:number,total:number,found:number)=>void,
-    onOrder:(o:Order)=>void,
-    onStats?:(s:Partial<ScanStats>)=>void){
+  constructor(subdomain:string,slug:string,idPrefix:string,onLog:(m:string,c:string)=>void,onProgress:(done:number,total:number,found:number)=>void,onOrder:(o:Order)=>void,onStats?:(s:Partial<ScanStats>)=>void){
     this.subdomain=subdomain;this.slug=slug;this.idPrefix=idPrefix
-    this.onLog=onLog;this.onProgress=onProgress;this.onOrder=onOrder;this.onStats=onStats
+    this.onLog=onLog;this.onProgress=onProgress;this.onOrder=onOrder
+    this.onStats=onStats
   }
-
   stop(){this.stopped=true}
   private toId(n:number):string|number{return this.idPrefix?`${this.idPrefix}${n}`:n}
-  static numericPart(id:number|string):number{
-    if(typeof id==='number')return id
-    const m=String(id).match(/(\d+)$/)
-    return m?parseInt(m[1]):0
-  }
+  static numericPart(id:number|string):number{if(typeof id==='number')return id;const m=String(id).match(/(\d+)$/);return m?parseInt(m[1]):0}
 
-  // Raw proxy call — returns 'rl' on any failure/rate-limit
-  private async callProxy(ids:number[]):Promise<Array<Order|null|'rl'>>{
-    try{
-      const res=await fetch('/api/proxy',{
-        method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({subdomain:this.subdomain,ids:ids.map(n=>this.toId(n))})
-      })
-      if(!res.ok)return ids.map(()=>'rl' as const)
-      const{results}=await res.json()
-      return results
-    }catch{return ids.map(()=>'rl' as const)}
-  }
-
-  // Wait with stop-check every 500ms, log countdown every 30s
-  private async wait(ms:number,label:string):Promise<void>{
-    const start=Date.now()
-    this.onLog(label+': '+Math.ceil(ms/1000)+'s...','info')
-    let lastLog=0
-    for(let elapsed=0;elapsed<ms&&!this.stopped;elapsed=Date.now()-start){
-      const remaining=Math.ceil((ms-elapsed)/1000)
-      if(elapsed-lastLog>=30000){lastLog=elapsed;this.onLog(label+': '+remaining+'s remaining','info')}
-      await sleep(Math.min(500,ms-elapsed))
-    }
-    if(!this.stopped)this.onLog(label+' done','info')
-  }
-
-  // Fetch with infinite retry on RL — escalating cooldowns: 10s,30s,60s,120s,180s,300s
   async fetchBatch(ids:number[]):Promise<Array<Order|null|'rl'>>{
     if(this.stopped)return ids.map(()=>null)
-    const WAITS=[10,20,40,60,90,120]
-    let attempt=0
-    while(!this.stopped){
-      const results=await this.callProxy(ids)
-      if(results.some(r=>r!=='rl')){
-        if(this.rlStreak>0){this.rlStreak=0;this.onLog('Connection restored','ok')}
-        return results
-      }
-      attempt++;this.rlStreak++
-      this.onStats?.({retries:1})
-      const waitSec=WAITS[Math.min(attempt-1,WAITS.length-1)]
-      this.onLog('Rate limited (x'+attempt+') — waiting '+waitSec+'s','info')
-      await this.wait(waitSec*1000,'Cooldown')
-    }
-    return ids.map(()=>null)
+    if(this.rlStreak>0){const w=Math.min(this.rlStreak*2000,30000);if(this.rlStreak===1)this.onLog(`Rate limit — waiting ${w/1000}s...`,'info');await sleep(w)}
+    try{
+      const orderIds=ids.map(n=>this.toId(n))
+      const res=await fetch('/api/proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({subdomain:this.subdomain,ids:orderIds})})
+      if(!res.ok){this.rlStreak++;return ids.map(()=>'rl')}
+      const{results}=await res.json()
+      const hasRl=results.some((r:any)=>r==='rl')
+      if(hasRl)this.rlStreak++;else this.rlStreak=Math.max(0,this.rlStreak-1)
+      return results
+    }catch{this.rlStreak++;return ids.map(()=>null)}
   }
 
-  private async probe(id:number):Promise<Order|null|'rl'>{
-    const r=await this.callProxy([id]);return r[0]
-  }
+  async probe(id:number):Promise<Order|null|'rl'>{const r=await this.fetchBatch([id]);return r[0]}
 
-  // Boundary walk for By Date scan
-  async walkToBracket(refId:number,refDate:string,targetDate:string,label:string):Promise<{lo:number,hi:number}>{
+  async walkToBracket(refId:number,refDate:string,targetDate:string,logPrefix:string):Promise<{lo:number,hi:number}>{
     const forward=targetDate>refDate
-    let lo=refId,hi=refId,lastId=refId,consNulls=0
-    this.onLog(label+': walking '+(forward?'→':'←')+' from #'+this.idPrefix+refId,'info')
+    let lo=refId,hi=refId,lastFoundId:number|string=refId,lastFoundDate=refDate,missesAfterLastFound=0
+    const numId=(o:Order)=>Scanner.numericPart(o.orderId)
+    this.onLog(`${logPrefix}: walking ${forward?'→':'←'} from #${this.idPrefix}${refId} (${refDate})`,'info')
     for(let i=1;i<=400&&!this.stopped;i++){
       const pid=forward?refId+i*500:Math.max(1,refId-i*500)
       const o=await this.probe(pid)
-      if(o&&o!=='rl'&&o.dateYMD){
-        consNulls=0;lastId=Scanner.numericPart(o.orderId)
-        this.onLog('  #'+o.orderId+' = '+o.orderDate,'info')
+      if(o&&o!=='rl'&&o.slug===this.slug&&o.dateYMD){
+        lastFoundId=o.orderId;lastFoundDate=o.dateYMD;missesAfterLastFound=0
+        this.onLog(`  #${o.orderId} = ${o.orderDate}`,'info')
         if(forward){
-          if(o.dateYMD>=targetDate){hi=lastId;break}
-          lo=lastId
-          if((new Date(targetDate+'T00:00:00').getTime()-new Date(o.dateYMD+'T00:00:00').getTime())/86400000<=5){hi=lastId+3000;break}
+          if(o.dateYMD>=targetDate){hi=numId(o);break}
+          lo=numId(o)
+          const daysLeft=(new Date(targetDate+'T00:00:00').getTime()-new Date(o.dateYMD+'T00:00:00').getTime())/86400000
+          if(daysLeft<=5){hi=numId(o)+3000;break}
         }else{
-          if(o.dateYMD<targetDate){lo=lastId;break}
-          hi=lastId
+          if(o.dateYMD<targetDate){lo=numId(o);break}
+          hi=numId(o)
         }
-      }else if(o===null){
-        consNulls++
-        if(forward&&lo>refId&&consNulls>=4){hi=lastId+1500;break}
+      }else{
+        missesAfterLastFound++
+        if(forward&&lo>refId&&missesAfterLastFound>=4){hi=Scanner.numericPart(lastFoundId)+1500;break}
       }
       await sleep(60)
       if(!forward&&pid<=1)break
@@ -218,168 +207,184 @@ class Scanner {
     return{lo,hi}
   }
 
-  async findBoundaries(anchorId:number,anchorDate:string,regPts:Array<{date:string,id:number}>,fromDate:string,toDate:string):Promise<{scanStart:number,scanEnd:number}>{
-    const pts=[{date:anchorDate,id:anchorId},...regPts].filter(p=>p.date&&p.id>0).sort((a,b)=>a.date.localeCompare(b.date))
-    const closest=(t:string)=>pts.reduce((b,p)=>
-      Math.abs(new Date(p.date+'T00:00:00').getTime()-new Date(t+'T00:00:00').getTime())<
-      Math.abs(new Date(b.date+'T00:00:00').getTime()-new Date(t+'T00:00:00').getTime())?p:b,pts[0])
-    const rF=closest(fromDate)
-    const fromB=await this.walkToBracket(rF.id,rF.date,fromDate,'fromDate')
+  async findBoundaries(anchorId:number,anchorDate:string,regressionPoints:Array<{date:string,id:number}>,fromDate:string,toDate:string):Promise<{scanStart:number,scanEnd:number}>{
+    const pts=[{date:anchorDate,id:anchorId},...regressionPoints].filter(p=>p.date&&p.id>0).sort((a,b)=>a.date.localeCompare(b.date))
+    const closest=(t:string)=>pts.reduce((best,p)=>Math.abs(new Date(p.date+'T00:00:00').getTime()-new Date(t+'T00:00:00').getTime())<Math.abs(new Date(best.date+'T00:00:00').getTime()-new Date(t+'T00:00:00').getTime())?p:best,pts[0])
+    const refFrom=closest(fromDate)
+    const fromBracket=await this.walkToBracket(refFrom.id,refFrom.date,fromDate,'fromDate')
     if(this.stopped)return{scanStart:0,scanEnd:0}
-    const rT=fromB.lo>closest(toDate).id?{id:fromB.lo,date:fromDate}:closest(toDate)
-    const toB=await this.walkToBracket(rT.id,rT.date,toDate,'toDate')
-    const scanStart=Math.max(1,fromB.lo-100),scanEnd=toB.hi+100
-    this.onLog('Range: #'+this.idPrefix+scanStart+' to #'+this.idPrefix+scanEnd+' ('+(scanEnd-scanStart+1)+' IDs)','ok')
+    const toRef=fromBracket.lo>closest(toDate).id?{id:fromBracket.lo,date:fromDate}:closest(toDate)
+    const toBracket=await this.walkToBracket(toRef.id,toRef.date,toDate,'toDate')
+    const scanStart=Math.max(1,fromBracket.lo-100)
+    const scanEnd=toBracket.hi+100
+    this.onLog(`✓ Range: #${this.idPrefix}${scanStart}–#${this.idPrefix}${scanEnd} (${scanEnd-scanStart+1} IDs)`,'ok')
     return{scanStart,scanEnd}
   }
 
-  // Adaptive burst controller
-  // Starts at BURST_MAX, halves on RL cooldown, recovers slowly
-  private static BURST_MAX=80
-  private static BURST_MIN=10
-  private static REST_BASE=3000  // ms between bursts
-
   async scanRange(scanStart:number,scanEnd:number,fromDate:string,toDate:string,concurrency:number,startedAt:number):Promise<Order[]>{
-    const orders:Order[]=[]
-    let scanned=0,matched=0,burstNum=0
-    let burstSize=Scanner.BURST_MAX
-    const total=scanEnd-scanStart+1
-
-    for(let base=scanStart;base<=scanEnd&&!this.stopped;){
-      const burstEnd=Math.min(base+burstSize-1,scanEnd)
-      burstNum++
-      this.onLog('Burst '+burstNum+' (sz='+burstSize+'): #'+this.toId(base)+' → #'+this.toId(burstEnd),'info')
-
-      let rlInBurst=0
-      for(let b=base;b<=burstEnd&&!this.stopped;b+=concurrency){
-        const ids=Array.from({length:Math.min(concurrency,burstEnd-b+1)},(_,i)=>b+i)
-        const results=await this.fetchBatch(ids)
-        for(let i=0;i<ids.length;i++){
-          const o=results[i];scanned++
-          if(o==='rl'){rlInBurst++;continue}
-          if(o!==null&&o.dateYMD&&o.dateYMD>=fromDate&&o.dateYMD<=toDate){
-            orders.push(o);matched++;this.onOrder(o)
-            this.onLog('#'+ids[i]+'  '+o.orderDate+'  '+o.value+'  '+o.payment+'  '+o.location+'  '+o.pincode,'ok')
-          }
-        }
-        this.onProgress(scanStart+scanned-1,scanEnd,matched)
-        await sleep(120)
+    const total=scanEnd-scanStart+1,orders:Order[]=[],batchDelay=()=>this.rlStreak>0?Math.min(this.rlStreak*1500,15000):300
+    let scanned=0,matched=0
+    for(let base=scanStart;base<=scanEnd&&!this.stopped;base+=concurrency){
+      const ids=Array.from({length:Math.min(concurrency,scanEnd-base+1)},(_,i)=>base+i)
+      const results=await this.fetchBatch(ids)
+      for(let i=0;i<ids.length;i++){
+        const o=results[i];scanned++
+        if(o&&o!=='rl'&&o.slug===this.slug&&o.dateYMD&&o.dateYMD>=fromDate&&o.dateYMD<=toDate){orders.push(o);matched++;this.onOrder(o);this.onLog(`#${ids[i]}  ${o.orderDate}  ${o.value}  ${o.payment}  ${o.location}  ${o.pincode}`,'ok')}
       }
-
-      // Adapt burst size based on RL hits
-      if(rlInBurst>0){
-        burstSize=Math.max(Scanner.BURST_MIN,Math.floor(burstSize/2))
-        this.onLog('Throttling detected — reduced burst to '+burstSize+' IDs','info')
-      }else if(burstSize<Scanner.BURST_MAX){
-        burstSize=Math.min(Scanner.BURST_MAX,burstSize+10)
-      }
-
-      base=burstEnd+1
-      if(base>scanEnd||this.stopped)break
-
-      const pct=Math.round(scanned/total*100)
-      const rest=rlInBurst>0?Scanner.REST_BASE*2:Scanner.REST_BASE
-      this.onLog('Rest '+(rest/1000)+'s — burst '+burstNum+' | '+matched+' found | '+pct+'%','info')
-      this.onStats?.({lastMatchedId:matched>0?Scanner.numericPart(orders[orders.length-1].orderId):null})
-      for(let t=0;t<rest&&!this.stopped;t+=300)await sleep(Math.min(300,rest-t))
+      this.onProgress(scanStart+scanned-1,scanEnd,matched)
+      await sleep(batchDelay())
     }
     return orders
   }
 
   async scanManual(startId:number,endId:number,concurrency:number,useAuto:boolean,stopAfter:number,startedAt:number):Promise<Order[]>{
-    const orders:Order[]=[]
-    let scanned=0,matched=0,consNulls=0,burstNum=0
-    let lastGoodId:number|null=null
-    // Adaptive burst: shrinks on RL, recovers after clean bursts
-    let burstSize=Scanner.BURST_MAX
-    let cleanBursts=0      // consecutive bursts with no RL
-    let rlCooldowns=0      // total RL cooldowns taken (for escalating wait)
-
-    // Check if a known-good ID still works — if not, we're rate-limited
-    const isRateLimited=async():Promise<boolean>=>{
-      if(!lastGoodId)return false
-      this.onLog('Verifying #'+this.toId(lastGoodId)+'...','info')
-      const r=(await this.callProxy([lastGoodId]))[0]
-      const rl=(r===null||r==='rl')
-      this.onLog(rl?'Rate limited confirmed':'Working fine — nulls are genuine','info')
-      return rl
-    }
-
-    for(let base=startId;base<=endId&&!this.stopped;){
-      const burstEnd=Math.min(base+burstSize-1,endId)
-      burstNum++
-      this.onLog('Burst '+burstNum+' (sz='+burstSize+'): #'+this.toId(base)+' → #'+this.toId(burstEnd),'info')
-
-      let rlInBurst=0
-      for(let b=base;b<=burstEnd&&!this.stopped;b+=concurrency){
-        const ids=Array.from({length:Math.min(concurrency,burstEnd-b+1)},(_,i)=>b+i)
-        const results=await this.fetchBatch(ids)
-
-        for(let i=0;i<ids.length&&!this.stopped;i++){
-          const o=results[i];scanned++
-          if(o==='rl'){rlInBurst++;continue}
-          if(o!==null){
-            orders.push(o);matched++;consNulls=0;cleanBursts=0
-            lastGoodId=ids[i]
-            this.onStats?.({lastMatchedId:Scanner.numericPart(o.orderId)})
-            this.onOrder(o)
-            this.onLog('#'+ids[i]+'  '+o.orderDate+'  '+o.value+'  '+o.payment+'  '+o.location,'ok')
+    const orders:Order[]=[],batchDelay=()=>this.rlStreak>0?Math.min(this.rlStreak*1500,15000):300
+    const processBatch=async(ids:number[])=>{
+      let batchMatches=0,batchMisses=0,batchRetryFailures=0
+      const results=await this.fetchBatch(ids)
+      for(let i=0;i<ids.length&&!this.stopped;i++){
+        let o=results[i];scanned++
+        if((!o||o==='rl'||o.slug!==this.slug)&&useAuto){
+          this.onStats?.({retries:1})
+          await sleep(120)
+          const retry=await this.probe(ids[i])
+          if(retry&&retry!=='rl'&&retry.slug===this.slug){
+            o=retry
+            this.onStats?.({recovered:1})
+            this.onLog(`#${ids[i]} recovered on retry`,'info')
+          }else if(retry==='rl'){
+            o='rl'
+            batchRetryFailures++
           }else{
-            consNulls++
-            // Reached null threshold — check if rate-limited before stopping/waiting
-            if(useAuto&&consNulls>=stopAfter){
-              const rl=await isRateLimited()
-              if(!rl){
-                // Genuine end
-                this.onLog('Genuine end of orders after '+matched+' orders','ok')
-                this.stopped=true
-                break
-              }
-              // Rate limited — escalating cooldown
-              rlCooldowns++
-              cleanBursts=0
-              // Cooldown escalates: 120s, 180s, 300s, 300s, ...
-              const coolSec=[30,60,90,180,300][Math.min(rlCooldowns-1,4)]
-              this.onLog('Rate-limit cooldown #'+rlCooldowns+' — waiting '+coolSec+'s then resuming...','info')
-              await this.wait(coolSec*1000,'Cooldown')
-              if(this.stopped)break
-              // After cooldown: shrink burst size and reset null counter
-              burstSize=Math.max(Scanner.BURST_MIN,Math.floor(burstSize/2))
-              consNulls=0
-              this.onLog('Resuming with smaller bursts (sz='+burstSize+')','ok')
-            }
+            o=null
+            batchRetryFailures++
           }
         }
-        this.onProgress(startId+scanned-1,endId,matched)
-        await sleep(120)
-      }
-
-      // Adapt burst size based on this burst's health
-      if(rlInBurst>0){
-        burstSize=Math.max(Scanner.BURST_MIN,Math.floor(burstSize/2))
-        cleanBursts=0
-        this.onLog('RL in burst — reduced size to '+burstSize,'info')
-      }else{
-        cleanBursts++
-        if(cleanBursts>=3&&burstSize<Scanner.BURST_MAX){
-          burstSize=Math.min(Scanner.BURST_MAX,burstSize+20)
-          this.onLog('Clean burst streak — increased size to '+burstSize,'info')
+        if(o&&o!=='rl'&&o.slug===this.slug){
+          const key=String(o.orderId)
+          if(this.seen.has(key)){this.onStats?.({duplicates:1});continue}
+          this.seen.add(key)
+          orders.push(o);matched++;batchMatches++;this.onOrder(o);this.onStats?.({lastMatchedId:Scanner.numericPart(o.orderId)});this.onLog(`#${ids[i]}  ${o.orderDate}  ${o.value}  ${o.payment}  ${o.location}`,'ok')
+        }else if(o!=='rl'){
+          batchMisses++
         }
       }
-
-      base=burstEnd+1
-      if(base>endId||this.stopped)break
-
-      // Longer rest after RL cooldowns to let rate limit fully reset
-      const rest=rlCooldowns>0?Scanner.REST_BASE*2:Scanner.REST_BASE
-      this.onLog('Rest '+(rest/1000)+'s — burst '+burstNum+' | '+matched+' found | '+consNulls+' null streak','info')
-      this.onStats?.({retries:this.rlStreak})
-      for(let t=0;t<rest&&!this.stopped;t+=300)await sleep(Math.min(300,rest-t))
+      return { batchMatches, batchMisses, batchRetryFailures }
     }
+
+    let scanned=0,matched=0
+    if(!useAuto){
+      for(let base=startId;base<=endId&&!this.stopped;base+=concurrency){
+        const ids=Array.from({length:Math.min(concurrency,endId-base+1)},(_,i)=>base+i)
+        await processBatch(ids)
+        this.onProgress(startId+scanned-1,endId,matched)
+        await sleep(batchDelay())
+      }
+      return orders
+    }
+
+    const normalWindowSize=Math.max(250,Math.min(5000,stopAfter))
+    const emptyWindowLimit=3
+    let nextBase=startId,emptyWindows=0,lastMatchedId:number|null=null,currentConcurrency=concurrency,retryFailureStreak=0,cooldowns=0,lowSlowMode=false,cleanWindows=0,stallScans=0
+    this.onLog(`Auto mode uses verified windows of ${normalWindowSize} IDs with forward probes`,'info')
+
+    while(nextBase<=endId&&!this.stopped){
+      const windowSize=lowSlowMode?Math.max(25,currentConcurrency*20):normalWindowSize
+      const probeStride=lowSlowMode?Math.max(60,currentConcurrency*40):Math.max(windowSize,concurrency*100)
+      const windowEnd=Math.min(endId,nextBase+windowSize-1)
+      let windowMatches=0,windowMisses=0,windowRetryFailures=0
+      this.onLog(`${lowSlowMode?'Low-slow':'Auto'} window: #${nextBase}-#${windowEnd} at ${currentConcurrency}x`,'info')
+      for(let base=nextBase;base<=windowEnd&&!this.stopped;base+=currentConcurrency){
+        const ids=Array.from({length:Math.min(currentConcurrency,windowEnd-base+1)},(_,i)=>base+i)
+        const res=await processBatch(ids)
+        windowMatches+=res.batchMatches
+        windowMisses+=res.batchMisses
+        windowRetryFailures+=res.batchRetryFailures
+        this.onProgress(scanned,0,matched)
+        await sleep(batchDelay())
+      }
+
+      if(windowMatches>0){
+        emptyWindows=0
+        retryFailureStreak=0
+        stallScans=0
+        cleanWindows++
+        if(lowSlowMode&&cleanWindows>=2&&windowRetryFailures===0){
+          currentConcurrency=Math.min(concurrency,currentConcurrency+1)
+          if(currentConcurrency>=Math.min(3,concurrency)){lowSlowMode=false;this.onLog('Exiting low-slow mode and resuming normal scan speed','info')}
+        }else if(!lowSlowMode&&currentConcurrency<concurrency&&windowRetryFailures===0){
+          currentConcurrency=Math.min(concurrency,currentConcurrency+1)
+        }
+        lastMatchedId=Math.max(lastMatchedId||0,...orders.slice(-windowMatches).map(o=>Scanner.numericPart(o.orderId)))
+        nextBase=windowEnd+1
+        continue
+      }
+
+      retryFailureStreak+=windowRetryFailures
+      stallScans+=windowMisses+windowRetryFailures
+      if(lastMatchedId!==null&&stallScans>=Math.max(40,currentConcurrency*20)){
+        lowSlowMode=true
+        cleanWindows=0
+        currentConcurrency=1
+        const reanchorBase=lastMatchedId+1
+        this.onLog(`Frontier stalled after ${stallScans} non-progress scans beyond #${lastMatchedId}; re-anchoring at #${reanchorBase} in low-slow mode`,'info')
+        stallScans=0
+        nextBase=reanchorBase
+        continue
+      }
+      const throttleLikely=windowRetryFailures>=Math.max(lowSlowMode?8:12,currentConcurrency*4)||(scanned>=50&&windowRetryFailures>Math.max(windowMatches,3))
+      if(throttleLikely){
+        cooldowns++
+        lowSlowMode=true
+        cleanWindows=0
+        const cooldownMs=Math.min(30000,8000+cooldowns*4000)
+        currentConcurrency=1
+        this.rlStreak=0
+        this.onLog(`Possible Shiprocket throttling: cooling down ${Math.round(cooldownMs/1000)}s and switching to low-slow mode at 1x`,'info')
+        await sleep(cooldownMs)
+        const resumeProbe=await this.probe(lastMatchedId!==null?lastMatchedId+1:nextBase)
+        if(resumeProbe&&resumeProbe!=='rl'&&resumeProbe.slug===this.slug){
+          this.onLog(`Cooldown probe succeeded near #${Scanner.numericPart(resumeProbe.orderId)} — resuming`,'info')
+          nextBase=Math.max(nextBase,(lastMatchedId!==null?lastMatchedId+1:nextBase))
+          retryFailureStreak=0
+          continue
+        }
+        this.onLog('Cooldown probe still weak, continuing in low-slow mode with short verified windows','info')
+      }
+
+      const probeIds=[windowEnd+concurrency,windowEnd+Math.floor(probeStride/2),windowEnd+probeStride].filter(id=>id<=endId)
+      let recoveredAhead:number|null=null
+      for(const pid of probeIds){
+        const ahead=await this.probe(pid)
+        if(ahead&&ahead!=='rl'&&ahead.slug===this.slug){
+          recoveredAhead=Scanner.numericPart(ahead.orderId)
+          break
+        }
+        await sleep(80)
+      }
+
+      if(recoveredAhead!==null){
+        emptyWindows=0
+        lastMatchedId=recoveredAhead
+        const jumpBase=Math.max(windowEnd+1,recoveredAhead-Math.max(concurrency*2,20))
+        this.onStats?.({gapJumps:1,lastMatchedId:recoveredAhead})
+        this.onLog(`Gap jump: skipped sparse region and re-anchored near #${recoveredAhead}`,'info')
+        nextBase=jumpBase
+        continue
+      }
+
+      emptyWindows++
+      this.onLog(`Verified empty window ${emptyWindows}/${emptyWindowLimit} at #${nextBase}-#${windowEnd}`,'info')
+      if(lastMatchedId!==null&&emptyWindows>=emptyWindowLimit){
+        this.onLog(`Auto-stopped after ${emptyWindowLimit} consecutive verified empty windows beyond #${lastMatchedId}`,'info')
+        break
+      }
+      nextBase=windowEnd+1
+    }
+
     return orders
   }
 }
-
 
 // ── App ───────────────────────────────────────────────
 export default function App(){
@@ -409,6 +414,36 @@ export default function App(){
   useEffect(()=>{if(logRef.current)logRef.current.scrollTop=logRef.current.scrollHeight},[log])
   useEffect(()=>{const fn=()=>{if(document.hidden&&scanning)addLog('⚠ Tab hidden — scan may slow. Keep this tab active!','err')};document.addEventListener('visibilitychange',fn);return()=>document.removeEventListener('visibilitychange',fn)},[scanning])
 
+  // Auto-send morning Telegram report once per day on app open
+  useEffect(()=>{
+    const tgToken=LS.get('tg_token','');const tgChat=LS.get('tg_chat','');const tgBrand=LS.get('tg_brand','')
+    if(!tgToken||!tgChat||!tgBrand)return
+    const now=new Date(new Date().toLocaleString('en-US',{timeZone:'Asia/Kolkata'}))
+    const today=now.toISOString().split('T')[0]
+    const lastSent=LS.get('tg_last_sent','')
+    if(lastSent===today)return  // already sent today
+    if(now.getHours()<7||now.getHours()>10)return  // only auto-send 7-10 AM IST
+    const brand=LS.get<Brand[]>('brands',[]).find(b=>b.id===tgBrand||b.name===tgBrand)
+    if(!brand)return
+    const runs=LS.get<Run[]>(`runs_${brand.id}`,[])
+    if(!runs.length)return
+    const allOrders=runs.flatMap(r=>r.orders||[])
+    const yest=new Date(now.getTime()-86400000).toISOString().split('T')[0]
+    const dow=now.getDay()||7;const wStart=new Date(now.getTime()-(dow-1)*86400000).toISOString().split('T')[0]
+    const mStart=today.slice(0,7)+'-01'
+    const msg=buildTelegramReport(allOrders,brand.name,'',yest,wStart,mStart,today)
+    sendTelegramMsg(tgToken,tgChat,msg).then(()=>{
+      LS.set('tg_last_sent',today)
+      // Send yesterday's CSV
+      const yestOrders=allOrders.filter(o=>o.dateYMD===yest)
+      if(yestOrders.length>0){
+        const csv='Order ID,Date,Time,Value,Payment,Status,Location,Pincode\n'+
+          yestOrders.map(o=>`${o.orderId},${o.orderDate},${o.orderTime},${o.value},${o.payment},${o.status},${o.location},${o.pincode}`).join('\n')
+        sendTelegramDoc(tgToken,tgChat,`${brand.name}_${yest}.csv`,csv,`Yesterday's orders — ${brand.name}`)
+      }
+    }).catch(()=>{})
+  },[])
+
   const addLog=useCallback((msg:string,cls:string='')=>setLog(p=>[...p.slice(-400),{msg,cls}]),[])
 
   function loadRuns(b:Brand){const r=LS.get<Run[]>(`runs_${b.id}`,[]);setRuns(r);if(r.length>0){setLastOrders(r[0].orders);setAnalytics(buildAnalytics(r[0].orders))}else{setLastOrders([]);setAnalytics(null)}}
@@ -432,6 +467,22 @@ export default function App(){
     setActive(u2);setBrands(brands.map(b=>b.id===brand.id?u2:b));LS.set('brands',brands.map(b=>b.id===brand.id?u2:b))
     const url=LS.get(`sheets_${brand.id}`,'')
     if(url&&cleaned.length>0)syncToSheets(url,cleaned).then(n=>n>0&&addLog(`✓ Sheets: ${n} rows synced`,'ok'))
+
+    // POST run data to server so Vercel Cron can access it for daily report
+    const allRuns=LS.get<Run[]>(`runs_${brand.id}`,[])
+    fetch('/api/run-store',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({subdomain:brand.subdomain,runs:allRuns.slice(0,15)})}).catch(()=>{})
+
+    // Send Telegram scan-complete notification if configured for this brand
+    const tgToken=LS.get('tg_token','');const tgChat=LS.get('tg_chat','');const tgBrand=LS.get('tg_brand','')
+    if(tgToken&&tgChat&&(!tgBrand||tgBrand===brand.id)){
+      const rev=cleaned.reduce((s,o)=>s+(o.valueNum||0),0)
+      const cod=cleaned.filter(o=>(o.payment||'').toUpperCase()==='COD').length
+      const msg=[`✅ <b>Scan Done</b> — ${brand.name}`,`📅 ${label}`,
+        `📦 ${cleaned.length} orders | ₹${Math.round(rev).toLocaleString('en-IN')}`,
+        `💳 COD: ${cod} · Prepaid: ${cleaned.length-cod}`].join('\n')
+      sendTelegramMsg(tgToken,tgChat,msg).catch(()=>{})
+    }
   }
 
   async function syncToSheets(url:string,orders:Order[]):Promise<number>{
@@ -489,17 +540,19 @@ export default function App(){
     if(!active||scanning)return
     if(!Number.isFinite(startId)||startId<=0){addLog('Invalid start ID. Please enter a real numeric Shiprocket order ID.','err');return}
     const brand=active
+    const safeStopAfter=useAuto?Math.max(stopAfter,recommendedAutoStop(concurrency,brand.avgPerDay||0)):stopAfter
     const autoHardCap=startId+Math.max(20000,Math.min(250000,(brand.avgPerDay||0)*45))
     setScanning(true);setLog([]);ordersRef.current=[];rateWindow.current=[]
     setScanStats({retries:0,recovered:0,duplicates:0,gapJumps:0,lastMatchedId:null})
     setProgress({done:0,total:useAuto?0:endId-startId+1,found:0});const sa=Date.now();setStartedAt(sa);setScanLabel(`#${brand.idPrefix||''}${startId}–${useAuto?'auto':'#'+(brand.idPrefix||'')+endId}`)
-    addLog(`Manual: #${brand.idPrefix||''}${startId}–${useAuto?'auto':'#'+(brand.idPrefix||'')+endId} | ${concurrency}x | stop after ${stopAfter} misses`,'info')
-    if(useAuto)addLog(`Hard cap: #${brand.idPrefix||''}${autoHardCap}`,'info')
+    addLog(`Manual: #${brand.idPrefix||''}${startId}–${useAuto?'auto':'#'+(brand.idPrefix||'')+endId} | ${concurrency}x`,'info')
+    if(useAuto&&safeStopAfter!==stopAfter)addLog(`Raised auto-stop from ${stopAfter} to ${safeStopAfter} for safer scanning`,'info')
+    if(useAuto)addLog(`Auto hard cap set to #${brand.idPrefix||''}${autoHardCap} based on current brand velocity`,'info')
     const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)))
     scannerRef.current=scanner
     try{
       const maxId=useAuto?autoHardCap:endId
-      const orders=await scanner.scanManual(startId,maxId,concurrency,useAuto,stopAfter,sa)
+      const orders=await scanner.scanManual(startId,maxId,concurrency,useAuto,safeStopAfter,sa)
       const dates=orders.map(r=>r.dateYMD).filter(Boolean).sort()
       const label=dates.length<2?'manual':`${dates[0]} to ${dates[dates.length-1]}`
       if(orders.length>0){const highest=Math.max(...orders.map(o=>parseInt(String(o.orderId).replace(/[^0-9]/g,''))||0));LS.set(`manual_resume_${brand.id}`,highest+1)}
@@ -571,9 +624,12 @@ export default function App(){
                     <span>{progress.done.toLocaleString()} / {progress.total?progress.total.toLocaleString():'?'} — <b style={{color:'var(--accent)'}}>{progress.found} found</b></span>
                     <span style={{color:'var(--accent)'}}>{eta?`ETA: ${eta}`:''}</span>
                   </div>
-                  <div style={{display:'flex',gap:12,flexWrap:'wrap',fontSize:9,color:'var(--muted)',marginBottom:5}}>
-                    <span>Retries: <b style={{color:scanStats.retries>50?'var(--red)':scanStats.retries>10?'var(--warn)':'var(--text)'}}>{scanStats.retries}</b></span>
-                    <span>Last live: <b style={{color:'var(--accent)'}}>{scanStats.lastMatchedId?('#'+(active?.idPrefix||'')+scanStats.lastMatchedId):'—'}</b></span>
+                  <div style={{display:'flex',gap:10,flexWrap:'wrap',fontSize:9,color:'var(--muted)',marginBottom:6}}>
+                    <span>Retries: <b style={{color:'var(--accent)'}}>{scanStats.retries}</b></span>
+                    <span>Recovered: <b style={{color:'var(--accent)'}}>{scanStats.recovered}</b></span>
+                    <span>Gap jumps: <b style={{color:'var(--accent)'}}>{scanStats.gapJumps}</b></span>
+                    <span>Duplicates skipped: <b style={{color:'var(--accent)'}}>{scanStats.duplicates}</b></span>
+                    {scanStats.lastMatchedId&&<span>Last live ID: <b style={{color:'var(--accent)'}}>#{active?.idPrefix||''}{scanStats.lastMatchedId}</b></span>}
                   </div>
                   <div style={{background:'var(--surface)',border:'1px solid var(--border)',borderRadius:4,height:6,overflow:'hidden'}}>
                     <div style={{height:'100%',background:'var(--accent)',width:`${pct.toFixed(1)}%`,transition:'width .3s',borderRadius:4}}/>
@@ -746,7 +802,7 @@ function ManualTab({active,scanning,scanLabel,onStart,inp,lbl}:any){
             <input type="checkbox" checked={useAuto} onChange={e=>setUseAuto(e.target.checked)} style={{accentColor:'var(--accent)',width:16,height:16}}/>
           </div>
           {resumeId>0&&<div style={{display:'flex',justifyContent:'space-between',alignItems:'center',background:'var(--surface2)',border:'1px solid var(--border)',borderRadius:6,padding:'8px 10px',marginBottom:10,fontSize:10,color:'var(--muted)'}}><span>Resume suggestion: start from #{pfx}{resumeId}</span><button onClick={()=>setStartId(String(resumeId))} style={{background:'none',border:'1px solid var(--accent)',color:'var(--accent)',padding:'4px 8px',borderRadius:4,fontSize:9,fontFamily:'inherit',cursor:'pointer'}}>Use resume ID</button></div>}
-          {useAuto&&<div style={{marginBottom:10}}><label style={lbl}>Stop after N misses</label><div style={{display:'flex',alignItems:'center',gap:8}}><input type="number" value={stopAfter} onChange={e=>setStopAfter(e.target.value)} style={{...inp,width:90}}/><span style={{fontSize:9,color:'var(--muted)'}}>Recommended: {recommendedStop}+. Hits threshold → verifies if rate-limited → cooldowns and resumes automatically.</span></div></div>}
+          {useAuto&&<div style={{marginBottom:10}}><label style={lbl}>Stop after N misses</label><div style={{display:'flex',alignItems:'center',gap:8}}><input type="number" value={stopAfter} onChange={e=>setStopAfter(e.target.value)} style={{...inp,width:90}}/><span style={{fontSize:9,color:'var(--muted)'}}>Safe floor here: {recommendedStop}. Lower values are auto-raised, and misses are retried once before counting.</span></div></div>}
           <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:12,fontSize:11,color:'var(--muted)'}}>
             <span>Concurrent fetches</span>
             <select value={conc} onChange={e=>setConc(e.target.value)} style={{...inp,width:'auto',padding:'5px 8px',fontSize:11}}>{['3','5','8','10'].map(v=><option key={v} value={v}>{v}</option>)}</select>
@@ -757,8 +813,7 @@ function ManualTab({active,scanning,scanLabel,onStart,inp,lbl}:any){
             const parsedStart=normalizeId(startId),parsedEnd=normalizeId(endId)
             if(!parsedStart){alert('Enter a valid numeric Start ID');return}
             if(!useAuto&&!parsedEnd){alert('Enter a valid numeric End ID');return}
-            const sa=Math.max(100,parseInt(stopAfter)||500)
-            onStart(parsedStart,parsedEnd,parseInt(conc),useAuto,sa)
+            onStart(parsedStart,parsedEnd,parseInt(conc),useAuto,parseInt(stopAfter))
           }} style={{width:'100%',background:'var(--accent)',color:'#000',border:'none',padding:11,borderRadius:8,fontSize:12,fontWeight:700,letterSpacing:'.06em',textTransform:'uppercase',marginBottom:12,fontFamily:'inherit',cursor:'pointer'}}>▶ START MANUAL SCRAPE</button>
         </>
       )}
@@ -856,8 +911,85 @@ function SettingsTab({brands,active,runs,onDelete,onSync,inp,lbl}:any){
   async function save(){LS.set(`sheets_${active.id}`,url);setStatus('✓ Saved — auto-syncs after every scan')}
   async function test(){if(!url){setStatus('⚠ Enter URL first');return};setBusy(true);setStatus('Testing...');try{const r=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({orders:[{orderId:'TEST',orderDate:'test',value:'Rs.1',payment:'COD',status:'test',location:'Mumbai',pincode:'400001'}],mode:'test'})});const d=await r.json();setStatus(d.ok?'✓ Connected!':'⚠ '+JSON.stringify(d))}catch(e:any){setStatus('⚠ '+e.message)};setBusy(false)}
   async function sync(mode:'append'|'replace'){if(!url){setStatus('⚠ Save URL first');return};const all=runs.flatMap((r:Run)=>r.orders);if(!all.length){setStatus('⚠ No orders to sync');return};setBusy(true);setStatus(`Syncing ${all.length} orders...`);const n=await onSync(url,all);setStatus(`✓ Synced ${n} rows`);setBusy(false)}
+  const [tgStatus,setTgStatus]=useState('')
+  const [tgBusy,setTgBusy]=useState(false)
+  const [tgToken,setTgToken]=useState(()=>LS.get('tg_token',''))
+  const [tgChat,setTgChat]=useState(()=>LS.get('tg_chat',''))
+  const [tgBrandId,setTgBrandId]=useState(()=>LS.get('tg_brand',''))
+
+  async function saveTg(){LS.set('tg_token',tgToken);LS.set('tg_chat',tgChat);LS.set('tg_brand',tgBrandId);setTgStatus('✓ Saved')}
+  async function testTg(){
+    if(!tgToken||!tgChat){setTgStatus('⚠ Enter token and chat ID first');return}
+    setTgBusy(true);setTgStatus('Sending test...')
+    try{
+      await sendTelegramMsg(tgToken,tgChat,'✅ <b>Test from Shiprocket Order Scrapper</b>\nTelegram notifications are working!')
+      setTgStatus('✓ Test message sent!')
+    }catch(e:any){setTgStatus('⚠ '+e.message)}
+    setTgBusy(false)
+  }
+  async function sendNow(){
+    if(!tgToken||!tgChat){setTgStatus('⚠ Enter token and chat ID first');return}
+    const brand=brands.find((b:Brand)=>b.id===tgBrandId)||brands[0]
+    if(!brand){setTgStatus('⚠ Select a brand first');return}
+    setTgBusy(true);setTgStatus('Sending report...')
+    try{
+      const allRuns=LS.get<Run[]>(`runs_${brand.id}`,[])
+      const allOrders=allRuns.flatMap(r=>r.orders||[])
+      if(!allOrders.length){setTgStatus('⚠ No scan data for this brand');setTgBusy(false);return}
+      const now=new Date(new Date().toLocaleString('en-US',{timeZone:'Asia/Kolkata'}))
+      const today=now.toISOString().split('T')[0]
+      const yest=new Date(now.getTime()-86400000).toISOString().split('T')[0]
+      const dow=now.getDay()||7;const wStart=new Date(now.getTime()-(dow-1)*86400000).toISOString().split('T')[0]
+      const mStart=today.slice(0,7)+'-01'
+      const msg=buildTelegramReport(allOrders,brand.name,'',yest,wStart,mStart,today)
+      await sendTelegramMsg(tgToken,tgChat,msg)
+      LS.set('tg_last_sent',today)
+      const yestOrders=allOrders.filter((o:Order)=>o.dateYMD===yest)
+      if(yestOrders.length>0){
+        const csv='Order ID,Date,Time,Value,Payment,Status,Location,Pincode\n'+
+          yestOrders.map((o:Order)=>`${o.orderId},${o.orderDate},${o.orderTime},${o.value},${o.payment},${o.status},${o.location},${o.pincode}`).join('\n')
+        await sendTelegramDoc(tgToken,tgChat,`${brand.name}_${yest}.csv`,csv,`Yesterday's orders — ${brand.name}`)
+      }
+      setTgStatus('✓ Report sent!')
+    }catch(e:any){setTgStatus('⚠ '+e.message)}
+    setTgBusy(false)
+  }
+
   return(
     <div>
+      {/* Telegram */}
+      <div style={{background:'var(--surface)',border:'1px solid var(--border)',borderRadius:8,padding:14,marginBottom:14}}>
+        <div style={{fontSize:10,fontWeight:700,color:'var(--accent)',marginBottom:4,textTransform:'uppercase',letterSpacing:'.06em'}}>📱 Telegram Daily Report</div>
+        <div style={{fontSize:9,color:'var(--muted)',marginBottom:10,lineHeight:1.9}}>
+          1. Message <a href="https://t.me/BotFather" target="_blank" style={{color:'var(--accent)'}}>@BotFather</a> → /newbot → copy the token<br/>
+          2. Message your bot once, then get your chat ID from <a href="https://api.telegram.org/bot{TOKEN}/getUpdates" target="_blank" style={{color:'var(--accent)'}}>getUpdates</a><br/>
+          3. Opens the app 7–10 AM IST → auto-sends morning report<br/>
+          4. For fully automatic (no browser needed): set env vars in Vercel dashboard
+        </div>
+        <div style={{display:'grid',gap:8,marginBottom:8}}>
+          <div><label style={lbl}>Bot Token</label><input value={tgToken} onChange={(e:any)=>setTgToken(e.target.value)} placeholder="1234567890:AAxxxxxxx" style={inp} type="password"/></div>
+          <div><label style={lbl}>Chat ID (your Telegram user ID or group ID)</label><input value={tgChat} onChange={(e:any)=>setTgChat(e.target.value)} placeholder="-100123456789 or 123456789" style={inp}/></div>
+          <div><label style={lbl}>Brand to report on</label>
+            <select value={tgBrandId} onChange={(e:any)=>setTgBrandId(e.target.value)} style={{...inp,padding:'8px 10px'}}>
+              <option value="">All brands</option>
+              {brands.map((b:Brand)=><option key={b.id} value={b.id}>{b.name}</option>)}
+            </select>
+          </div>
+        </div>
+        {tgStatus&&<div style={{fontSize:10,padding:'6px 10px',borderRadius:4,marginBottom:8,
+          background:tgStatus.startsWith('✓')?'#00ff8815':'#ff444415',
+          border:`1px solid ${tgStatus.startsWith('✓')?'var(--accent)':'var(--red)'}`,
+          color:tgStatus.startsWith('✓')?'var(--accent)':'var(--red)'}}>{tgStatus}</div>}
+        <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
+          <button onClick={saveTg} style={btn()}>Save</button>
+          <button onClick={testTg} disabled={tgBusy} style={btn()}>Test</button>
+          <button onClick={sendNow} disabled={tgBusy} style={btn({color:'var(--accent)',borderColor:'var(--accent)'})}>Send Report Now</button>
+        </div>
+        <div style={{fontSize:8,color:'var(--muted)',marginTop:8,lineHeight:1.8}}>
+          <b>For fully automatic (no browser needed):</b> Add env vars to Vercel dashboard:<br/>
+          TELEGRAM_BOT_TOKEN · TELEGRAM_CHAT_ID · BRAND_SUBDOMAIN · BRAND_NAME
+        </div>
+      </div>
       <div style={{background:'var(--surface)',border:'1px solid var(--border)',borderRadius:8,padding:14,marginBottom:14}}>
         <div style={{fontSize:10,fontWeight:700,color:'var(--accent)',marginBottom:10,textTransform:'uppercase',letterSpacing:'.06em'}}>Google Sheets Sync</div>
         <div style={{fontSize:9,color:'var(--muted)',marginBottom:10,lineHeight:1.8}}>1. Go to <a href="https://script.google.com" target="_blank" style={{color:'var(--accent)'}}>script.google.com</a> → New project<br/>2. Paste the code below → Deploy as web app (execute as: Me, who has access: Anyone)<br/>3. Copy the /exec URL and paste here</div>
