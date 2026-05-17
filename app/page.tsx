@@ -935,20 +935,28 @@ function SettingsTab({brands,active,runs,onDelete,onSync,inp,lbl}:any){
     try{
       const allRuns=LS.get<Run[]>(`runs_${brand.id}`,[])
       const allOrders=allRuns.flatMap(r=>r.orders||[])
-      if(!allOrders.length){setTgStatus('⚠ No scan data for this brand');setTgBusy(false);return}
+      if(!allOrders.length){setTgStatus('⚠ No scan data — run a scan first');setTgBusy(false);return}
+      // Find most recent date in stored data
+      const allDates=allOrders.map(o=>o.dateYMD).filter(Boolean).sort() as string[]
+      const latestDate=allDates[allDates.length-1]||''
       const now=new Date(new Date().toLocaleString('en-US',{timeZone:'Asia/Kolkata'}))
       const today=now.toISOString().split('T')[0]
       const yest=new Date(now.getTime()-86400000).toISOString().split('T')[0]
       const dow=now.getDay()||7;const wStart=new Date(now.getTime()-(dow-1)*86400000).toISOString().split('T')[0]
       const mStart=today.slice(0,7)+'-01'
-      const msg=buildTelegramReport(allOrders,brand.name,'',yest,wStart,mStart,today)
+      const hasRecentData=allOrders.some(o=>o.dateYMD&&o.dateYMD>=wStart)
+      const staleSuffix=!hasRecentData&&latestDate?'\n\n⚠️ Latest scan: '+latestDate+'\nRun a fresh scan for current numbers.':''
+      const msg=buildTelegramReport(allOrders,brand.name,'',yest,wStart,mStart,today)+staleSuffix
       await sendTelegramMsg(tgToken,tgChat,msg)
       LS.set('tg_last_sent',today)
+      // Send CSV of yesterday or most recent day with data
       const yestOrders=allOrders.filter((o:Order)=>o.dateYMD===yest)
-      if(yestOrders.length>0){
+      const csvOrders=yestOrders.length>0?yestOrders:allOrders.filter((o:Order)=>o.dateYMD===latestDate)
+      if(csvOrders.length>0){
+        const csvDate=yestOrders.length>0?yest:latestDate
         const csv='Order ID,Date,Time,Value,Payment,Status,Location,Pincode\n'+
-          yestOrders.map((o:Order)=>`${o.orderId},${o.orderDate},${o.orderTime},${o.value},${o.payment},${o.status},${o.location},${o.pincode}`).join('\n')
-        await sendTelegramDoc(tgToken,tgChat,`${brand.name}_${yest}.csv`,csv,`Yesterday's orders — ${brand.name}`)
+          csvOrders.map((o:Order)=>`${o.orderId},${o.orderDate},${o.orderTime},${o.value},${o.payment},${o.status},${o.location},${o.pincode}`).join('\n')
+        await sendTelegramDoc(tgToken,tgChat,`${brand.name}_${csvDate}.csv`,csv,`Orders for ${csvDate} — ${brand.name}`)
       }
       setTgStatus('✓ Report sent!')
     }catch(e:any){setTgStatus('⚠ '+e.message)}
@@ -984,6 +992,17 @@ function SettingsTab({brands,active,runs,onDelete,onSync,inp,lbl}:any){
           <button onClick={saveTg} style={btn()}>Save</button>
           <button onClick={testTg} disabled={tgBusy} style={btn()}>Test</button>
           <button onClick={sendNow} disabled={tgBusy} style={btn({color:'var(--accent)',borderColor:'var(--accent)'})}>Send Report Now</button>
+          <button onClick={async()=>{
+            const brand2=brands.find((b:Brand)=>b.id===tgBrandId)||brands[0]
+            if(!brand2){setTgStatus('⚠ Select a brand');return}
+            setTgBusy(true);setTgStatus('Syncing runs to server...')
+            const runs2=LS.get<Run[]>(`runs_${brand2.id}`,[])
+            const res=await fetch('/api/run-store',{method:'POST',headers:{'Content-Type':'application/json'},
+              body:JSON.stringify({subdomain:brand2.subdomain,runs:runs2.slice(0,20)})})
+            const d=await res.json()
+            setTgStatus(d.ok?`✓ Synced ${d.count} runs to server`:'⚠ Sync failed')
+            setTgBusy(false)
+          }} disabled={tgBusy} style={btn({color:'var(--muted)'})} title="Needed for Vercel Cron to access your data">Sync to Server</button>
         </div>
         <div style={{fontSize:8,color:'var(--muted)',marginTop:8,lineHeight:1.8}}>
           <b>For fully automatic (no browser needed):</b> Add env vars to Vercel dashboard:<br/>
