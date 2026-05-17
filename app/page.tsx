@@ -142,63 +142,113 @@ const darkVars={'--bg':'#0d0d0d','--surface':'#161616','--surface2':'#1e1e1e','-
 const lightVars={'--bg':'#f5f5f0','--surface':'#fff','--surface2':'#efefea','--border':'#ddd','--accent':'#008844','--warn':'#cc5500','--text':'#111','--muted':'#888','--red':'#cc2222'}
 
 // ── Scanner ───────────────────────────────────────────
+// Architecture:
+//   - callProxy: raw HTTP, returns 'rl' on any failure
+//   - fetchBatch: wraps callProxy, handles RL with escalating cooldowns, never gives up
+//   - scanManual / scanRange: burst-rest rhythm with adaptive throttling
+//
+// KEY: On minnies.shiprocket.co every response belongs to Minnies.
+//   null = ID doesn't exist yet (genuine gap or end of orders)
+//   'rl' = rate limited (retry)
+//   Order = valid order
+
 class Scanner {
   private subdomain:string; private slug:string; private idPrefix:string
-  private stopped=false; private rlStreak=0
+  public stopped=false; private rlStreak=0
   private onLog:(m:string,c:string)=>void
   private onProgress:(done:number,total:number,found:number)=>void
   private onOrder:(o:Order)=>void
   private onStats?:(s:Partial<ScanStats>)=>void
-  private seen=new Set<string>()
 
-  constructor(subdomain:string,slug:string,idPrefix:string,onLog:(m:string,c:string)=>void,onProgress:(done:number,total:number,found:number)=>void,onOrder:(o:Order)=>void,onStats?:(s:Partial<ScanStats>)=>void){
+  constructor(subdomain:string,slug:string,idPrefix:string,
+    onLog:(m:string,c:string)=>void,
+    onProgress:(done:number,total:number,found:number)=>void,
+    onOrder:(o:Order)=>void,
+    onStats?:(s:Partial<ScanStats>)=>void){
     this.subdomain=subdomain;this.slug=slug;this.idPrefix=idPrefix
-    this.onLog=onLog;this.onProgress=onProgress;this.onOrder=onOrder
-    this.onStats=onStats
+    this.onLog=onLog;this.onProgress=onProgress;this.onOrder=onOrder;this.onStats=onStats
   }
+
   stop(){this.stopped=true}
   private toId(n:number):string|number{return this.idPrefix?`${this.idPrefix}${n}`:n}
-  static numericPart(id:number|string):number{if(typeof id==='number')return id;const m=String(id).match(/(\d+)$/);return m?parseInt(m[1]):0}
-
-  async fetchBatch(ids:number[]):Promise<Array<Order|null|'rl'>>{
-    if(this.stopped)return ids.map(()=>null)
-    if(this.rlStreak>0){const w=Math.min(this.rlStreak*2000,30000);if(this.rlStreak===1)this.onLog(`Rate limit — waiting ${w/1000}s...`,'info');await sleep(w)}
-    try{
-      const orderIds=ids.map(n=>this.toId(n))
-      const res=await fetch('/api/proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({subdomain:this.subdomain,ids:orderIds})})
-      if(!res.ok){this.rlStreak++;return ids.map(()=>'rl')}
-      const{results}=await res.json()
-      const hasRl=results.some((r:any)=>r==='rl')
-      if(hasRl)this.rlStreak++;else this.rlStreak=Math.max(0,this.rlStreak-1)
-      return results
-    }catch{this.rlStreak++;return ids.map(()=>null)}
+  static numericPart(id:number|string):number{
+    if(typeof id==='number')return id
+    const m=String(id).match(/(\d+)$/)
+    return m?parseInt(m[1]):0
   }
 
-  async probe(id:number):Promise<Order|null|'rl'>{const r=await this.fetchBatch([id]);return r[0]}
+  // Raw proxy call — returns 'rl' on any failure/rate-limit
+  private async callProxy(ids:number[]):Promise<Array<Order|null|'rl'>>{
+    try{
+      const res=await fetch('/api/proxy',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({subdomain:this.subdomain,ids:ids.map(n=>this.toId(n))})
+      })
+      if(!res.ok)return ids.map(()=>'rl' as const)
+      const{results}=await res.json()
+      return results
+    }catch{return ids.map(()=>'rl' as const)}
+  }
 
-  async walkToBracket(refId:number,refDate:string,targetDate:string,logPrefix:string):Promise<{lo:number,hi:number}>{
+  // Wait with stop-check every 500ms, log countdown every 30s
+  private async wait(ms:number,label:string):Promise<void>{
+    const start=Date.now()
+    this.onLog(label+': '+Math.ceil(ms/1000)+'s...','info')
+    let lastLog=0
+    for(let elapsed=0;elapsed<ms&&!this.stopped;elapsed=Date.now()-start){
+      const remaining=Math.ceil((ms-elapsed)/1000)
+      if(elapsed-lastLog>=30000){lastLog=elapsed;this.onLog(label+': '+remaining+'s remaining','info')}
+      await sleep(Math.min(500,ms-elapsed))
+    }
+    if(!this.stopped)this.onLog(label+' done','info')
+  }
+
+  // Fetch with infinite retry on RL — escalating cooldowns: 10s,30s,60s,120s,180s,300s
+  async fetchBatch(ids:number[]):Promise<Array<Order|null|'rl'>>{
+    if(this.stopped)return ids.map(()=>null)
+    const WAITS=[10,20,40,60,90,120]
+    let attempt=0
+    while(!this.stopped){
+      const results=await this.callProxy(ids)
+      if(results.some(r=>r!=='rl')){
+        if(this.rlStreak>0){this.rlStreak=0;this.onLog('Connection restored','ok')}
+        return results
+      }
+      attempt++;this.rlStreak++
+      this.onStats?.({retries:1})
+      const waitSec=WAITS[Math.min(attempt-1,WAITS.length-1)]
+      this.onLog('Rate limited (x'+attempt+') — waiting '+waitSec+'s','info')
+      await this.wait(waitSec*1000,'Cooldown')
+    }
+    return ids.map(()=>null)
+  }
+
+  private async probe(id:number):Promise<Order|null|'rl'>{
+    const r=await this.callProxy([id]);return r[0]
+  }
+
+  // Boundary walk for By Date scan
+  async walkToBracket(refId:number,refDate:string,targetDate:string,label:string):Promise<{lo:number,hi:number}>{
     const forward=targetDate>refDate
-    let lo=refId,hi=refId,lastFoundId:number|string=refId,lastFoundDate=refDate,missesAfterLastFound=0
-    const numId=(o:Order)=>Scanner.numericPart(o.orderId)
-    this.onLog(`${logPrefix}: walking ${forward?'→':'←'} from #${this.idPrefix}${refId} (${refDate})`,'info')
+    let lo=refId,hi=refId,lastId=refId,consNulls=0
+    this.onLog(label+': walking '+(forward?'→':'←')+' from #'+this.idPrefix+refId,'info')
     for(let i=1;i<=400&&!this.stopped;i++){
       const pid=forward?refId+i*500:Math.max(1,refId-i*500)
       const o=await this.probe(pid)
-      if(o&&o!=='rl'&&o.slug===this.slug&&o.dateYMD){
-        lastFoundId=o.orderId;lastFoundDate=o.dateYMD;missesAfterLastFound=0
-        this.onLog(`  #${o.orderId} = ${o.orderDate}`,'info')
+      if(o&&o!=='rl'&&o.dateYMD){
+        consNulls=0;lastId=Scanner.numericPart(o.orderId)
+        this.onLog('  #'+o.orderId+' = '+o.orderDate,'info')
         if(forward){
-          if(o.dateYMD>=targetDate){hi=numId(o);break}
-          lo=numId(o)
-          const daysLeft=(new Date(targetDate+'T00:00:00').getTime()-new Date(o.dateYMD+'T00:00:00').getTime())/86400000
-          if(daysLeft<=5){hi=numId(o)+3000;break}
+          if(o.dateYMD>=targetDate){hi=lastId;break}
+          lo=lastId
+          if((new Date(targetDate+'T00:00:00').getTime()-new Date(o.dateYMD+'T00:00:00').getTime())/86400000<=5){hi=lastId+3000;break}
         }else{
-          if(o.dateYMD<targetDate){lo=numId(o);break}
-          hi=numId(o)
+          if(o.dateYMD<targetDate){lo=lastId;break}
+          hi=lastId
         }
-      }else{
-        missesAfterLastFound++
-        if(forward&&lo>refId&&missesAfterLastFound>=4){hi=Scanner.numericPart(lastFoundId)+1500;break}
+      }else if(o===null){
+        consNulls++
+        if(forward&&lo>refId&&consNulls>=4){hi=lastId+1500;break}
       }
       await sleep(60)
       if(!forward&&pid<=1)break
@@ -207,184 +257,174 @@ class Scanner {
     return{lo,hi}
   }
 
-  async findBoundaries(anchorId:number,anchorDate:string,regressionPoints:Array<{date:string,id:number}>,fromDate:string,toDate:string):Promise<{scanStart:number,scanEnd:number}>{
-    const pts=[{date:anchorDate,id:anchorId},...regressionPoints].filter(p=>p.date&&p.id>0).sort((a,b)=>a.date.localeCompare(b.date))
-    const closest=(t:string)=>pts.reduce((best,p)=>Math.abs(new Date(p.date+'T00:00:00').getTime()-new Date(t+'T00:00:00').getTime())<Math.abs(new Date(best.date+'T00:00:00').getTime()-new Date(t+'T00:00:00').getTime())?p:best,pts[0])
-    const refFrom=closest(fromDate)
-    const fromBracket=await this.walkToBracket(refFrom.id,refFrom.date,fromDate,'fromDate')
+  async findBoundaries(anchorId:number,anchorDate:string,regPts:Array<{date:string,id:number}>,fromDate:string,toDate:string):Promise<{scanStart:number,scanEnd:number}>{
+    const pts=[{date:anchorDate,id:anchorId},...regPts].filter(p=>p.date&&p.id>0).sort((a,b)=>a.date.localeCompare(b.date))
+    const closest=(t:string)=>pts.reduce((b,p)=>
+      Math.abs(new Date(p.date+'T00:00:00').getTime()-new Date(t+'T00:00:00').getTime())<
+      Math.abs(new Date(b.date+'T00:00:00').getTime()-new Date(t+'T00:00:00').getTime())?p:b,pts[0])
+    const rF=closest(fromDate)
+    const fromB=await this.walkToBracket(rF.id,rF.date,fromDate,'fromDate')
     if(this.stopped)return{scanStart:0,scanEnd:0}
-    const toRef=fromBracket.lo>closest(toDate).id?{id:fromBracket.lo,date:fromDate}:closest(toDate)
-    const toBracket=await this.walkToBracket(toRef.id,toRef.date,toDate,'toDate')
-    const scanStart=Math.max(1,fromBracket.lo-100)
-    const scanEnd=toBracket.hi+100
-    this.onLog(`✓ Range: #${this.idPrefix}${scanStart}–#${this.idPrefix}${scanEnd} (${scanEnd-scanStart+1} IDs)`,'ok')
+    const rT=fromB.lo>closest(toDate).id?{id:fromB.lo,date:fromDate}:closest(toDate)
+    const toB=await this.walkToBracket(rT.id,rT.date,toDate,'toDate')
+    const scanStart=Math.max(1,fromB.lo-100),scanEnd=toB.hi+100
+    this.onLog('Range: #'+this.idPrefix+scanStart+' to #'+this.idPrefix+scanEnd+' ('+(scanEnd-scanStart+1)+' IDs)','ok')
     return{scanStart,scanEnd}
   }
 
+  // Adaptive burst controller
+  // Starts at BURST_MAX, halves on RL cooldown, recovers slowly
+  private static BURST_MAX=80
+  private static BURST_MIN=10
+  private static REST_BASE=3000  // ms between bursts
+
   async scanRange(scanStart:number,scanEnd:number,fromDate:string,toDate:string,concurrency:number,startedAt:number):Promise<Order[]>{
-    const total=scanEnd-scanStart+1,orders:Order[]=[],batchDelay=()=>this.rlStreak>0?Math.min(this.rlStreak*1500,15000):300
-    let scanned=0,matched=0
-    for(let base=scanStart;base<=scanEnd&&!this.stopped;base+=concurrency){
-      const ids=Array.from({length:Math.min(concurrency,scanEnd-base+1)},(_,i)=>base+i)
-      const results=await this.fetchBatch(ids)
-      for(let i=0;i<ids.length;i++){
-        const o=results[i];scanned++
-        if(o&&o!=='rl'&&o.slug===this.slug&&o.dateYMD&&o.dateYMD>=fromDate&&o.dateYMD<=toDate){orders.push(o);matched++;this.onOrder(o);this.onLog(`#${ids[i]}  ${o.orderDate}  ${o.value}  ${o.payment}  ${o.location}  ${o.pincode}`,'ok')}
+    const orders:Order[]=[]
+    let scanned=0,matched=0,burstNum=0
+    let burstSize=Scanner.BURST_MAX
+    const total=scanEnd-scanStart+1
+
+    for(let base=scanStart;base<=scanEnd&&!this.stopped;){
+      const burstEnd=Math.min(base+burstSize-1,scanEnd)
+      burstNum++
+      this.onLog('Burst '+burstNum+' (sz='+burstSize+'): #'+this.toId(base)+' → #'+this.toId(burstEnd),'info')
+
+      let rlInBurst=0
+      for(let b=base;b<=burstEnd&&!this.stopped;b+=concurrency){
+        const ids=Array.from({length:Math.min(concurrency,burstEnd-b+1)},(_,i)=>b+i)
+        const results=await this.fetchBatch(ids)
+        for(let i=0;i<ids.length;i++){
+          const o=results[i];scanned++
+          if(o==='rl'){rlInBurst++;continue}
+          if(o!==null&&o.dateYMD&&o.dateYMD>=fromDate&&o.dateYMD<=toDate){
+            orders.push(o);matched++;this.onOrder(o)
+            this.onLog('#'+ids[i]+'  '+o.orderDate+'  '+o.value+'  '+o.payment+'  '+o.location+'  '+o.pincode,'ok')
+          }
+        }
+        this.onProgress(scanStart+scanned-1,scanEnd,matched)
+        await sleep(120)
       }
-      this.onProgress(scanStart+scanned-1,scanEnd,matched)
-      await sleep(batchDelay())
+
+      // Adapt burst size based on RL hits
+      if(rlInBurst>0){
+        burstSize=Math.max(Scanner.BURST_MIN,Math.floor(burstSize/2))
+        this.onLog('Throttling detected — reduced burst to '+burstSize+' IDs','info')
+      }else if(burstSize<Scanner.BURST_MAX){
+        burstSize=Math.min(Scanner.BURST_MAX,burstSize+10)
+      }
+
+      base=burstEnd+1
+      if(base>scanEnd||this.stopped)break
+
+      const pct=Math.round(scanned/total*100)
+      const rest=rlInBurst>0?Scanner.REST_BASE*2:Scanner.REST_BASE
+      this.onLog('Rest '+(rest/1000)+'s — burst '+burstNum+' | '+matched+' found | '+pct+'%','info')
+      this.onStats?.({lastMatchedId:matched>0?Scanner.numericPart(orders[orders.length-1].orderId):null})
+      for(let t=0;t<rest&&!this.stopped;t+=300)await sleep(Math.min(300,rest-t))
     }
     return orders
   }
 
   async scanManual(startId:number,endId:number,concurrency:number,useAuto:boolean,stopAfter:number,startedAt:number):Promise<Order[]>{
-    const orders:Order[]=[],batchDelay=()=>this.rlStreak>0?Math.min(this.rlStreak*1500,15000):300
-    const processBatch=async(ids:number[])=>{
-      let batchMatches=0,batchMisses=0,batchRetryFailures=0
-      const results=await this.fetchBatch(ids)
-      for(let i=0;i<ids.length&&!this.stopped;i++){
-        let o=results[i];scanned++
-        if((!o||o==='rl'||o.slug!==this.slug)&&useAuto){
-          this.onStats?.({retries:1})
-          await sleep(120)
-          const retry=await this.probe(ids[i])
-          if(retry&&retry!=='rl'&&retry.slug===this.slug){
-            o=retry
-            this.onStats?.({recovered:1})
-            this.onLog(`#${ids[i]} recovered on retry`,'info')
-          }else if(retry==='rl'){
-            o='rl'
-            batchRetryFailures++
+    const orders:Order[]=[]
+    let scanned=0,matched=0,consNulls=0,burstNum=0
+    let lastGoodId:number|null=null
+    // Adaptive burst: shrinks on RL, recovers after clean bursts
+    let burstSize=Scanner.BURST_MAX
+    let cleanBursts=0      // consecutive bursts with no RL
+    let rlCooldowns=0      // total RL cooldowns taken (for escalating wait)
+
+    // Check if we're rate-limited by probing a known-good ID 3 times
+    // Only declare "genuine end" if ALL 3 probes return a real order
+    const isRateLimited=async():Promise<boolean>=>{
+      if(!lastGoodId)return false
+      this.onLog('Verifying x3 on #'+this.toId(lastGoodId)+'...','info')
+      let successCount=0
+      for(let i=0;i<3;i++){
+        const r=(await this.callProxy([lastGoodId]))[0]
+        if(r&&r!=='rl'&&r!==null)successCount++
+        await sleep(2000)
+      }
+      const rl=successCount<3  // rate limited if ANY probe fails
+      this.onLog(rl?'Rate limited ('+successCount+'/3 probes succeeded)':'All 3 probes OK — genuine end','info')
+      return rl
+    }
+
+    for(let base=startId;base<=endId&&!this.stopped;){
+      const burstEnd=Math.min(base+burstSize-1,endId)
+      burstNum++
+      this.onLog('Burst '+burstNum+' (sz='+burstSize+'): #'+this.toId(base)+' → #'+this.toId(burstEnd),'info')
+
+      let rlInBurst=0
+      for(let b=base;b<=burstEnd&&!this.stopped;b+=concurrency){
+        const ids=Array.from({length:Math.min(concurrency,burstEnd-b+1)},(_,i)=>b+i)
+        const results=await this.fetchBatch(ids)
+
+        for(let i=0;i<ids.length&&!this.stopped;i++){
+          const o=results[i];scanned++
+          if(o==='rl'){rlInBurst++;continue}
+          if(o!==null){
+            orders.push(o);matched++;consNulls=0;cleanBursts=0
+            lastGoodId=ids[i]
+            this.onStats?.({lastMatchedId:Scanner.numericPart(o.orderId)})
+            this.onOrder(o)
+            this.onLog('#'+ids[i]+'  '+o.orderDate+'  '+o.value+'  '+o.payment+'  '+o.location,'ok')
           }else{
-            o=null
-            batchRetryFailures++
+            consNulls++
+            // Reached null threshold — check if rate-limited before stopping/waiting
+            if(useAuto&&consNulls>=stopAfter){
+              const rl=await isRateLimited()
+              if(!rl){
+                // Genuine end
+                this.onLog('Genuine end of orders after '+matched+' orders','ok')
+                this.stopped=true
+                break
+              }
+              // Rate limited — escalating cooldown
+              rlCooldowns++
+              cleanBursts=0
+              // Cooldown escalates: 120s, 180s, 300s, 300s, ...
+              const coolSec=[30,60,90,180,300][Math.min(rlCooldowns-1,4)]
+              this.onLog('Rate-limit cooldown #'+rlCooldowns+' — waiting '+coolSec+'s then resuming...','info')
+              await this.wait(coolSec*1000,'Cooldown')
+              if(this.stopped)break
+              // After cooldown: shrink burst size and reset null counter
+              burstSize=Math.max(Scanner.BURST_MIN,Math.floor(burstSize/2))
+              consNulls=0
+              this.onLog('Resuming with smaller bursts (sz='+burstSize+')','ok')
+            }
           }
         }
-        if(o&&o!=='rl'&&o.slug===this.slug){
-          const key=String(o.orderId)
-          if(this.seen.has(key)){this.onStats?.({duplicates:1});continue}
-          this.seen.add(key)
-          orders.push(o);matched++;batchMatches++;this.onOrder(o);this.onStats?.({lastMatchedId:Scanner.numericPart(o.orderId)});this.onLog(`#${ids[i]}  ${o.orderDate}  ${o.value}  ${o.payment}  ${o.location}`,'ok')
-        }else if(o!=='rl'){
-          batchMisses++
-        }
-      }
-      return { batchMatches, batchMisses, batchRetryFailures }
-    }
-
-    let scanned=0,matched=0
-    if(!useAuto){
-      for(let base=startId;base<=endId&&!this.stopped;base+=concurrency){
-        const ids=Array.from({length:Math.min(concurrency,endId-base+1)},(_,i)=>base+i)
-        await processBatch(ids)
         this.onProgress(startId+scanned-1,endId,matched)
-        await sleep(batchDelay())
+        await sleep(120)
       }
-      return orders
+
+      // Adapt burst size based on this burst's health
+      if(rlInBurst>0){
+        burstSize=Math.max(Scanner.BURST_MIN,Math.floor(burstSize/2))
+        cleanBursts=0
+        this.onLog('RL in burst — reduced size to '+burstSize,'info')
+      }else{
+        cleanBursts++
+        if(cleanBursts>=3&&burstSize<Scanner.BURST_MAX){
+          burstSize=Math.min(Scanner.BURST_MAX,burstSize+20)
+          this.onLog('Clean burst streak — increased size to '+burstSize,'info')
+        }
+      }
+
+      base=burstEnd+1
+      if(base>endId||this.stopped)break
+
+      // Longer rest after RL cooldowns to let rate limit fully reset
+      const rest=rlCooldowns>0?Scanner.REST_BASE*2:Scanner.REST_BASE
+      this.onLog('Rest '+(rest/1000)+'s — burst '+burstNum+' | '+matched+' found | '+consNulls+' null streak','info')
+      this.onStats?.({retries:this.rlStreak})
+      for(let t=0;t<rest&&!this.stopped;t+=300)await sleep(Math.min(300,rest-t))
     }
-
-    const normalWindowSize=Math.max(250,Math.min(5000,stopAfter))
-    const emptyWindowLimit=3
-    let nextBase=startId,emptyWindows=0,lastMatchedId:number|null=null,currentConcurrency=concurrency,retryFailureStreak=0,cooldowns=0,lowSlowMode=false,cleanWindows=0,stallScans=0
-    this.onLog(`Auto mode uses verified windows of ${normalWindowSize} IDs with forward probes`,'info')
-
-    while(nextBase<=endId&&!this.stopped){
-      const windowSize=lowSlowMode?Math.max(25,currentConcurrency*20):normalWindowSize
-      const probeStride=lowSlowMode?Math.max(60,currentConcurrency*40):Math.max(windowSize,concurrency*100)
-      const windowEnd=Math.min(endId,nextBase+windowSize-1)
-      let windowMatches=0,windowMisses=0,windowRetryFailures=0
-      this.onLog(`${lowSlowMode?'Low-slow':'Auto'} window: #${nextBase}-#${windowEnd} at ${currentConcurrency}x`,'info')
-      for(let base=nextBase;base<=windowEnd&&!this.stopped;base+=currentConcurrency){
-        const ids=Array.from({length:Math.min(currentConcurrency,windowEnd-base+1)},(_,i)=>base+i)
-        const res=await processBatch(ids)
-        windowMatches+=res.batchMatches
-        windowMisses+=res.batchMisses
-        windowRetryFailures+=res.batchRetryFailures
-        this.onProgress(scanned,0,matched)
-        await sleep(batchDelay())
-      }
-
-      if(windowMatches>0){
-        emptyWindows=0
-        retryFailureStreak=0
-        stallScans=0
-        cleanWindows++
-        if(lowSlowMode&&cleanWindows>=2&&windowRetryFailures===0){
-          currentConcurrency=Math.min(concurrency,currentConcurrency+1)
-          if(currentConcurrency>=Math.min(3,concurrency)){lowSlowMode=false;this.onLog('Exiting low-slow mode and resuming normal scan speed','info')}
-        }else if(!lowSlowMode&&currentConcurrency<concurrency&&windowRetryFailures===0){
-          currentConcurrency=Math.min(concurrency,currentConcurrency+1)
-        }
-        lastMatchedId=Math.max(lastMatchedId||0,...orders.slice(-windowMatches).map(o=>Scanner.numericPart(o.orderId)))
-        nextBase=windowEnd+1
-        continue
-      }
-
-      retryFailureStreak+=windowRetryFailures
-      stallScans+=windowMisses+windowRetryFailures
-      if(lastMatchedId!==null&&stallScans>=Math.max(40,currentConcurrency*20)){
-        lowSlowMode=true
-        cleanWindows=0
-        currentConcurrency=1
-        const reanchorBase=lastMatchedId+1
-        this.onLog(`Frontier stalled after ${stallScans} non-progress scans beyond #${lastMatchedId}; re-anchoring at #${reanchorBase} in low-slow mode`,'info')
-        stallScans=0
-        nextBase=reanchorBase
-        continue
-      }
-      const throttleLikely=windowRetryFailures>=Math.max(lowSlowMode?8:12,currentConcurrency*4)||(scanned>=50&&windowRetryFailures>Math.max(windowMatches,3))
-      if(throttleLikely){
-        cooldowns++
-        lowSlowMode=true
-        cleanWindows=0
-        const cooldownMs=Math.min(30000,8000+cooldowns*4000)
-        currentConcurrency=1
-        this.rlStreak=0
-        this.onLog(`Possible Shiprocket throttling: cooling down ${Math.round(cooldownMs/1000)}s and switching to low-slow mode at 1x`,'info')
-        await sleep(cooldownMs)
-        const resumeProbe=await this.probe(lastMatchedId!==null?lastMatchedId+1:nextBase)
-        if(resumeProbe&&resumeProbe!=='rl'&&resumeProbe.slug===this.slug){
-          this.onLog(`Cooldown probe succeeded near #${Scanner.numericPart(resumeProbe.orderId)} — resuming`,'info')
-          nextBase=Math.max(nextBase,(lastMatchedId!==null?lastMatchedId+1:nextBase))
-          retryFailureStreak=0
-          continue
-        }
-        this.onLog('Cooldown probe still weak, continuing in low-slow mode with short verified windows','info')
-      }
-
-      const probeIds=[windowEnd+concurrency,windowEnd+Math.floor(probeStride/2),windowEnd+probeStride].filter(id=>id<=endId)
-      let recoveredAhead:number|null=null
-      for(const pid of probeIds){
-        const ahead=await this.probe(pid)
-        if(ahead&&ahead!=='rl'&&ahead.slug===this.slug){
-          recoveredAhead=Scanner.numericPart(ahead.orderId)
-          break
-        }
-        await sleep(80)
-      }
-
-      if(recoveredAhead!==null){
-        emptyWindows=0
-        lastMatchedId=recoveredAhead
-        const jumpBase=Math.max(windowEnd+1,recoveredAhead-Math.max(concurrency*2,20))
-        this.onStats?.({gapJumps:1,lastMatchedId:recoveredAhead})
-        this.onLog(`Gap jump: skipped sparse region and re-anchored near #${recoveredAhead}`,'info')
-        nextBase=jumpBase
-        continue
-      }
-
-      emptyWindows++
-      this.onLog(`Verified empty window ${emptyWindows}/${emptyWindowLimit} at #${nextBase}-#${windowEnd}`,'info')
-      if(lastMatchedId!==null&&emptyWindows>=emptyWindowLimit){
-        this.onLog(`Auto-stopped after ${emptyWindowLimit} consecutive verified empty windows beyond #${lastMatchedId}`,'info')
-        break
-      }
-      nextBase=windowEnd+1
-    }
-
     return orders
   }
 }
+
 
 // ── App ───────────────────────────────────────────────
 export default function App(){
