@@ -57,7 +57,7 @@ export async function GET(req: NextRequest) {
   const now    = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }))
   const today  = now.toISOString().split('T')[0]
   const yest   = new Date(now.getTime() - 86400000).toISOString().split('T')[0]
-  const dow    = now.getDay() || 7
+  const dow    = now.getDay() === 0 ? 7 : now.getDay()  // 1=Mon ... 7=Sun
   const wStart = new Date(now.getTime() - (dow-1)*86400000).toISOString().split('T')[0]
   const mStart = today.slice(0,7) + '-01'
 
@@ -66,9 +66,20 @@ export async function GET(req: NextRequest) {
   fetch(`${origin}/api/cron/scan?date=${yest}${SECRET?`&secret=${SECRET}`:''}`)
     .catch(() => {}) // don't await — runs in background
 
-  // Report from stored data
-  const runs = loadRuns()
-  const all = runs.flatMap((r: any) => r.orders || [])
+  // Read from run-store (populated by browser Sync button or after each scan)
+  let all: any[] = []
+  try {
+    const storeRes = await fetch(`${origin}/api/run-store?subdomain=${SUBDOMAIN}`)
+    if (storeRes.ok) {
+      const storeData = await storeRes.json()
+      all = (storeData.runs || []).flatMap((r: any) => r.orders || [])
+    }
+  } catch {}
+  // Also check /tmp as fallback
+  if (all.length === 0) {
+    const runs = loadRuns()
+    all = runs.flatMap((r: any) => r.orders || [])
+  }
 
   const yestO = all.filter((o:any) => o.dateYMD === yest)
   const wtdO  = all.filter((o:any) => o.dateYMD >= wStart && o.dateYMD <= today)
