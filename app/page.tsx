@@ -122,13 +122,12 @@ function buildTelegramReport(orders:Order[], brandName:string, label:string, yes
   inRange(orders,yest,yest).forEach(o=>{const c=o.location;if(c&&c!=='N/A')cityMap[c]=(cityMap[c]||0)+1})
   const top=Object.entries(cityMap).sort((a,b)=>b[1]-a[1]).slice(0,3).map(([c,n])=>`${c} (${n})`).join(' · ')
   const yLine=y.count>0?[
-    `📦 ${y.count} orders | ${fmt(y.rev)} | Avg ₹${y.avg}`,
-    `💳 COD: ${y.cod} (${y.count?Math.round(y.cod/y.count*100):0}%) · Prepaid: ${y.prepaid}`,
+    `📦 ${y.count} orders`,
     top?`📍 ${top}`:''
   ].filter(Boolean).join('\n'):'No orders found'
   return [`🌅 <b>Morning Report</b> — ${brandName}`,'',`📅 <b>Yesterday</b> (${fd(yest)})`,yLine,'',
-    `📊 <b>Week to Date</b> (from ${fd(wStart)}): <b>${w.count}</b> orders · ${fmt(w.rev)}`,
-    `📈 <b>Month to Date</b>: <b>${m.count}</b> orders · ${fmt(m.rev)}`].join('\n')
+    `📊 <b>Week to Date</b> (from ${fd(wStart)}): <b>${w.count}</b> orders`,
+    `📈 <b>Month to Date</b>: <b>${m.count}</b> orders`].join('\n')
 }
 
 function dlFile(content:string,filename:string){const a=document.createElement('a');a.href='data:text/csv;charset=utf-8,'+encodeURIComponent(content);a.download=filename;a.click()}
@@ -519,8 +518,7 @@ export default function App(){
       const rev=cleaned.reduce((s,o)=>s+(o.valueNum||0),0)
       const cod=cleaned.filter(o=>(o.payment||'').toUpperCase()==='COD').length
       const msg=[`✅ <b>Scan Done</b> — ${brand.name}`,`📅 ${label}`,
-        `📦 ${cleaned.length} orders | ₹${Math.round(rev).toLocaleString('en-IN')}`,
-        `💳 COD: ${cod} · Prepaid: ${cleaned.length-cod}`].join('\n')
+        `📦 ${cleaned.length} orders`].join('\n')
       sendTelegramMsg(tgToken,tgChat,msg).catch(()=>{})
     }
   }
