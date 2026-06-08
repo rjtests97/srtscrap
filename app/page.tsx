@@ -58,6 +58,17 @@ const stripSource=(order:Order):Order=>{
   return rest
 }
 const mergeOrdersById=(orders:Order[])=>Object.values(Object.fromEntries(orders.map(order=>[String(order.orderId),order])))
+const loadBrandRuns=(brandId:string)=>LS.get<Run[]>(`runs_${brandId}`,[])
+const loadHistoricalOrders=(brandId:string):Order[]=>{
+  const merged = new Map<string, Order>()
+  loadBrandRuns(brandId).forEach(run=>{
+    run.orders.forEach(order=>{
+      const key=String(order.orderId)
+      if(!merged.has(key))merged.set(key, order)
+    })
+  })
+  return Array.from(merged.values())
+}
 
 function buildAnalytics(orders:Order[]):Analytics|null {
   if(!orders.length)return null
@@ -147,6 +158,16 @@ function buildUnifiedRangeOrders(cache:OrderCache, scannedOrders:Order[], fromDa
   if (forceRefresh) return mergeOrdersById(scannedOrders)
   const cachedRange = cache.getRange(fromDate, toDate).filter(order => cache.isFinal(order.orderId))
   return mergeOrdersById([...cachedRange, ...scannedOrders])
+}
+function hydrateCacheFromHistory(brand:Brand, cache:OrderCache){
+  const historical = loadHistoricalOrders(brand.id).map(order=>({
+    ...order,
+    slug: order.slug || brand.slug || brand.subdomain,
+  }))
+  if(!historical.length)return { total: 0, delivered: 0 }
+  cache.bulkLoad(historical, brand.slug||brand.subdomain)
+  const delivered = historical.filter(order=>isFinalStatus(order.status)).length
+  return { total: historical.length, delivered }
 }
 
 const darkVars={'--bg':'#0d0d0d','--surface':'#161616','--surface2':'#1e1e1e','--border':'#252525','--accent':'#00ff88','--warn':'#ff6b35','--text':'#e8e8e8','--muted':'#555','--red':'#ff4444'}
@@ -738,7 +759,7 @@ export default function App(){
 
   const addLog=useCallback((msg:string,cls:string='')=>setLog(p=>[...p.slice(-400),{msg,cls}]),[])
 
-  function loadRuns(b:Brand){const r=LS.get<Run[]>(`runs_${b.id}`,[]);setRuns(r);if(r.length>0){setLastOrders(r[0].orders);setAnalytics(buildAnalytics(r[0].orders))}else{setLastOrders([]);setAnalytics(null)}}
+  function loadRuns(b:Brand){const r=loadBrandRuns(b.id);setRuns(r);if(r.length>0){setLastOrders(r[0].orders);setAnalytics(buildAnalytics(r[0].orders))}else{setLastOrders([]);setAnalytics(null)}}
   function selectBrand(b:Brand){setActive(b);LS.set('activeBrandId',b.id);loadRuns(b)}
   function deleteBrand(id:string){if(!confirm('Delete this brand and all data?'))return;const u=brands.filter(b=>b.id!==id);setBrands(u);LS.set('brands',u);localStorage.removeItem(`runs_${id}`);const n=u[0]||null;setActive(n);if(n)loadRuns(n);else{setRuns([]);setLastOrders([]);setAnalytics(null)}}
 
@@ -750,7 +771,7 @@ export default function App(){
     scanCache.bulkLoad(cleaned,brand.slug||brand.subdomain)
     scanCache.save()
     const run:Run={runId:Date.now().toString(),dateRange:label,found:cleaned.length,orders:cleaned,createdAt:new Date().toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'numeric'})}
-    const updated=[run,...LS.get<Run[]>(`runs_${brand.id}`,[])].slice(0,50)
+    const updated=[run,...loadBrandRuns(brand.id)].slice(0,50)
     LS.set(`runs_${brand.id}`,updated);setRuns(updated);setLastOrders(cleaned);setAnalytics(buildAnalytics(cleaned))
     const toNum=(id:number|string)=>typeof id==='number'?id:parseInt(String(id).replace(/[^0-9]/g,''))||0
     const byDate:Record<string,{min:number,max:number}>={}
@@ -765,7 +786,7 @@ export default function App(){
     if(url&&cleaned.length>0)syncToSheets(url,cleaned).then(n=>n>0&&addLog(`✓ Sheets: ${n} rows synced`,'ok'))
 
     // POST run data to server so Vercel Cron can access it for daily report
-    const allRuns=LS.get<Run[]>(`runs_${brand.id}`,[])
+    const allRuns=loadBrandRuns(brand.id)
     fetch('/api/run-store',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({subdomain:brand.subdomain,runs:allRuns.slice(0,15)})}).catch(()=>{})
 
@@ -793,7 +814,7 @@ export default function App(){
     const dates=cleaned.map(order=>order.dateYMD).filter(Boolean).sort() as string[]
     const label=dates.length===0?sourceLabel:dates[0]===dates[dates.length-1]?dates[0]:`${dates[0]} to ${dates[dates.length-1]}`
     const run:Run={runId:'import_'+Date.now(),dateRange:label,found:cleaned.length,orders:cleaned,createdAt:'Imported'}
-    const updated=[run,...LS.get<Run[]>(`runs_${brand.id}`,[]).filter(existing=>existing.runId!==run.runId)].slice(0,50)
+    const updated=[run,...loadBrandRuns(brand.id).filter(existing=>existing.runId!==run.runId)].slice(0,50)
     LS.set(`runs_${brand.id}`,updated)
     setRuns(updated)
     setLastOrders(cleaned)
@@ -834,7 +855,9 @@ export default function App(){
     if('wakeLock' in navigator){try{(navigator as any).wakeLock.request('screen').catch(()=>{})}catch{}}
     addLog('⚠ Keep this tab active — switching tabs may pause the scan','info')
     const cache=new OrderCache(brand.id, brand.slug||brand.subdomain)
+    const seeded=hydrateCacheFromHistory(brand, cache)
     const cs=cache.stats()
+    if(seeded.delivered>0&&!forceRefresh)addLog(`History seed: ${seeded.delivered} delivered loaded from saved runs`,'ok')
     if(cs.total>0&&!forceRefresh)addLog(`Cache: ${cs.delivered} delivered (skip) + ${cs.active} active (rescan) — ${cache.sizeKB()}KB`,'ok')
     if(forceRefresh)addLog('Force refresh: ignoring all cache','info')
     const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)),cache,forceRefresh)
@@ -872,7 +895,9 @@ export default function App(){
     if(useAuto&&safeStopAfter!==stopAfter)addLog(`Raised auto-stop from ${stopAfter} to ${safeStopAfter} for safer scanning`,'info')
     if(useAuto)addLog(`Auto hard cap set to #${brand.idPrefix||''}${autoHardCap} based on current brand velocity`,'info')
     const cacheM=new OrderCache(brand.id, brand.slug||brand.subdomain)
+    const seededM=hydrateCacheFromHistory(brand, cacheM)
     const csM=cacheM.stats()
+    if(seededM.delivered>0&&!forceRefresh)addLog(`History seed: ${seededM.delivered} delivered loaded from saved runs`,'ok')
     if(csM.total>0&&!forceRefresh)addLog(`Cache: ${csM.delivered} delivered (skip) + ${csM.active} active | ${cacheM.sizeKB()}KB`,'ok')
     const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)),cacheM,forceRefresh)
     scannerRef.current=scanner
@@ -1306,6 +1331,7 @@ function CachePanel({active,brands,forceRefresh,setForceRefresh,onImportOrders}:
   const refresh=()=>{
     if(!active)return
     const c=new OrderCache(active.id, active.slug||active.subdomain)
+    hydrateCacheFromHistory(active, c)
     const s=c.stats()
     setStats({...s,sizeKB:c.sizeKB()})
     setCleared(false)
