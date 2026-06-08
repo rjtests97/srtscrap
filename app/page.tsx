@@ -2,7 +2,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 
 interface Brand { id:string; name:string; subdomain:string; slug:string; companyName:string; anchorId:number; anchorDate:string; avgPerDay:number; regressionPoints:Array<{date:string,id:number}>; idPrefix:string }
-interface Order { orderId:number|string; slug:string; orderDate:string; orderTime:string; dateYMD:string|null; value:string; valueNum:number; payment:string; status:string; pincode:string; location:string }
+interface Order { orderId:number|string; slug:string; orderDate:string; orderTime:string; dateYMD:string|null; value:string; valueNum:number; payment:string; status:string; pincode:string; location:string; source?:'cache'|'fresh' }
 interface Run { runId:string; dateRange:string; found:number; orders:Order[]; createdAt:string }
 interface Analytics {
   totalOrders:number
@@ -76,7 +76,7 @@ function buildAnalytics(orders:Order[]):Analytics|null {
   return{totalOrders:N,totalRevenue:rev,avgOrderVal:rev/N,codCount:cod.length,prepaidCount:N-cod.length,codPct:Math.round((cod.length/N)*100),topCities,topPincodes,repeatLocations,statuses,daily,hours,valueBuckets:valMap,velocity,avgDailyOrders:Math.round((N/Math.max(daily.length,1))*10)/10,avgDailyRevenue:rev/Math.max(daily.length,1),revenueMomentum}
 }
 
-function buildCSV(orders:Order[]){let s='Order ID,Date,Time,Value,Payment,Status,Location,Pincode\n';sortOrders(orders).forEach(r=>s+=`${esc(r.orderId)},${esc(r.orderDate)},${esc(r.orderTime)},${esc(r.value)},${esc(r.payment)},${esc(r.status)},${esc(r.location)},${esc(r.pincode)}\n`);return s}
+function buildCSV(orders:Order[]){let s='Order ID,Date,Time,Value,Payment,Status,Location,Pincode,Source\n';sortOrders(orders).forEach(r=>s+=`${esc(r.orderId)},${esc(r.orderDate)},${esc(r.orderTime)},${esc(r.value)},${esc(r.payment)},${esc(r.status)},${esc(r.location)},${esc(r.pincode)}\n`);return s}
 function buildReport(orders:Order[],brandName:string,dateRange:string){
   const a=buildAnalytics(orders);if(!a)return''
   const fd=(ymd:string)=>{const[y,m,d]=ymd.split('-');return new Date(+y,+m-1,+d).toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'numeric'})}
@@ -375,7 +375,7 @@ class Scanner {
       for(let id=base;id<=burstEnd;id++){
         if(!this.forceRefresh&&this.cache?.isFinal(id)){
           // Load from cache — no API call needed
-          const cached=this.cache.get(id)!
+          const cached={...this.cache.get(id)!,source:'cache' as const}
           if(cached.dateYMD&&cached.dateYMD>=fromDate&&cached.dateYMD<=toDate){
             orders.push(cached);matched++;fromCacheCount++;this.onOrder(cached)
             this.onLog('#'+id+'  '+cached.orderDate+'  [cached '+cached.status+']','ok')
@@ -399,10 +399,11 @@ class Scanner {
           const o=results[i];scanned++
           if(o==='rl'){rlInBurst++;continue}
           if(o!==null){
-            this.cache?.set(ids[i],o)  // save to cache
-            if(o.dateYMD&&o.dateYMD>=fromDate&&o.dateYMD<=toDate){
-              orders.push(o);matched++;this.onOrder(o)
-              this.onLog('#'+ids[i]+'  '+o.orderDate+'  '+o.value+'  '+o.payment+'  '+o.location+'  '+o.pincode,'ok')
+            const tagged={...o,source:'fresh' as const}
+            this.cache?.set(ids[i],tagged)  // save to cache
+            if(tagged.dateYMD&&tagged.dateYMD>=fromDate&&tagged.dateYMD<=toDate){
+              orders.push(tagged);matched++;this.onOrder(tagged)
+              this.onLog('#'+ids[i]+'  '+tagged.orderDate+'  '+tagged.value+'  '+tagged.payment+'  '+tagged.location+'  '+tagged.pincode,'ok')
             }
           }
         }
@@ -462,7 +463,7 @@ class Scanner {
       const toFetchM:number[]=[]
       for(let id=base;id<=burstEnd;id++){
         if(!this.forceRefresh&&this.cache?.isFinal(id)){
-          const cached=this.cache.get(id)!
+          const cached={...this.cache.get(id)!,source:'cache' as const}
           orders.push(cached);matched++;consNulls=0
           lastGoodId=id;this.onOrder(cached)
           this.onLog('#'+id+'  '+cached.orderDate+'  [cached '+cached.status+']','ok')
@@ -479,12 +480,13 @@ class Scanner {
           const o=results[i];scanned++
           if(o==='rl'){rlInBurst++;continue}
           if(o!==null){
-            this.cache?.set(ids[i],o)
-            orders.push(o);matched++;consNulls=0;cleanBursts=0
+            const fo={...o,source:'fresh' as const}
+            this.cache?.set(ids[i],fo)
+            orders.push(fo);matched++;consNulls=0;cleanBursts=0
             lastGoodId=ids[i]
-            this.onStats?.({lastMatchedId:Scanner.numericPart(o.orderId)})
-            this.onOrder(o)
-            this.onLog('#'+ids[i]+'  '+o.orderDate+'  '+o.value+'  '+o.payment+'  '+o.location,'ok')
+            this.onStats?.({lastMatchedId:Scanner.numericPart(fo.orderId)})
+            this.onOrder(fo)
+            this.onLog('#'+ids[i]+'  '+fo.orderDate+'  '+fo.value+'  '+fo.payment+'  '+fo.location,'ok')
           }else{
             consNulls++
             // Reached null threshold — check if rate-limited before stopping/waiting
@@ -596,8 +598,8 @@ export default function App(){
       // Send yesterday's CSV
       const yestOrders=allOrders.filter(o=>o.dateYMD===yest)
       if(yestOrders.length>0){
-        const csv='Order ID,Date,Time,Value,Payment,Status,Location,Pincode\n'+
-          yestOrders.map(o=>`${o.orderId},${o.orderDate},${o.orderTime},${o.value},${o.payment},${o.status},${o.location},${o.pincode}`).join('\n')
+        const csv='Order ID,Date,Time,Value,Payment,Status,Location,Pincode,Source\n'+
+          yestOrders.map(o=>`${o.orderId},${o.orderDate},${o.orderTime},${o.value},${o.payment},${o.status},${o.location},${o.pincode},${o.source||"fresh"}`).join('\n')
         sendTelegramDoc(tgToken,tgChat,`${brand.name}_${yest}.csv`,csv,`Yesterday's orders — ${brand.name}`)
       }
     }).catch(()=>{})
@@ -1189,8 +1191,8 @@ function SettingsTab({brands,active,runs,onDelete,onSync,inp,lbl,forceRefresh,se
       const csvOrders=yestOrders.length>0?yestOrders:allOrders.filter((o:Order)=>o.dateYMD===latestDate)
       if(csvOrders.length>0){
         const csvDate=yestOrders.length>0?yest:latestDate
-        const csv='Order ID,Date,Time,Value,Payment,Status,Location,Pincode\n'+
-          csvOrders.map((o:Order)=>`${o.orderId},${o.orderDate},${o.orderTime},${o.value},${o.payment},${o.status},${o.location},${o.pincode}`).join('\n')
+        const csv='Order ID,Date,Time,Value,Payment,Status,Location,Pincode,Source\n'+
+          csvOrders.map((o:Order)=>`${o.orderId},${o.orderDate},${o.orderTime},${o.value},${o.payment},${o.status},${o.location},${o.pincode},${o.source||"fresh"}`).join('\n')
         await sendTelegramDoc(tgToken,tgChat,`${brand.name}_${csvDate}.csv`,csv,`Orders for ${csvDate} — ${brand.name}`)
       }
       setTgStatus('✓ Report sent!')

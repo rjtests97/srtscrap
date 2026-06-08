@@ -202,8 +202,8 @@ export async function GET(req: NextRequest) {
     await tgMsg(followUp)
 
     if (collectedOrders.length > 0) {
-      const csv = 'Order ID,Date,Time,Status,Location,Pincode\n' +
-        collectedOrders.map((o:any)=>`${o.orderId},${o.orderDate},${o.orderTime},${o.status},${o.location},${o.pincode}`).join('\n')
+      const csv = 'Order ID,Date,Time,Status,Location,Pincode,Source\n' +
+        collectedOrders.map((o:any)=>`${o.orderId},${o.orderDate},${o.orderTime},${o.status},${o.location},${o.pincode},fresh`).join('\n')
       await tgDoc(`${BRAND_NAME.replace(/\s+/g,'_')}_${dateStr}.csv`, csv, `${collectedOrders.length} orders — ${fmtDate(dateStr)}`)
     }
   }
