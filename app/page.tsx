@@ -1,5 +1,5 @@
 'use client'
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, ChangeEvent } from 'react'
 
 interface Brand { id:string; name:string; subdomain:string; slug:string; companyName:string; anchorId:number; anchorDate:string; avgPerDay:number; regressionPoints:Array<{date:string,id:number}>; idPrefix:string }
 interface Order { orderId:number|string; slug:string; orderDate:string; orderTime:string; dateYMD:string|null; value:string; valueNum:number; payment:string; status:string; pincode:string; location:string; source?:'cache'|'fresh' }
@@ -221,8 +221,8 @@ class OrderCache {
   private isCompleteEntry(entry: CacheEntry) {
     return !!entry.orderDate && entry.orderDate !== 'N/A'
       && !!entry.status && entry.status !== 'N/A'
-      && !!entry.payment && entry.payment !== 'N/A'
-      && (entry.value !== 'N/A' || entry.valueNum > 0)
+      && !!entry.location && entry.location !== 'N/A'
+      && !!entry.pincode && entry.pincode !== 'N/A'
   }
 
   private flush() {
@@ -736,6 +736,26 @@ export default function App(){
     }
   }
 
+  function importOrdersToBrand(brand:Brand, importedOrders:Order[], sourceLabel:string){
+    const cleaned=mergeOrdersById(importedOrders.map(order=>({
+      ...order,
+      slug: order.slug || brand.slug || brand.subdomain,
+      source: order.source || 'cache',
+    })))
+    if(!cleaned.length)return
+    const cache=new OrderCache(brand.id, brand.slug||brand.subdomain)
+    cache.bulkLoad(cleaned,brand.slug||brand.subdomain)
+    cache.save()
+    const dates=cleaned.map(order=>order.dateYMD).filter(Boolean).sort() as string[]
+    const label=dates.length===0?sourceLabel:dates[0]===dates[dates.length-1]?dates[0]:`${dates[0]} to ${dates[dates.length-1]}`
+    const run:Run={runId:'import_'+Date.now(),dateRange:label,found:cleaned.length,orders:cleaned,createdAt:'Imported'}
+    const updated=[run,...LS.get<Run[]>(`runs_${brand.id}`,[]).filter(existing=>existing.runId!==run.runId)].slice(0,50)
+    LS.set(`runs_${brand.id}`,updated)
+    setRuns(updated)
+    setLastOrders(cleaned)
+    setAnalytics(buildAnalytics(cleaned))
+  }
+
   async function syncToSheets(url:string,orders:Order[]):Promise<number>{
     let added=0
     for(let i=0;i<orders.length;i+=200){
@@ -914,7 +934,7 @@ export default function App(){
           {tab==='analytics'&&<AnalyticsTab analytics={analytics}/>}
           {tab==='compare'&&<CompareTab brands={brands}/>}
           {tab==='history'&&<HistoryTab runs={runs} brandName={active.name} onClear={()=>{localStorage.removeItem(`runs_${active.id}`);setRuns([]);setLastOrders([]);setAnalytics(null)}}/>}
-          {tab==='settings'&&<SettingsTab brands={brands} active={active} runs={runs} onDelete={deleteBrand} onSync={(url:string,orders:Order[])=>syncToSheets(url,orders)} inp={inp} lbl={lbl} forceRefresh={forceRefresh} setForceRefresh={setForceRefresh}/>}
+          {tab==='settings'&&<SettingsTab brands={brands} active={active} runs={runs} onDelete={deleteBrand} onSync={(url:string,orders:Order[])=>syncToSheets(url,orders)} onImportOrders={(orders:Order[], label:string)=>active&&importOrdersToBrand(active,orders,label)} inp={inp} lbl={lbl} forceRefresh={forceRefresh} setForceRefresh={setForceRefresh}/>}
         </>
       )}
     </div>
@@ -1184,32 +1204,60 @@ function parseCSVDate(d:string):string|null{
   return m2?m2[1]:null
 }
 
+function parseCSVLine(line:string):string[]{
+  const out:string[]=[]
+  let cur='',inQuotes=false
+  for(let i=0;i<line.length;i++){
+    const ch=line[i]
+    if(ch==='"'){
+      if(inQuotes&&line[i+1]==='"'){cur+='"';i++}
+      else inQuotes=!inQuotes
+    }else if(ch===','&&!inQuotes){
+      out.push(cur.trim())
+      cur=''
+    }else cur+=ch
+  }
+  out.push(cur.trim())
+  return out
+}
+
 function parseFullReportCSV(text:string):Order[]{
-  const lines=text.split('\n')
-  // Find the "Order ID,Date,Time..." header line
+  const lines=text.split(/\r?\n/)
   let headerIdx=-1
   for(let i=0;i<lines.length;i++){
-    if(lines[i].replace(/"/g,'').trim().startsWith('Order ID,Date')){headerIdx=i;break}
+    const normalized=lines[i].replace(/"/g,'').trim()
+    if(normalized.startsWith('Order ID,Date,Time')){headerIdx=i;break}
   }
   if(headerIdx<0)return[]
-  const clean=(s:string)=>s.replace(/^"|"$/g,'').trim()
+  const header=parseCSVLine(lines[headerIdx]).map(col=>col.replace(/^"|"$/g,'').trim().toLowerCase())
+  const idx=(name:string)=>header.indexOf(name)
+  const orderIdx=idx('order id'),dateIdx=idx('date'),timeIdx=idx('time'),valueIdx=idx('value'),paymentIdx=idx('payment'),statusIdx=idx('status'),locationIdx=idx('location'),pincodeIdx=idx('pincode')
+  if(orderIdx<0||dateIdx<0||timeIdx<0||statusIdx<0||locationIdx<0||pincodeIdx<0)return[]
   const orders:Order[]=[]
   for(let i=headerIdx+1;i<lines.length;i++){
-    const row=lines[i].match(/("([^"]*)"|([^,]*))(,|$)/g)
-    if(!row||row.length<8)continue
-    const cols=row.map(c=>clean(c.replace(/,$/,'')))
-    const orderId=cols[0];if(!orderId||isNaN(Number(orderId)))continue
-    const orderDate=cols[1],orderTime=cols[2],value=cols[3]||'N/A',payment=cols[4]||'N/A',status=cols[5]||'N/A',location=cols[6]||'N/A',pincode=cols[7]||'N/A'
+    const cols=parseCSVLine(lines[i]).map(col=>col.replace(/^"|"$/g,'').trim())
+    if(cols.length<header.length)continue
+    const orderId=cols[orderIdx]
+    if(!orderId||isNaN(Number(orderId)))continue
+    const orderDate=cols[dateIdx]||'N/A'
+    const orderTime=cols[timeIdx]||'N/A'
+    const value=valueIdx>=0?(cols[valueIdx]||'N/A'):'N/A'
+    const payment=paymentIdx>=0?(cols[paymentIdx]||'N/A'):'N/A'
+    const status=cols[statusIdx]||'N/A'
+    const location=cols[locationIdx]||'N/A'
+    const pincode=cols[pincodeIdx]||'N/A'
     const dateYMD=parseCSVDate(orderDate)
     orders.push({orderId:parseInt(orderId),slug:'',orderDate,orderTime,dateYMD,value,valueNum:parseFloat(value.replace(/[^0-9.]/g,''))||0,payment,status,pincode,location,source:'cache'})
   }
   return orders
 }
 
-function CachePanel({active,brands,forceRefresh,setForceRefresh}:any){
+function CachePanel({active,brands,forceRefresh,setForceRefresh,onImportOrders}:any){
   const[stats,setStats]=useState<{total:number,delivered:number,active:number,sizeKB:number}|null>(null)
   const[cleared,setCleared]=useState(false)
   const[importResult,setImportResult]=useState('')
+  const[fileName,setFileName]=useState('')
+  const fileInputRef=useRef<HTMLInputElement|null>(null)
 
   const refresh=()=>{
     if(!active)return
@@ -1230,6 +1278,28 @@ function CachePanel({active,brands,forceRefresh,setForceRefresh}:any){
   }
 
   const pct=stats?.total?Math.round(stats.delivered/stats.total*100):0
+
+  async function handleImportFile(e:ChangeEvent<HTMLInputElement>){
+    const file=e.target.files?.[0]
+    if(!file||!active)return
+    setFileName(file.name)
+    const text=await file.text()
+    const parsed=parseFullReportCSV(text)
+    if(!parsed.length){
+      setImportResult('⚠ No orders found — upload a Full Report or export CSV with an Order ID,Date,Time header')
+      e.target.value=''
+      return
+    }
+    const cache=new OrderCache(active.id, active.slug||active.subdomain)
+    const {added,skipped}=cache.bulkLoad(parsed,active.slug||active.subdomain)
+    cache.save()
+    const final=parsed.filter(o=>isFinalStatus(o.status)).length
+    const newStats=cache.stats()
+    setStats({...newStats,sizeKB:cache.sizeKB()})
+    setImportResult(`✓ Imported ${parsed.length} orders from ${file.name} (${final} delivered, ${added} written, ${skipped} unchanged)`)
+    onImportOrders?.(parsed, file.name.replace(/\.csv$/i,''))
+    e.target.value=''
+  }
 
   return(
     <div style={{background:'var(--surface)',border:'1px solid var(--border)',borderRadius:8,padding:14,marginBottom:14}}>
@@ -1265,35 +1335,10 @@ function CachePanel({active,brands,forceRefresh,setForceRefresh}:any){
       <div style={{marginTop:10,paddingTop:10,borderTop:'1px solid var(--border)'}}>
         <div style={{fontSize:9,fontWeight:700,color:'var(--accent)',marginBottom:6,textTransform:'uppercase',letterSpacing:'.05em'}}>Import from CSV</div>
         <div style={{fontSize:9,color:'var(--muted)',marginBottom:6,lineHeight:1.6}}>Upload a Full Report CSV to seed the cache. Cached Delivered orders will be skipped on the next scan.</div>
-        <label style={{display:'block',padding:'8px 12px',background:'var(--surface2)',border:'1px dashed var(--border)',borderRadius:6,cursor:'pointer',fontSize:9,color:'var(--muted)',textAlign:'center' as const}}>
-          📂 Click to upload Full Report CSV
-          <input type="file" accept=".csv" style={{display:'none'}} onChange={async(e:any)=>{
-            const file=e.target.files?.[0];if(!file||!active)return
-            const text=await file.text()
-            const parsed=parseFullReportCSV(text)
-            if(!parsed.length){setImportResult('⚠ No orders found — make sure this is a Full Report CSV');return}
-            const cache=new OrderCache(active.id, active.slug||active.subdomain)
-            // bulkLoad = no intermediate flushes, single write at end
-            const {added,skipped}=cache.bulkLoad(parsed,active.slug||active.subdomain)
-            cache.save()  // single localStorage write for all orders
-            const final=parsed.filter(o=>isFinalStatus(o.status)).length
-            // Update stats directly from in-memory cache (avoids stale read)
-            const newStats=cache.stats()
-            setStats({...newStats,sizeKB:cache.sizeKB()})
-            setImportResult(`✓ Imported ${added} orders (${final} final/cached, ${skipped} already in cache)`)
-            // Also save as a run so dashboard shows historical data
-            const byDate:Record<string,Order[]>={}
-            parsed.forEach(o=>{if(o.dateYMD){if(!byDate[o.dateYMD])byDate[o.dateYMD]=[];byDate[o.dateYMD].push(o)}})
-            const dates=Object.keys(byDate).sort()
-            if(dates.length>0){
-              const run:any={runId:'import_'+Date.now(),dateRange:`${dates[0]} to ${dates[dates.length-1]}`,found:parsed.length,orders:parsed,createdAt:'Imported'}
-              const existing=LS.get<any[]>(`runs_${active.id}`,[])
-              const merged=[run,...existing.filter((r:any)=>r.runId!==run.runId)].slice(0,50)
-              LS.set(`runs_${active.id}`,merged)
-            }
-            e.target.value=''
-          }}/>
-        </label>
+        <input ref={fileInputRef} type="file" accept=".csv" style={{display:'none'}} onChange={handleImportFile}/>
+        <button onClick={()=>fileInputRef.current?.click()} style={{display:'block',width:'100%',padding:'8px 12px',background:'var(--surface2)',border:'1px dashed var(--border)',borderRadius:6,cursor:'pointer',fontSize:9,color:'var(--muted)',textAlign:'center'}}>
+          📂 {fileName?`Selected: ${fileName}`:'Click to upload Full Report CSV'}
+        </button>
         {importResult&&<div style={{fontSize:9,marginTop:6,padding:'5px 8px',borderRadius:4,background:importResult.startsWith('✓')?'#00ff8815':'#ff444415',border:`1px solid ${importResult.startsWith('✓')?'var(--accent)':'var(--red)'}`,color:importResult.startsWith('✓')?'var(--accent)':'var(--red)'}}>{importResult}</div>}
       </div>
       <div style={{fontSize:8,color:'var(--muted)',marginTop:8,lineHeight:1.7}}>
@@ -1304,7 +1349,7 @@ function CachePanel({active,brands,forceRefresh,setForceRefresh}:any){
   )
 }
 
-function SettingsTab({brands,active,runs,onDelete,onSync,inp,lbl,forceRefresh,setForceRefresh}:any){
+function SettingsTab({brands,active,runs,onDelete,onSync,onImportOrders,inp,lbl,forceRefresh,setForceRefresh}:any){
   const[url,setUrl]=useState(()=>LS.get(`sheets_${active?.id}`,''));const[status,setStatus]=useState('');const[busy,setBusy]=useState(false)
   useEffect(()=>setUrl(LS.get(`sheets_${active?.id}`,'')),[ active?.id])
   const btn=(e:any={})=>({background:'var(--surface)',border:'1px solid var(--border)',color:'var(--text)',padding:'8px 12px',borderRadius:6,fontSize:10,fontWeight:700,fontFamily:'inherit',cursor:'pointer',...e})
@@ -1366,7 +1411,7 @@ function SettingsTab({brands,active,runs,onDelete,onSync,inp,lbl,forceRefresh,se
   return(
     <div>
       {/* Cache Management */}
-      <CachePanel active={active} brands={brands} forceRefresh={forceRefresh} setForceRefresh={setForceRefresh}/>
+      <CachePanel active={active} brands={brands} forceRefresh={forceRefresh} setForceRefresh={setForceRefresh} onImportOrders={onImportOrders}/>
 
       {/* Telegram */}
       <div style={{background:'var(--surface)',border:'1px solid var(--border)',borderRadius:8,padding:14,marginBottom:14}}>
