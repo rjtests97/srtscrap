@@ -1079,9 +1079,42 @@ function HistoryTab({runs,brandName,onClear}:{runs:Run[],brandName:string,onClea
   )
 }
 
+
+// ── CSV Import ────────────────────────────────────────
+const MONTHS_MAP:Record<string,string>={Jan:'01',Feb:'02',Mar:'03',Apr:'04',May:'05',Jun:'06',Jul:'07',Aug:'08',Sep:'09',Oct:'10',Nov:'11',Dec:'12'}
+function parseCSVDate(d:string):string|null{
+  const m=d.match(/^(\d{1,2})\s+(\w{3})\s+(\d{4})/)
+  if(m)return`${m[3]}-${MONTHS_MAP[m[2]]||'00'}-${m[1].padStart(2,'0')}`
+  const m2=d.match(/^(\d{4}-\d{2}-\d{2})/)
+  return m2?m2[1]:null
+}
+
+function parseFullReportCSV(text:string):Order[]{
+  const lines=text.split('\n')
+  // Find the "Order ID,Date,Time..." header line
+  let headerIdx=-1
+  for(let i=0;i<lines.length;i++){
+    if(lines[i].replace(/"/g,'').trim().startsWith('Order ID,Date')){headerIdx=i;break}
+  }
+  if(headerIdx<0)return[]
+  const clean=(s:string)=>s.replace(/^"|"$/g,'').trim()
+  const orders:Order[]=[]
+  for(let i=headerIdx+1;i<lines.length;i++){
+    const row=lines[i].match(/("([^"]*)"|([^,]*))(,|$)/g)
+    if(!row||row.length<8)continue
+    const cols=row.map(c=>clean(c.replace(/,$/,'')))
+    const orderId=cols[0];if(!orderId||isNaN(Number(orderId)))continue
+    const orderDate=cols[1],orderTime=cols[2],value=cols[3]||'N/A',payment=cols[4]||'N/A',status=cols[5]||'N/A',location=cols[6]||'N/A',pincode=cols[7]||'N/A'
+    const dateYMD=parseCSVDate(orderDate)
+    orders.push({orderId:parseInt(orderId),slug:'',orderDate,orderTime,dateYMD,value,valueNum:parseFloat(value.replace(/[^0-9.]/g,''))||0,payment,status,pincode,location,source:'cache'})
+  }
+  return orders
+}
+
 function CachePanel({active,brands,forceRefresh,setForceRefresh}:any){
   const[stats,setStats]=useState<{total:number,delivered:number,active:number,sizeKB:number}|null>(null)
   const[cleared,setCleared]=useState(false)
+  const[importResult,setImportResult]=useState('')
 
   const refresh=()=>{
     if(!active)return
@@ -1133,6 +1166,45 @@ function CachePanel({active,brands,forceRefresh,setForceRefresh}:any){
         </div>
       </div>
       {cleared&&<div style={{fontSize:9,color:'var(--accent)',marginTop:6}}>✓ Cache cleared</div>}
+      {/* Import CSV */}
+      <div style={{marginTop:10,paddingTop:10,borderTop:'1px solid var(--border)'}}>
+        <div style={{fontSize:9,fontWeight:700,color:'var(--accent)',marginBottom:6,textTransform:'uppercase',letterSpacing:'.05em'}}>Import from CSV</div>
+        <div style={{fontSize:9,color:'var(--muted)',marginBottom:6,lineHeight:1.6}}>Upload a Full Report CSV to seed the cache. Delivered orders will be skipped on next scan.</div>
+        <label style={{display:'block',padding:'8px 12px',background:'var(--surface2)',border:'1px dashed var(--border)',borderRadius:6,cursor:'pointer',fontSize:9,color:'var(--muted)',textAlign:'center' as const}}>
+          📂 Click to upload Full Report CSV
+          <input type="file" accept=".csv" style={{display:'none'}} onChange={async(e:any)=>{
+            const file=e.target.files?.[0];if(!file||!active)return
+            const text=await file.text()
+            const parsed=parseFullReportCSV(text)
+            if(!parsed.length){setImportResult('⚠ No orders found — make sure this is a Full Report CSV');return}
+            const cache=new OrderCache(active.id)
+            let added=0,skipped=0
+            parsed.forEach(o=>{
+              // Don't overwrite existing cache entry if it has a better status
+              const existing=cache.get(o.orderId)
+              if(existing&&FINAL_STATUSES.some(f=>existing.status.toLowerCase().includes(f))){skipped++;return}
+              cache.set(o.orderId,{...o,slug:active.slug||active.subdomain})
+              added++
+            })
+            cache.save()
+            const final=parsed.filter(o=>FINAL_STATUSES.some(f=>o.status.toLowerCase().includes(f))).length
+            setImportResult(`✓ Imported ${added} orders (${final} final/cached, ${skipped} already in cache)`)
+            refresh()
+            // Also save as a run so dashboard shows historical data
+            const byDate:Record<string,Order[]>={}
+            parsed.forEach(o=>{if(o.dateYMD){if(!byDate[o.dateYMD])byDate[o.dateYMD]=[];byDate[o.dateYMD].push(o)}})
+            const dates=Object.keys(byDate).sort()
+            if(dates.length>0){
+              const run:any={runId:'import_'+Date.now(),dateRange:`${dates[0]} to ${dates[dates.length-1]}`,found:parsed.length,orders:parsed,createdAt:'Imported'}
+              const existing=LS.get<any[]>(`runs_${active.id}`,[])
+              const merged=[run,...existing.filter((r:any)=>r.runId!==run.runId)].slice(0,50)
+              LS.set(`runs_${active.id}`,merged)
+            }
+            e.target.value=''
+          }}/>
+        </label>
+        {importResult&&<div style={{fontSize:9,marginTop:6,padding:'5px 8px',borderRadius:4,background:importResult.startsWith('✓')?'#00ff8815':'#ff444415',border:`1px solid ${importResult.startsWith('✓')?'var(--accent)':'var(--red)'}`,color:importResult.startsWith('✓')?'var(--accent)':'var(--red)'}}>{importResult}</div>}
+      </div>
       <div style={{fontSize:8,color:'var(--muted)',marginTop:8,lineHeight:1.7}}>
         <b>How it works:</b> Delivered orders are saved permanently. On the next scan, they load from cache instantly — no API calls. Only non-delivered orders are re-fetched.<br/>
         Final states: <b>Delivered</b> · <b>RTO Delivered</b>
