@@ -160,6 +160,18 @@ const lightVars={'--bg':'#f5f5f0','--surface':'#fff','--surface2':'#efefea','--b
 
 type CacheEntry = Omit<Order,'source'>
 interface LegacyCacheEntry { d?:string; dt?:string; t?:string; s?:string; l?:string; p?:string }
+interface StoredCacheEntry {
+  sg?:string
+  dt?:string
+  t?:string
+  d?:string
+  v?:string
+  vn?:number
+  py?:string
+  s?:string
+  p?:string
+  l?:string
+}
 
 class OrderCache {
   private brandId: string
@@ -179,12 +191,29 @@ class OrderCache {
       const raw = localStorage.getItem(this.key())
       const parsed = raw ? JSON.parse(raw) : {}
       this.data = Object.fromEntries(
-        Object.entries(parsed || {}).map(([id, entry]) => [id, this.normalizeEntry(id, entry as CacheEntry | LegacyCacheEntry)])
+        Object.entries(parsed || {}).map(([id, entry]) => [id, this.normalizeEntry(id, entry as CacheEntry | LegacyCacheEntry | StoredCacheEntry)])
       )
     } catch { this.data = {} }
   }
 
-  private normalizeEntry(orderId: string, entry: CacheEntry | LegacyCacheEntry): CacheEntry {
+  private normalizeEntry(orderId: string, entry: CacheEntry | LegacyCacheEntry | StoredCacheEntry): CacheEntry {
+    const stored = entry as StoredCacheEntry
+    if ('sg' in stored || 'py' in stored || 'vn' in stored) {
+      return {
+        orderId: normalizeId(orderId) || orderId,
+        slug: stored.sg || this.brandSlug,
+        orderDate: stored.dt || 'N/A',
+        orderTime: stored.t || 'N/A',
+        dateYMD: stored.d || null,
+        value: stored.v || 'N/A',
+        valueNum: Number(stored.vn || 0),
+        payment: stored.py || 'N/A',
+        status: stored.s || 'N/A',
+        pincode: stored.p || 'N/A',
+        location: stored.l || 'N/A',
+      }
+    }
+
     const full = entry as Partial<CacheEntry>
     if ('orderDate' in full || 'payment' in full || 'value' in full) {
       return {
@@ -227,11 +256,29 @@ class OrderCache {
 
   private flush() {
     try {
-      localStorage.setItem(this.key(), JSON.stringify(this.data))
+      const serialized = Object.fromEntries(
+        Object.entries(this.data).map(([id, entry]) => [id, this.serializeEntry(entry)])
+      )
+      localStorage.setItem(this.key(), JSON.stringify(serialized))
       this.dirty = 0
     } catch(e) {
       console.error('OrderCache flush failed:', e, 'entries:', Object.keys(this.data).length)
       this.dirty = 0
+    }
+  }
+
+  private serializeEntry(entry: CacheEntry): StoredCacheEntry {
+    return {
+      sg: entry.slug || '',
+      dt: entry.orderDate || 'N/A',
+      t: entry.orderTime || 'N/A',
+      d: entry.dateYMD || '',
+      v: entry.value || 'N/A',
+      vn: Number(entry.valueNum || 0),
+      py: entry.payment || 'N/A',
+      s: entry.status || 'N/A',
+      p: entry.pincode || 'N/A',
+      l: entry.location || 'N/A',
     }
   }
 
