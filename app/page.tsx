@@ -168,8 +168,24 @@ class OrderCache {
   }
 
   private flush() {
-    try { localStorage.setItem(this.key(), JSON.stringify(this.data)) } catch {}
-    this.dirty = 0
+    try {
+      const json = JSON.stringify(this.data)
+      localStorage.setItem(this.key(), json)
+      this.dirty = 0
+    } catch(e: any) {
+      // Quota exceeded — keep only final-status entries to stay under limit
+      try {
+        const finalOnly = Object.fromEntries(
+          Object.entries(this.data).filter(([,o]:any) =>
+            FINAL_STATUSES.some(f => (o.status||'').toLowerCase().includes(f))
+          )
+        )
+        localStorage.setItem(this.key(), JSON.stringify(finalOnly))
+        this.data = finalOnly as any
+        this.dirty = 0
+        console.warn('Cache quota exceeded — kept only final-status orders')
+      } catch { this.dirty = 0 }
+    }
   }
 
   get(orderId: number|string): Order|null {
@@ -179,10 +195,26 @@ class OrderCache {
   set(orderId: number|string, order: Order) {
     this.data[String(orderId)] = order
     this.dirty++
-    if (this.dirty >= 50) this.flush()  // batch writes
+    if (this.dirty >= 200) this.flush()  // batch writes every 200
   }
 
-  save() { if (this.dirty > 0) this.flush() }
+  // Bulk load without intermediate flushes — single write at end
+  bulkLoad(orders: Order[], defaultSlug='') {
+    let added=0, skipped=0
+    orders.forEach(o => {
+      const key = String(o.orderId)
+      const existing = this.data[key]
+      // Don't overwrite a final-status entry with a non-final one
+      if (existing && FINAL_STATUSES.some(f => (existing.status||'').toLowerCase().includes(f))) {
+        skipped++; return
+      }
+      this.data[key] = {...o, slug: o.slug || defaultSlug}
+      added++
+    })
+    return { added, skipped }
+  }
+
+  save() { if (this.dirty > 0 || Object.keys(this.data).length > 0) this.flush() }
 
   isFinal(orderId: number|string): boolean {
     const o = this.data[String(orderId)]
@@ -210,9 +242,9 @@ class OrderCache {
     return Object.values(this.data).filter(o => o.dateYMD && o.dateYMD >= fromDate && o.dateYMD <= toDate)
   }
 
-  // Bytes used (approximate)
+  // Size in KB — computed from in-memory data (more reliable than re-reading localStorage)
   sizeKB(): number {
-    try { return Math.round((localStorage.getItem(this.key()) || '').length / 1024) } catch { return 0 }
+    try { return Math.round(JSON.stringify(this.data).length / 1024) } catch { return 0 }
   }
 }
 
@@ -614,6 +646,10 @@ export default function App(){
   function saveRun(brand:Brand,orders:Order[],label:string){
     const cleaned=uniqueOrders(orders)
     if(!cleaned.length)return
+    // Persist to cache — ensures cache is always up to date after every scan
+    const scanCache=new OrderCache(brand.id)
+    scanCache.bulkLoad(cleaned,brand.slug||brand.subdomain)
+    scanCache.save()
     const run:Run={runId:Date.now().toString(),dateRange:label,found:cleaned.length,orders:cleaned,createdAt:new Date().toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'numeric'})}
     const updated=[run,...LS.get<Run[]>(`runs_${brand.id}`,[])].slice(0,50)
     LS.set(`runs_${brand.id}`,updated);setRuns(updated);setLastOrders(cleaned);setAnalytics(buildAnalytics(cleaned))
@@ -1118,10 +1154,11 @@ function CachePanel({active,brands,forceRefresh,setForceRefresh}:any){
 
   const refresh=()=>{
     if(!active)return
-    const c=new OrderCache(active.id)
+    const c=new OrderCache(active.id)  // constructor calls load() → reads localStorage
     const s=c.stats()
     setStats({...s,sizeKB:c.sizeKB()})
     setCleared(false)
+    setImportResult('')  // clear any stale import message on manual refresh
   }
 
   useEffect(()=>{refresh()},[active?.id])
@@ -1178,18 +1215,14 @@ function CachePanel({active,brands,forceRefresh,setForceRefresh}:any){
             const parsed=parseFullReportCSV(text)
             if(!parsed.length){setImportResult('⚠ No orders found — make sure this is a Full Report CSV');return}
             const cache=new OrderCache(active.id)
-            let added=0,skipped=0
-            parsed.forEach(o=>{
-              // Don't overwrite existing cache entry if it has a better status
-              const existing=cache.get(o.orderId)
-              if(existing&&FINAL_STATUSES.some(f=>existing.status.toLowerCase().includes(f))){skipped++;return}
-              cache.set(o.orderId,{...o,slug:active.slug||active.subdomain})
-              added++
-            })
-            cache.save()
+            // bulkLoad = no intermediate flushes, single write at end
+            const {added,skipped}=cache.bulkLoad(parsed,active.slug||active.subdomain)
+            cache.save()  // single localStorage write for all orders
             const final=parsed.filter(o=>FINAL_STATUSES.some(f=>o.status.toLowerCase().includes(f))).length
+            // Update stats directly from in-memory cache (avoids stale read)
+            const newStats=cache.stats()
+            setStats({...newStats,sizeKB:cache.sizeKB()})
             setImportResult(`✓ Imported ${added} orders (${final} final/cached, ${skipped} already in cache)`)
-            refresh()
             // Also save as a run so dashboard shows historical data
             const byDate:Record<string,Order[]>={}
             parsed.forEach(o=>{if(o.dateYMD){if(!byDate[o.dateYMD])byDate[o.dateYMD]=[];byDate[o.dateYMD].push(o)}})
@@ -1201,6 +1234,12 @@ function CachePanel({active,brands,forceRefresh,setForceRefresh}:any){
               LS.set(`runs_${active.id}`,merged)
             }
             e.target.value=''
+            // Force a delayed refresh as safety net
+            setTimeout(()=>{
+              const c2=new OrderCache(active.id)
+              const s2=c2.stats()
+              setStats({...s2,sizeKB:c2.sizeKB()})
+            },300)
           }}/>
         </label>
         {importResult&&<div style={{fontSize:9,marginTop:6,padding:'5px 8px',borderRadius:4,background:importResult.startsWith('✓')?'#00ff8815':'#ff444415',border:`1px solid ${importResult.startsWith('✓')?'var(--accent)':'var(--red)'}`,color:importResult.startsWith('✓')?'var(--accent)':'var(--red)'}}>{importResult}</div>}
