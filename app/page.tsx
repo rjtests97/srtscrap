@@ -140,6 +140,83 @@ function buildWhatsappSummary(orders:Order[],brandName:string,dateRange:string){
 const darkVars={'--bg':'#0d0d0d','--surface':'#161616','--surface2':'#1e1e1e','--border':'#252525','--accent':'#00ff88','--warn':'#ff6b35','--text':'#e8e8e8','--muted':'#555','--red':'#ff4444'}
 const lightVars={'--bg':'#f5f5f0','--surface':'#fff','--surface2':'#efefea','--border':'#ddd','--accent':'#008844','--warn':'#cc5500','--text':'#111','--muted':'#888','--red':'#cc2222'}
 
+
+// ── Order Cache ───────────────────────────────────────
+// Persistent localStorage cache keyed by brandId + orderId
+// Delivered orders are never re-scanned (final state)
+// All other statuses are re-scanned on each run
+
+const FINAL_STATUSES = ['delivered', 'rto delivered']
+
+class OrderCache {
+  private brandId: string
+  private data: Record<string, Order> = {}
+  private dirty = 0  // pending writes
+
+  constructor(brandId: string) {
+    this.brandId = brandId
+    this.load()
+  }
+
+  private key() { return `ordercache_${this.brandId}` }
+
+  private load() {
+    try {
+      const raw = localStorage.getItem(this.key())
+      this.data = raw ? JSON.parse(raw) : {}
+    } catch { this.data = {} }
+  }
+
+  private flush() {
+    try { localStorage.setItem(this.key(), JSON.stringify(this.data)) } catch {}
+    this.dirty = 0
+  }
+
+  get(orderId: number|string): Order|null {
+    return this.data[String(orderId)] || null
+  }
+
+  set(orderId: number|string, order: Order) {
+    this.data[String(orderId)] = order
+    this.dirty++
+    if (this.dirty >= 50) this.flush()  // batch writes
+  }
+
+  save() { if (this.dirty > 0) this.flush() }
+
+  isFinal(orderId: number|string): boolean {
+    const o = this.data[String(orderId)]
+    if (!o) return false
+    const s = (o.status || '').toLowerCase().trim()
+    return FINAL_STATUSES.some(f => s.includes(f))
+  }
+
+  stats() {
+    const vals = Object.values(this.data)
+    const delivered = vals.filter(o => {
+      const s = (o.status||'').toLowerCase()
+      return FINAL_STATUSES.some(f => s.includes(f))
+    })
+    return { total: vals.length, delivered: delivered.length, active: vals.length - delivered.length }
+  }
+
+  clear() {
+    this.data = {}
+    try { localStorage.removeItem(this.key()) } catch {}
+  }
+
+  // Get all cached orders within a date range
+  getRange(fromDate: string, toDate: string): Order[] {
+    return Object.values(this.data).filter(o => o.dateYMD && o.dateYMD >= fromDate && o.dateYMD <= toDate)
+  }
+
+  // Bytes used (approximate)
+  sizeKB(): number {
+    try { return Math.round((localStorage.getItem(this.key()) || '').length / 1024) } catch { return 0 }
+  }
+}
+
+
 // ── Scanner ───────────────────────────────────────────
 // Architecture:
 //   - callProxy: raw HTTP, returns 'rl' on any failure
@@ -159,13 +236,19 @@ class Scanner {
   private onOrder:(o:Order)=>void
   private onStats?:(s:Partial<ScanStats>)=>void
 
+  private cache:OrderCache|null=null
+  private forceRefresh=false
+
   constructor(subdomain:string,slug:string,idPrefix:string,
     onLog:(m:string,c:string)=>void,
     onProgress:(done:number,total:number,found:number)=>void,
     onOrder:(o:Order)=>void,
-    onStats?:(s:Partial<ScanStats>)=>void){
+    onStats?:(s:Partial<ScanStats>)=>void,
+    cache?:OrderCache,
+    forceRefresh?:boolean){
     this.subdomain=subdomain;this.slug=slug;this.idPrefix=idPrefix
     this.onLog=onLog;this.onProgress=onProgress;this.onOrder=onOrder;this.onStats=onStats
+    this.cache=cache||null;this.forceRefresh=forceRefresh||false
   }
 
   stop(){this.stopped=true}
@@ -279,48 +362,69 @@ class Scanner {
 
   async scanRange(scanStart:number,scanEnd:number,fromDate:string,toDate:string,concurrency:number,startedAt:number):Promise<Order[]>{
     const orders:Order[]=[]
-    let scanned=0,matched=0,burstNum=0
+    let scanned=0,matched=0,fromCacheCount=0,burstNum=0
     let burstSize=Scanner.BURST_MAX
     const total=scanEnd-scanStart+1
 
     for(let base=scanStart;base<=scanEnd&&!this.stopped;){
       const burstEnd=Math.min(base+burstSize-1,scanEnd)
       burstNum++
-      this.onLog('Burst '+burstNum+' (sz='+burstSize+'): #'+this.toId(base)+' → #'+this.toId(burstEnd),'info')
 
+      // ── Cache check: split IDs into cached-final vs needs-fetch ──
+      const toFetch:number[]=[]
+      for(let id=base;id<=burstEnd;id++){
+        if(!this.forceRefresh&&this.cache?.isFinal(id)){
+          // Load from cache — no API call needed
+          const cached=this.cache.get(id)!
+          if(cached.dateYMD&&cached.dateYMD>=fromDate&&cached.dateYMD<=toDate){
+            orders.push(cached);matched++;fromCacheCount++;this.onOrder(cached)
+            this.onLog('#'+id+'  '+cached.orderDate+'  [cached '+cached.status+']','ok')
+          }
+          scanned++
+        }else{
+          toFetch.push(id)
+        }
+      }
+
+      const cacheHits=burstEnd-base+1-toFetch.length
+      if(cacheHits>0)this.onLog('Burst '+burstNum+': '+cacheHits+' from cache, '+toFetch.length+' to fetch','info')
+      else this.onLog('Burst '+burstNum+' (sz='+burstSize+'): #'+this.toId(base)+' → #'+this.toId(burstEnd),'info')
+
+      // ── Fetch non-cached IDs ──
       let rlInBurst=0
-      for(let b=base;b<=burstEnd&&!this.stopped;b+=concurrency){
-        const ids=Array.from({length:Math.min(concurrency,burstEnd-b+1)},(_,i)=>b+i)
+      for(let b=0;b<toFetch.length&&!this.stopped;b+=concurrency){
+        const ids=toFetch.slice(b,b+concurrency)
         const results=await this.fetchBatch(ids)
         for(let i=0;i<ids.length;i++){
           const o=results[i];scanned++
           if(o==='rl'){rlInBurst++;continue}
-          if(o!==null&&o.dateYMD&&o.dateYMD>=fromDate&&o.dateYMD<=toDate){
-            orders.push(o);matched++;this.onOrder(o)
-            this.onLog('#'+ids[i]+'  '+o.orderDate+'  '+o.value+'  '+o.payment+'  '+o.location+'  '+o.pincode,'ok')
+          if(o!==null){
+            this.cache?.set(ids[i],o)  // save to cache
+            if(o.dateYMD&&o.dateYMD>=fromDate&&o.dateYMD<=toDate){
+              orders.push(o);matched++;this.onOrder(o)
+              this.onLog('#'+ids[i]+'  '+o.orderDate+'  '+o.value+'  '+o.payment+'  '+o.location+'  '+o.pincode,'ok')
+            }
           }
         }
         this.onProgress(scanStart+scanned-1,scanEnd,matched)
         await sleep(120)
       }
 
-      // Adapt burst size based on RL hits
-      if(rlInBurst>0){
-        burstSize=Math.max(Scanner.BURST_MIN,Math.floor(burstSize/2))
-        this.onLog('Throttling detected — reduced burst to '+burstSize+' IDs','info')
-      }else if(burstSize<Scanner.BURST_MAX){
-        burstSize=Math.min(Scanner.BURST_MAX,burstSize+10)
-      }
+      this.cache?.save()  // flush cache after each burst
+
+      if(rlInBurst>0){burstSize=Math.max(Scanner.BURST_MIN,Math.floor(burstSize/2));this.onLog('Throttling — burst reduced to '+burstSize,'info')}
+      else if(burstSize<Scanner.BURST_MAX){burstSize=Math.min(Scanner.BURST_MAX,burstSize+10)}
 
       base=burstEnd+1
       if(base>scanEnd||this.stopped)break
 
       const pct=Math.round(scanned/total*100)
       const rest=rlInBurst>0?Scanner.REST_BASE*2:Scanner.REST_BASE
-      this.onLog('Rest '+(rest/1000)+'s — burst '+burstNum+' | '+matched+' found | '+pct+'%','info')
+      this.onLog('Rest '+(rest/1000)+'s | '+matched+' found ('+fromCacheCount+' cache) | '+pct+'%','info')
       this.onStats?.({lastMatchedId:matched>0?Scanner.numericPart(orders[orders.length-1].orderId):null})
       for(let t=0;t<rest&&!this.stopped;t+=300)await sleep(Math.min(300,rest-t))
     }
+    this.cache?.save()
     return orders
   }
 
@@ -354,15 +458,28 @@ class Scanner {
       burstNum++
       this.onLog('Burst '+burstNum+' (sz='+burstSize+'): #'+this.toId(base)+' → #'+this.toId(burstEnd),'info')
 
+      // Cache check for manual scan
+      const toFetchM:number[]=[]
+      for(let id=base;id<=burstEnd;id++){
+        if(!this.forceRefresh&&this.cache?.isFinal(id)){
+          const cached=this.cache.get(id)!
+          orders.push(cached);matched++;consNulls=0
+          lastGoodId=id;this.onOrder(cached)
+          this.onLog('#'+id+'  '+cached.orderDate+'  [cached '+cached.status+']','ok')
+          scanned++
+        }else toFetchM.push(id)
+      }
+
       let rlInBurst=0
-      for(let b=base;b<=burstEnd&&!this.stopped;b+=concurrency){
-        const ids=Array.from({length:Math.min(concurrency,burstEnd-b+1)},(_,i)=>b+i)
+      for(let b=0;b<toFetchM.length&&!this.stopped;b+=concurrency){
+        const ids=toFetchM.slice(b,b+concurrency)
         const results=await this.fetchBatch(ids)
 
         for(let i=0;i<ids.length&&!this.stopped;i++){
           const o=results[i];scanned++
           if(o==='rl'){rlInBurst++;continue}
           if(o!==null){
+            this.cache?.set(ids[i],o)
             orders.push(o);matched++;consNulls=0;cleanBursts=0
             lastGoodId=ids[i]
             this.onStats?.({lastMatchedId:Scanner.numericPart(o.orderId)})
@@ -416,10 +533,12 @@ class Scanner {
 
       // Longer rest after RL cooldowns to let rate limit fully reset
       const rest=rlCooldowns>0?Scanner.REST_BASE*2:Scanner.REST_BASE
+      this.cache?.save()
       this.onLog('Rest '+(rest/1000)+'s — burst '+burstNum+' | '+matched+' found | '+consNulls+' null streak','info')
       this.onStats?.({retries:this.rlStreak})
       for(let t=0;t<rest&&!this.stopped;t+=300)await sleep(Math.min(300,rest-t))
     }
+    this.cache?.save()
     return orders
   }
 }
@@ -440,6 +559,7 @@ export default function App(){
   const[scanStats,setScanStats]=useState<ScanStats>({retries:0,recovered:0,duplicates:0,gapJumps:0,lastMatchedId:null})
   const[startedAt,setStartedAt]=useState(0)
   const[scanLabel,setScanLabel]=useState('')
+  const[forceRefresh,setForceRefresh]=useState(false)
   const[showAdd,setShowAdd]=useState(false)
   const scannerRef=useRef<Scanner|null>(null)
   const logRef=useRef<HTMLDivElement>(null)
@@ -556,7 +676,11 @@ export default function App(){
     setProgress({done:0,total:0,found:0});setStartedAt(Date.now());setScanLabel(`${fromDate} → ${toDate}`)
     if('wakeLock' in navigator){try{(navigator as any).wakeLock.request('screen').catch(()=>{})}catch{}}
     addLog('⚠ Keep this tab active — switching tabs may pause the scan','info')
-    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)))
+    const cache=new OrderCache(brand.id)
+    const cs=cache.stats()
+    if(cs.total>0&&!forceRefresh)addLog(`Cache: ${cs.delivered} delivered (skip) + ${cs.active} active (rescan) — ${cache.sizeKB()}KB`,'ok')
+    if(forceRefresh)addLog('Force refresh: ignoring all cache','info')
+    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)),cache,forceRefresh)
     scannerRef.current=scanner
     try{
       addLog(`Finding boundaries for ${fromDate} → ${toDate}...`,'info')
@@ -586,7 +710,10 @@ export default function App(){
     addLog(`Manual: #${brand.idPrefix||''}${startId}–${useAuto?'auto':'#'+(brand.idPrefix||'')+endId} | ${concurrency}x`,'info')
     if(useAuto&&safeStopAfter!==stopAfter)addLog(`Raised auto-stop from ${stopAfter} to ${safeStopAfter} for safer scanning`,'info')
     if(useAuto)addLog(`Auto hard cap set to #${brand.idPrefix||''}${autoHardCap} based on current brand velocity`,'info')
-    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)))
+    const cacheM=new OrderCache(brand.id)
+    const csM=cacheM.stats()
+    if(csM.total>0&&!forceRefresh)addLog(`Cache: ${csM.delivered} delivered (skip) + ${csM.active} active | ${cacheM.sizeKB()}KB`,'ok')
+    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)),cacheM,forceRefresh)
     scannerRef.current=scanner
     try{
       const maxId=useAuto?autoHardCap:endId
@@ -654,8 +781,8 @@ export default function App(){
 
           {(tab==='date'||tab==='manual')&&(
             <>
-              {tab==='date'&&<DateTab active={active} scanning={scanning} scanLabel={scanLabel} onStart={(f:string,t:string,c:number)=>startDateScan(f,t,c)} inp={inp} lbl={lbl}/>}
-              {tab==='manual'&&<ManualTab active={active} scanning={scanning} scanLabel={scanLabel} onStart={(si:number,ei:number,c:number,ua:boolean,sa:number)=>startManualScan(si,ei,c,ua,sa)} inp={inp} lbl={lbl}/>}
+              {tab==='date'&&<DateTab active={active} scanning={scanning} scanLabel={scanLabel} onStart={(f:string,t:string,c:number)=>startDateScan(f,t,c)} inp={inp} lbl={lbl} forceRefresh={forceRefresh} setForceRefresh={setForceRefresh}/>}
+              {tab==='manual'&&<ManualTab active={active} scanning={scanning} scanLabel={scanLabel} onStart={(si:number,ei:number,c:number,ua:boolean,sa:number)=>startManualScan(si,ei,c,ua,sa)} inp={inp} lbl={lbl} forceRefresh={forceRefresh} setForceRefresh={setForceRefresh}/>}
               {scanning&&(
                 <div style={{marginBottom:10}}>
                   <div style={{display:'flex',justifyContent:'space-between',fontSize:10,color:'var(--muted)',marginBottom:5}}>
@@ -690,7 +817,7 @@ export default function App(){
           {tab==='analytics'&&<AnalyticsTab analytics={analytics}/>}
           {tab==='compare'&&<CompareTab brands={brands}/>}
           {tab==='history'&&<HistoryTab runs={runs} brandName={active.name} onClear={()=>{localStorage.removeItem(`runs_${active.id}`);setRuns([]);setLastOrders([]);setAnalytics(null)}}/>}
-          {tab==='settings'&&<SettingsTab brands={brands} active={active} runs={runs} onDelete={deleteBrand} onSync={(url:string,orders:Order[])=>syncToSheets(url,orders)} inp={inp} lbl={lbl}/>}
+          {tab==='settings'&&<SettingsTab brands={brands} active={active} runs={runs} onDelete={deleteBrand} onSync={(url:string,orders:Order[])=>syncToSheets(url,orders)} inp={inp} lbl={lbl} forceRefresh={forceRefresh} setForceRefresh={setForceRefresh}/>}
         </>
       )}
     </div>
@@ -785,7 +912,7 @@ function DashboardStrip({runs}:{runs:Run[]}){
   )
 }
 
-function DateTab({active,scanning,scanLabel,onStart,inp,lbl}:any){
+function DateTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setForceRefresh}:any){
   const[from,setFrom]=useState(yestStr());const[to,setTo]=useState(todayStr());const[conc,setConc]=useState('5')
   const presetBtn=(label:string,f:string,t:string)=><button key={label} onClick={()=>{setFrom(f);setTo(t)}} style={{background:'var(--surface)',border:'1px solid var(--border)',color:'var(--muted)',padding:'6px 10px',borderRadius:20,fontSize:9,fontFamily:'inherit',cursor:'pointer'}}>{label}</button>
   return(
@@ -812,6 +939,10 @@ function DateTab({active,scanning,scanLabel,onStart,inp,lbl}:any){
             <select value={conc} onChange={e=>setConc(e.target.value)} style={{...inp,width:'auto',padding:'5px 8px',fontSize:11}}>{['3','5','8','10','15'].map(v=><option key={v} value={v}>{v}</option>)}</select>
             <span style={{fontSize:9}}>(higher = faster)</span>
           </div>
+          <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:8,padding:'6px 10px',background:'var(--surface)',borderRadius:6,border:'1px solid var(--border)'}}>
+            <input type="checkbox" id="fr_date" checked={forceRefresh} onChange={(e:any)=>setForceRefresh(e.target.checked)} style={{accentColor:'var(--accent)',width:13,height:13,cursor:'pointer'}}/>
+            <label htmlFor="fr_date" style={{fontSize:9,color:'var(--muted)',cursor:'pointer',lineHeight:1.4}}>Force Refresh — re-scan all IDs, ignore cache (slow)</label>
+          </div>
           <button onClick={()=>onStart(from,to,parseInt(conc))} style={{width:'100%',background:'var(--accent)',color:'#000',border:'none',padding:11,borderRadius:8,fontSize:12,fontWeight:700,letterSpacing:'.06em',textTransform:'uppercase',marginBottom:12,fontFamily:'inherit',cursor:'pointer'}}>🔍 FIND &amp; SCRAPE</button>
         </>
       )}
@@ -819,7 +950,7 @@ function DateTab({active,scanning,scanLabel,onStart,inp,lbl}:any){
   )
 }
 
-function ManualTab({active,scanning,scanLabel,onStart,inp,lbl}:any){
+function ManualTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setForceRefresh}:any){
   const[startId,setStartId]=useState('');const[endId,setEndId]=useState('');const[useAuto,setUseAuto]=useState(false);const[stopAfter,setStopAfter]=useState('500');const[conc,setConc]=useState('5')
   const pfx=active.idPrefix||''
   const recommendedStop=recommendedAutoStop(parseInt(conc)||5,active?.avgPerDay||0)
@@ -853,6 +984,10 @@ function ManualTab({active,scanning,scanLabel,onStart,inp,lbl}:any){
             if(!useAuto&&!parsedEnd){alert('Enter a valid numeric End ID');return}
             onStart(parsedStart,parsedEnd,parseInt(conc),useAuto,parseInt(stopAfter))
           }} style={{width:'100%',background:'var(--accent)',color:'#000',border:'none',padding:11,borderRadius:8,fontSize:12,fontWeight:700,letterSpacing:'.06em',textTransform:'uppercase',marginBottom:12,fontFamily:'inherit',cursor:'pointer'}}>▶ START MANUAL SCRAPE</button>
+          <div style={{display:'flex',alignItems:'center',gap:8,marginTop:-6,marginBottom:8,padding:'6px 10px',background:'var(--surface)',borderRadius:6,border:'1px solid var(--border)'}}>
+            <input type="checkbox" id="fr_manual" checked={forceRefresh} onChange={(e:any)=>setForceRefresh(e.target.checked)} style={{accentColor:'var(--accent)',width:13,height:13,cursor:'pointer'}}/>
+            <label htmlFor="fr_manual" style={{fontSize:9,color:'var(--muted)',cursor:'pointer',lineHeight:1.4}}>Force Refresh — re-scan all IDs, ignore cache (slow)</label>
+          </div>
         </>
       )}
     </div>
@@ -942,7 +1077,69 @@ function HistoryTab({runs,brandName,onClear}:{runs:Run[],brandName:string,onClea
   )
 }
 
-function SettingsTab({brands,active,runs,onDelete,onSync,inp,lbl}:any){
+function CachePanel({active,brands,forceRefresh,setForceRefresh}:any){
+  const[stats,setStats]=useState<{total:number,delivered:number,active:number,sizeKB:number}|null>(null)
+  const[cleared,setCleared]=useState(false)
+
+  const refresh=()=>{
+    if(!active)return
+    const c=new OrderCache(active.id)
+    const s=c.stats()
+    setStats({...s,sizeKB:c.sizeKB()})
+    setCleared(false)
+  }
+
+  useEffect(()=>{refresh()},[active?.id])
+
+  function clearCache(){
+    if(!active)return
+    if(!confirm(`Clear all cached orders for ${active.name}? This will NOT delete run history. Next scan will re-fetch all orders.`))return
+    new OrderCache(active.id).clear()
+    setStats({total:0,delivered:0,active:0,sizeKB:0})
+    setCleared(true)
+  }
+
+  const pct=stats?.total?Math.round(stats.delivered/stats.total*100):0
+
+  return(
+    <div style={{background:'var(--surface)',border:'1px solid var(--border)',borderRadius:8,padding:14,marginBottom:14}}>
+      <div style={{fontSize:10,fontWeight:700,color:'var(--accent)',marginBottom:8,textTransform:'uppercase',letterSpacing:'.06em'}}>⚡ Order Cache</div>
+      {!stats||stats.total===0?(
+        <div style={{fontSize:10,color:'var(--muted)'}}>No cache yet — run a scan to build the cache. Subsequent scans will skip Delivered orders automatically.</div>
+      ):(
+        <>
+          <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:6,marginBottom:10}}>
+            {[['Total',stats.total,'var(--text)'],['Delivered',stats.delivered,'var(--accent)'],['Active',stats.active,'var(--warn)'],['Size',stats.sizeKB+'KB','var(--muted)']].map(([l,v,c])=>(
+              <div key={l} style={{background:'var(--surface2)',borderRadius:6,padding:'8px',textAlign:'center'}}>
+                <div style={{fontSize:16,fontWeight:700,color:c as string}}>{v}</div>
+                <div style={{fontSize:8,color:'var(--muted)',marginTop:2}}>{l}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{background:'var(--bg)',borderRadius:4,height:6,overflow:'hidden',marginBottom:8}}>
+            <div style={{height:'100%',background:'var(--accent)',width:pct+'%',borderRadius:4,transition:'width .3s'}}/>
+          </div>
+          <div style={{fontSize:9,color:'var(--muted)',marginBottom:10}}>{pct}% delivered (cached) · {100-pct}% active (will rescan)</div>
+        </>
+      )}
+      <div style={{display:'flex',gap:6,alignItems:'center',flexWrap:'wrap'}}>
+        <button onClick={refresh} style={{fontSize:9,padding:'5px 10px',background:'var(--surface2)',border:'1px solid var(--border)',borderRadius:4,color:'var(--text)',cursor:'pointer'}}>Refresh Stats</button>
+        {stats&&stats.total>0&&<button onClick={clearCache} style={{fontSize:9,padding:'5px 10px',background:'var(--surface2)',border:'1px solid var(--red)',borderRadius:4,color:'var(--red)',cursor:'pointer'}}>Clear Cache</button>}
+        <div style={{display:'flex',alignItems:'center',gap:6,marginLeft:'auto'}}>
+          <input type="checkbox" id="fr_settings" checked={forceRefresh} onChange={(e:any)=>setForceRefresh(e.target.checked)} style={{accentColor:'var(--accent)',width:13,height:13,cursor:'pointer'}}/>
+          <label htmlFor="fr_settings" style={{fontSize:9,color:'var(--muted)',cursor:'pointer'}}>Force Refresh (ignore cache)</label>
+        </div>
+      </div>
+      {cleared&&<div style={{fontSize:9,color:'var(--accent)',marginTop:6}}>✓ Cache cleared</div>}
+      <div style={{fontSize:8,color:'var(--muted)',marginTop:8,lineHeight:1.7}}>
+        <b>How it works:</b> Delivered orders are saved permanently. On the next scan, they load from cache instantly — no API calls. Only non-delivered orders are re-fetched.<br/>
+        Final states: <b>Delivered</b> · <b>RTO Delivered</b>
+      </div>
+    </div>
+  )
+}
+
+function SettingsTab({brands,active,runs,onDelete,onSync,inp,lbl,forceRefresh,setForceRefresh}:any){
   const[url,setUrl]=useState(()=>LS.get(`sheets_${active?.id}`,''));const[status,setStatus]=useState('');const[busy,setBusy]=useState(false)
   useEffect(()=>setUrl(LS.get(`sheets_${active?.id}`,'')),[ active?.id])
   const btn=(e:any={})=>({background:'var(--surface)',border:'1px solid var(--border)',color:'var(--text)',padding:'8px 12px',borderRadius:6,fontSize:10,fontWeight:700,fontFamily:'inherit',cursor:'pointer',...e})
@@ -1003,6 +1200,9 @@ function SettingsTab({brands,active,runs,onDelete,onSync,inp,lbl}:any){
 
   return(
     <div>
+      {/* Cache Management */}
+      <CachePanel active={active} brands={brands} forceRefresh={forceRefresh} setForceRefresh={setForceRefresh}/>
+
       {/* Telegram */}
       <div style={{background:'var(--surface)',border:'1px solid var(--border)',borderRadius:8,padding:14,marginBottom:14}}>
         <div style={{fontSize:10,fontWeight:700,color:'var(--accent)',marginBottom:4,textTransform:'uppercase',letterSpacing:'.06em'}}>📱 Telegram Daily Report</div>
