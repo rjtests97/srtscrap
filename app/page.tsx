@@ -247,11 +247,8 @@ class OrderCache {
     }
   }
 
-  private isCompleteEntry(entry: CacheEntry) {
-    return !!entry.orderDate && entry.orderDate !== 'N/A'
-      && !!entry.status && entry.status !== 'N/A'
-      && !!entry.location && entry.location !== 'N/A'
-      && !!entry.pincode && entry.pincode !== 'N/A'
+  private canTreatAsFinal(entry: CacheEntry) {
+    return isFinalStatus(entry.status)
   }
 
   private flush() {
@@ -316,7 +313,7 @@ class OrderCache {
       const key = String(o.orderId)
       const incoming = this.compact({ ...stripSource(o), slug: o.slug || defaultSlug || this.brandSlug })
       const ex = this.data[key]
-      if (ex && isFinalStatus(ex.status) && this.isCompleteEntry(ex) && isFinalStatus(incoming.status)) { skipped++; return }
+      if (ex && this.canTreatAsFinal(ex) && isFinalStatus(incoming.status)) { skipped++; return }
       this.data[key] = incoming
       added++
     })
@@ -328,7 +325,7 @@ class OrderCache {
 
   isFinal(orderId: number|string): boolean {
     const e = this.data[String(orderId)]
-    return e ? isFinalStatus(e.status) && this.isCompleteEntry(e) : false
+    return e ? this.canTreatAsFinal(e) : false
   }
 
   getRange(fromDate:string,toDate:string):Order[] {
@@ -339,7 +336,7 @@ class OrderCache {
 
   stats() {
     const keys = Object.keys(this.data)
-    const delivered = keys.filter(k => isFinalStatus(this.data[k].status) && this.isCompleteEntry(this.data[k])).length
+    const delivered = keys.filter(k => this.canTreatAsFinal(this.data[k])).length
     return { total: keys.length, delivered, active: keys.length - delivered }
   }
 
