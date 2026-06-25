@@ -83,6 +83,21 @@ setup beyond pasting the script. It shows:
 It recomputes on every sync (manual or the daily cron). You can also force a
 refresh anytime by opening the `/exec` URL in a browser.
 
+## In-Sheet menu (⚡ srtscrap)
+
+After deploying, reload the Sheet once — a **⚡ srtscrap** menu appears with:
+
+- **Refresh Dashboard** — recompute the dashboard on demand (it also auto-rebuilds
+  on every sync, so this is just a manual nudge).
+- **Run scan now (yesterday)** / **Run scan for a date…** — kick the Vercel scan
+  from inside the Sheet. To enable these, set `CRON_URL` (and `CRON_SECRET` if
+  you use one) at the top of the Apps Script:
+
+  ```js
+  var CRON_URL    = 'https://srtscrap.vercel.app/api/cron/scan';
+  var CRON_SECRET = 'your-secret';   // optional, matches Vercel CRON_SECRET
+  ```
+
 ## Notes
 
 - Rows are **upserted by Order ID**, so re-running a day never duplicates —

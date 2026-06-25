@@ -22,6 +22,43 @@ var TZ = 'Asia/Kolkata';
 var H = ['Order ID','Date','Time','Value','Payment','Status','Location','Pincode','dateYMD','Updated'];
 var MON = { Jan:'01',Feb:'02',Mar:'03',Apr:'04',May:'05',Jun:'06',Jul:'07',Aug:'08',Sep:'09',Oct:'10',Nov:'11',Dec:'12' };
 
+// ── Optional: run a scan from inside the Sheet (⚡ srtscrap menu) ──
+// Fill these to enable "Run scan now". Leave blank to just use Refresh Dashboard.
+var CRON_URL    = '';   // e.g. https://srtscrap.vercel.app/api/cron/scan
+var CRON_SECRET = '';   // the CRON_SECRET you set in Vercel (optional)
+
+// Adds the menu when the spreadsheet opens (reload the sheet once after deploy).
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('⚡ srtscrap')
+    .addItem('Refresh Dashboard', 'menuRefresh')
+    .addItem('Run scan now (yesterday)', 'menuScanYesterday')
+    .addItem('Run scan for a date…', 'menuScanDate')
+    .addToUi();
+}
+
+function menuRefresh() {
+  rebuildDashboard(SpreadsheetApp.getActiveSpreadsheet());
+  SpreadsheetApp.getActiveSpreadsheet().toast('Dashboard refreshed', '⚡ srtscrap', 4);
+}
+
+function triggerScan(date) {
+  if (!CRON_URL) { SpreadsheetApp.getUi().alert('Set CRON_URL at the top of the script first.'); return; }
+  var u = CRON_URL + '?' + (date ? 'date=' + date + '&' : '') + (CRON_SECRET ? 'secret=' + CRON_SECRET : '');
+  UrlFetchApp.fetch(u, { muteHttpExceptions: true });
+  SpreadsheetApp.getActiveSpreadsheet().toast('Scan triggered' + (date ? ' for ' + date : ' (yesterday)') + ' — rows arrive in a moment', '⚡ srtscrap', 6);
+}
+
+function menuScanYesterday() { triggerScan(''); }
+
+function menuScanDate() {
+  var ui = SpreadsheetApp.getUi();
+  var resp = ui.prompt('Scan a date', 'Enter date as YYYY-MM-DD:', ui.ButtonSet.OK_CANCEL);
+  if (resp.getSelectedButton() !== ui.Button.OK) return;
+  var d = resp.getResponseText().trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(d)) triggerScan(d);
+  else ui.alert('Invalid date — use YYYY-MM-DD.');
+}
+
 // Resolve a row's YYYY-MM-DD. Handles three forms because Google Sheets often
 // auto-converts date-looking text into real Date cells:
 //   1. dateYMD cell as a Date object  -> format it
