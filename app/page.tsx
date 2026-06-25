@@ -2,7 +2,7 @@
 import { useState, useEffect, useRef, useCallback, ChangeEvent } from 'react'
 
 interface Brand { id:string; name:string; subdomain:string; slug:string; companyName:string; anchorId:number; anchorDate:string; avgPerDay:number; regressionPoints:Array<{date:string,id:number}>; idPrefix:string }
-interface Order { orderId:number|string; slug:string; orderDate:string; orderTime:string; dateYMD:string|null; value:string; valueNum:number; payment:string; status:string; pincode:string; location:string; source?:'cache'|'fresh' }
+interface Order { orderId:number|string; slug:string; orderDate:string; orderTime:string; dateYMD:string|null; value:string; valueNum:number; payment:string; status:string; pincode:string; location:string; source?:'cache'|'fresh'; archived?:boolean; awb?:string|null; deliveredDate?:string|null }
 interface Run { runId:string; dateRange:string; found:number; orders:Order[]; createdAt:string }
 interface Analytics {
   totalOrders:number
@@ -515,7 +515,8 @@ class Scanner {
   async scanRange(scanStart:number,scanEnd:number,fromDate:string,toDate:string,concurrency:number,startedAt:number):Promise<Order[]>{
     const orders:Order[]=[]
     let scanned=0,matched=0,fromCacheCount=0,burstNum=0
-    let burstSize=Scanner.BURST_MAX
+    // Warm up small so the first burst doesn't trip rate limiting; grows on clean bursts.
+    let burstSize=Scanner.BURST_MIN
     const total=scanEnd-scanStart+1
 
     for(let base=scanStart;base<=scanEnd&&!this.stopped;){
@@ -585,8 +586,9 @@ class Scanner {
     const orders:Order[]=[]
     let scanned=0,matched=0,consNulls=0,burstNum=0
     let lastGoodId:number|null=null
-    // Adaptive burst: shrinks on RL, recovers after clean bursts
-    let burstSize=Scanner.BURST_MAX
+    // Adaptive burst: warm up small, grow on clean bursts, shrink on RL.
+    // Starting at BURST_MIN avoids tripping the rate limiter on the very first try.
+    let burstSize=Scanner.BURST_MIN
     let cleanBursts=0      // consecutive bursts with no RL
     let rlCooldowns=0      // total RL cooldowns taken (for escalating wait)
 
@@ -638,7 +640,9 @@ class Scanner {
             lastGoodId=ids[i]
             this.onStats?.({lastMatchedId:Scanner.numericPart(fo.orderId)})
             this.onOrder(fo)
-            this.onLog('#'+ids[i]+'  '+fo.orderDate+'  '+fo.value+'  '+fo.payment+'  '+fo.location,'ok')
+            this.onLog(fo.archived
+              ?'#'+ids[i]+'  [archived '+fo.status+']  '+fo.orderDate+(fo.deliveredDate?'  delivered '+fo.deliveredDate:'')
+              :'#'+ids[i]+'  '+fo.orderDate+'  '+fo.value+'  '+fo.payment+'  '+fo.location,'ok')
           }else{
             consNulls++
             // Reached null threshold — check if rate-limited before stopping/waiting
