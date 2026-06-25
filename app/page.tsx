@@ -37,7 +37,10 @@ const esc=(v:any)=>`"${String(v??'').replace(/"/g,'""')}"`
 const fmt=(n:number)=>'Rs.'+Number(n||0).toFixed(2)
 const RTO=new Set(['HUB','ETAIL','E-TAIL','SORTING','GATEWAY','DEPOT','FACILITY','WAREHOUSE','PROCESSING','COUNTER','DISPATCH','SURFACE'])
 const isRTO=(c:string)=>{const u=(c||'').toUpperCase().trim();if(!u||u==='N/A')return true;return u.split(/[\s,\-]+/).some(w=>RTO.has(w))}
-const recommendedAutoStop=(concurrency:number,avgPerDay:number)=>Math.max(250,concurrency*100,Math.ceil((avgPerDay||0)*4))
+// Order IDs are contiguous (no gaps), so a short consecutive-miss streak
+// reliably means the end of the range. ~100 is plenty; scale mildly with
+// concurrency since a wide batch can overshoot the true end.
+const recommendedAutoStop=(concurrency:number,_avgPerDay:number)=>Math.max(100,concurrency*10)
 const uniqueOrders=(orders:Order[])=>Object.values(Object.fromEntries(orders.map(o=>[String(o.orderId),o])))
 const mergeScanStats=(prev:ScanStats,patch:Partial<ScanStats>):ScanStats=>({
   retries: prev.retries + (patch.retries||0),
@@ -52,7 +55,13 @@ const normalizeId=(v:any):number=>{
   return Number.isFinite(n)&&n>0?Math.floor(n):0
 }
 const normalizeStatus=(status:string)=>String(status||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim()
+// "delivered" — used for the daily-report delivered COUNT (delivered only).
 const isFinalStatus=(status:string)=>normalizeStatus(status)==='delivered'
+// Terminal statuses that never change again → safe to serve from cache and
+// never re-scan. Everything else (Pending, In Transit, Picked Up, …) may still
+// transition, so it gets re-checked each scan.
+const TERMINAL_STATUSES=new Set(['delivered','rto delivered','cancelled','lost'])
+const isTerminalStatus=(status:string)=>TERMINAL_STATUSES.has(normalizeStatus(status))
 const stripSource=(order:Order):Order=>{
   const { source, ...rest } = order
   return rest
@@ -269,7 +278,7 @@ class OrderCache {
   }
 
   private canTreatAsFinal(entry: CacheEntry) {
-    return isFinalStatus(entry.status)
+    return isTerminalStatus(entry.status)
   }
 
   private flush() {
@@ -340,7 +349,7 @@ class OrderCache {
       const key = String(o.orderId)
       const incoming = this.compact({ ...stripSource(o), slug: o.slug || defaultSlug || this.brandSlug })
       const ex = this.data[key]
-      if (ex && this.canTreatAsFinal(ex) && isFinalStatus(incoming.status)) { skipped++; return }
+      if (ex && this.canTreatAsFinal(ex) && isTerminalStatus(incoming.status)) { skipped++; return }
       this.data[key] = incoming
       added++
     })
@@ -512,11 +521,27 @@ class Scanner {
     return{scanStart,scanEnd}
   }
 
-  // Adaptive burst controller
-  // Starts at BURST_MAX, halves on RL cooldown, recovers slowly
-  private static BURST_MAX=80
-  private static BURST_MIN=10
-  private static REST_BASE=3000  // ms between bursts
+  // Reconcile a freshly-fetched order with whatever we already hold in cache.
+  // Archived pages are masked (no value/date/location). If we already captured
+  // this order's full data, keep the rich fields and only adopt the latest
+  // status + delivered date from the archived page — so a Pending→Delivered
+  // transition is recorded (and the order becomes terminal/skippable) without
+  // losing the data we can no longer fetch.
+  private reconcile(id:number, fetched:Order):Order{
+    if(!fetched.archived) return {...fetched, source:'fresh'}
+    const prior=this.cache?.get(id)
+    if(prior&&prior.dateYMD){
+      return {...prior, status:fetched.status||prior.status, deliveredDate:fetched.deliveredDate??prior.deliveredDate, source:'cache'}
+    }
+    return {...fetched, source:'fresh'}
+  }
+
+  // Adaptive burst controller. There is no real server-side rate limit (the
+  // origin answers every request in ~0.3s), so rests are short; the adaptive
+  // shrink/grow only kicks in on genuine transient errors (timeouts).
+  private static BURST_MAX=120
+  private static BURST_MIN=20
+  private static REST_BASE=400   // ms between bursts
 
   async scanRange(scanStart:number,scanEnd:number,fromDate:string,toDate:string,concurrency:number,startedAt:number):Promise<Order[]>{
     const orders:Order[]=[]
@@ -558,10 +583,9 @@ class Scanner {
           const o=results[i];scanned++
           if(o==='rl'){rlInBurst++;continue}
           if(o!==null){
-            // Prefer richer cached data if this order is now archived (masked).
-            const prior=o.archived?this.cache?.get(ids[i]):null
-            const tagged:Order=prior&&prior.dateYMD?{...prior,source:'cache' as const}:{...o,source:'fresh' as const}
-            if(!(prior&&prior.dateYMD))this.cache?.set(ids[i],tagged)  // save to cache
+            // Merge archived (masked) results onto any richer cached record.
+            const tagged=this.reconcile(ids[i],o)
+            this.cache?.set(ids[i],tagged)  // save to cache
             if(tagged.dateYMD&&tagged.dateYMD>=fromDate&&tagged.dateYMD<=toDate){
               orders.push(tagged);matched++;this.onOrder(tagged)
               this.onLog('#'+ids[i]+'  '+tagged.orderDate+'  '+tagged.value+'  '+tagged.payment+'  '+tagged.location+'  '+tagged.pincode,'ok')
@@ -593,121 +617,74 @@ class Scanner {
   async scanManual(startId:number,endId:number,concurrency:number,useAuto:boolean,stopAfter:number,startedAt:number):Promise<Order[]>{
     const orders:Order[]=[]
     let scanned=0,matched=0,consNulls=0,burstNum=0
-    let lastGoodId:number|null=null
-    // Adaptive burst: warm up small, grow on clean bursts, shrink on RL.
-    // Starting at BURST_MIN avoids tripping the rate limiter on the very first try.
+    let cacheHits=0,fetched=0,statusUpdates=0
+    // Warm up small, grow on clean bursts, shrink only on genuine transient errors.
     let burstSize=Scanner.BURST_MIN
-    let cleanBursts=0      // consecutive bursts with no RL
-    let rlCooldowns=0      // total RL cooldowns taken (for escalating wait)
+    let cleanBursts=0
+    let ended=false
 
-    // Check if we're rate-limited by probing a known-good ID 3 times
-    // Only declare "genuine end" if ALL 3 probes return a real order
-    const isRateLimited=async():Promise<boolean>=>{
-      if(!lastGoodId)return false
-      this.onLog('Verifying x3 on #'+this.toId(lastGoodId)+'...','info')
-      let successCount=0
-      for(let i=0;i<3;i++){
-        const r=(await this.callProxy([lastGoodId]))[0]
-        if(r&&r!=='rl'&&r!==null)successCount++
-        await sleep(2000)
-      }
-      const rl=successCount<3  // rate limited if ANY probe fails
-      this.onLog(rl?'Rate limited ('+successCount+'/3 probes succeeded)':'All 3 probes OK — genuine end','info')
-      return rl
-    }
-
-    for(let base=startId;base<=endId&&!this.stopped;){
+    for(let base=startId;base<=endId&&!this.stopped&&!ended;){
       const burstEnd=Math.min(base+burstSize-1,endId)
       burstNum++
-      this.onLog('Burst '+burstNum+' (sz='+burstSize+'): #'+this.toId(base)+' → #'+this.toId(burstEnd),'info')
 
-      // Cache check for manual scan
+      // ── Cache: skip terminal/delivered orders entirely (no fetch) ──
       const toFetchM:number[]=[]
       for(let id=base;id<=burstEnd;id++){
         if(!this.forceRefresh&&this.cache?.isFinal(id)){
           const cached={...this.cache.get(id)!,source:'cache' as const}
-          orders.push(cached);matched++;consNulls=0
-          lastGoodId=id;this.onOrder(cached)
-          this.onLog('#'+id+'  '+cached.orderDate+'  [cached '+cached.status+']','ok')
+          orders.push(cached);matched++;consNulls=0;cacheHits++
+          this.onOrder(cached)
           scanned++
         }else toFetchM.push(id)
       }
+      this.onLog('Burst '+burstNum+' (sz='+burstSize+'): #'+this.toId(base)+'→#'+this.toId(burstEnd)+' | '+(burstEnd-base+1-toFetchM.length)+' cached, '+toFetchM.length+' to fetch','info')
 
-      let rlInBurst=0
-      for(let b=0;b<toFetchM.length&&!this.stopped;b+=concurrency){
+      let errInBurst=0
+      for(let b=0;b<toFetchM.length&&!this.stopped&&!ended;b+=concurrency){
         const ids=toFetchM.slice(b,b+concurrency)
         const results=await this.fetchBatch(ids)
 
         for(let i=0;i<ids.length&&!this.stopped;i++){
           const o=results[i];scanned++
-          if(o==='rl'){rlInBurst++;continue}
+          if(o==='rl'){errInBurst++;continue}  // genuine transient error (timeout)
           if(o!==null){
-            // If this order is now archived (masked) but we already captured its
-            // full data before, keep the richer cached record.
-            const prior=o.archived?this.cache?.get(ids[i]):null
-            const fo:Order=prior&&prior.dateYMD?{...prior,source:'cache' as const}:{...o,source:'fresh' as const}
-            if(!(prior&&prior.dateYMD))this.cache?.set(ids[i],fo)
+            fetched++
+            const fo=this.reconcile(ids[i],o)
+            if(o.archived&&!fo.archived)statusUpdates++  // archived masked merged onto cached full data
+            this.cache?.set(ids[i],fo)
             orders.push(fo);matched++;consNulls=0;cleanBursts=0
-            lastGoodId=ids[i]
             this.onStats?.({lastMatchedId:Scanner.numericPart(fo.orderId)})
             this.onOrder(fo)
             this.onLog(fo.archived
               ?'#'+ids[i]+'  [archived '+fo.status+']  '+fo.orderDate+(fo.deliveredDate?'  delivered '+fo.deliveredDate:'')
-              :'#'+ids[i]+'  '+fo.orderDate+'  '+fo.value+'  '+fo.payment+'  '+fo.location,'ok')
+              :'#'+ids[i]+'  '+fo.orderDate+'  '+fo.value+'  '+fo.payment+'  '+fo.location+(o.archived?'  [status←'+fo.status+']':''),'ok')
           }else{
             consNulls++
-            // Reached null threshold — check if rate-limited before stopping/waiting
+            // ~stopAfter consecutive missing AWBs (IDs are contiguous) = genuine end.
             if(useAuto&&consNulls>=stopAfter){
-              const rl=await isRateLimited()
-              if(!rl){
-                // Genuine end
-                this.onLog('Genuine end of orders after '+matched+' orders','ok')
-                this.stopped=true
-                break
-              }
-              // Rate limited — escalating cooldown
-              rlCooldowns++
-              cleanBursts=0
-              // Cooldown escalates: 120s, 180s, 300s, 300s, ...
-              const coolSec=[30,60,90,180,300][Math.min(rlCooldowns-1,4)]
-              this.onLog('Rate-limit cooldown #'+rlCooldowns+' — waiting '+coolSec+'s then resuming...','info')
-              await this.wait(coolSec*1000,'Cooldown')
-              if(this.stopped)break
-              // After cooldown: shrink burst size and reset null counter
-              burstSize=Math.max(Scanner.BURST_MIN,Math.floor(burstSize/2))
-              consNulls=0
-              this.onLog('Resuming with smaller bursts (sz='+burstSize+')','ok')
+              this.onLog('Genuine end of orders — '+consNulls+' consecutive misses after '+matched+' orders','ok')
+              ended=true;this.stopped=true;break
             }
           }
         }
         this.onProgress(startId+scanned-1,endId,matched)
-        await sleep(120)
+        await sleep(40)
       }
 
-      // Adapt burst size based on this burst's health
-      if(rlInBurst>0){
-        burstSize=Math.max(Scanner.BURST_MIN,Math.floor(burstSize/2))
-        cleanBursts=0
-        this.onLog('RL in burst — reduced size to '+burstSize,'info')
-      }else{
-        cleanBursts++
-        if(cleanBursts>=3&&burstSize<Scanner.BURST_MAX){
-          burstSize=Math.min(Scanner.BURST_MAX,burstSize+20)
-          this.onLog('Clean burst streak — increased size to '+burstSize,'info')
-        }
-      }
+      // Adapt burst size: shrink on transient errors, grow on clean bursts.
+      if(errInBurst>0){burstSize=Math.max(Scanner.BURST_MIN,Math.floor(burstSize/2));cleanBursts=0}
+      else{cleanBursts++;if(cleanBursts>=2&&burstSize<Scanner.BURST_MAX)burstSize=Math.min(Scanner.BURST_MAX,burstSize+30)}
 
       base=burstEnd+1
-      if(base>endId||this.stopped)break
+      if(base>endId||this.stopped||ended)break
 
-      // Longer rest after RL cooldowns to let rate limit fully reset
-      const rest=rlCooldowns>0?Scanner.REST_BASE*2:Scanner.REST_BASE
       this.cache?.save()
-      this.onLog('Rest '+(rest/1000)+'s — burst '+burstNum+' | '+matched+' found | '+consNulls+' null streak','info')
       this.onStats?.({retries:this.rlStreak})
+      const rest=Scanner.REST_BASE
       for(let t=0;t<rest&&!this.stopped;t+=300)await sleep(Math.min(300,rest-t))
     }
     this.cache?.save()
+    this.onLog('Done — '+matched+' orders ('+cacheHits+' from cache, '+fetched+' fetched'+(statusUpdates?', '+statusUpdates+' status updates':'')+')','ok')
     return orders
   }
 }
@@ -1114,7 +1091,7 @@ function DashboardStrip({runs}:{runs:Run[]}){
 }
 
 function DateTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setForceRefresh}:any){
-  const[from,setFrom]=useState(yestStr());const[to,setTo]=useState(todayStr());const[conc,setConc]=useState('5')
+  const[from,setFrom]=useState(yestStr());const[to,setTo]=useState(todayStr());const[conc,setConc]=useState('10')
   const presetBtn=(label:string,f:string,t:string)=><button key={label} onClick={()=>{setFrom(f);setTo(t)}} style={{background:'var(--surface)',border:'1px solid var(--border)',color:'var(--muted)',padding:'6px 10px',borderRadius:20,fontSize:9,fontFamily:'inherit',cursor:'pointer'}}>{label}</button>
   return(
     <div>
@@ -1137,7 +1114,7 @@ function DateTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setForc
           </div>
           <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:12,fontSize:11,color:'var(--muted)'}}>
             <span>Concurrent fetches</span>
-            <select value={conc} onChange={e=>setConc(e.target.value)} style={{...inp,width:'auto',padding:'5px 8px',fontSize:11}}>{['3','5','8','10','15'].map(v=><option key={v} value={v}>{v}</option>)}</select>
+            <select value={conc} onChange={e=>setConc(e.target.value)} style={{...inp,width:'auto',padding:'5px 8px',fontSize:11}}>{['5','8','10','15','20'].map(v=><option key={v} value={v}>{v}</option>)}</select>
             <span style={{fontSize:9}}>(higher = faster)</span>
           </div>
           <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:8,padding:'6px 10px',background:'var(--surface)',borderRadius:6,border:'1px solid var(--border)'}}>
@@ -1152,7 +1129,7 @@ function DateTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setForc
 }
 
 function ManualTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setForceRefresh}:any){
-  const[startId,setStartId]=useState('');const[endId,setEndId]=useState('');const[useAuto,setUseAuto]=useState(false);const[stopAfter,setStopAfter]=useState('500');const[conc,setConc]=useState('5')
+  const[startId,setStartId]=useState('');const[endId,setEndId]=useState('');const[useAuto,setUseAuto]=useState(true);const[stopAfter,setStopAfter]=useState('100');const[conc,setConc]=useState('10')
   const pfx=active.idPrefix||''
   const recommendedStop=recommendedAutoStop(parseInt(conc)||5,active?.avgPerDay||0)
   const storedResume=LS.get(`manual_resume_${active?.id}`,'')
@@ -1172,10 +1149,10 @@ function ManualTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setFo
             <input type="checkbox" checked={useAuto} onChange={e=>setUseAuto(e.target.checked)} style={{accentColor:'var(--accent)',width:16,height:16}}/>
           </div>
           {resumeId>0&&<div style={{display:'flex',justifyContent:'space-between',alignItems:'center',background:'var(--surface2)',border:'1px solid var(--border)',borderRadius:6,padding:'8px 10px',marginBottom:10,fontSize:10,color:'var(--muted)'}}><span>Resume suggestion: start from #{pfx}{resumeId}</span><button onClick={()=>setStartId(String(resumeId))} style={{background:'none',border:'1px solid var(--accent)',color:'var(--accent)',padding:'4px 8px',borderRadius:4,fontSize:9,fontFamily:'inherit',cursor:'pointer'}}>Use resume ID</button></div>}
-          {useAuto&&<div style={{marginBottom:10}}><label style={lbl}>Stop after N misses</label><div style={{display:'flex',alignItems:'center',gap:8}}><input type="number" value={stopAfter} onChange={e=>setStopAfter(e.target.value)} style={{...inp,width:90}}/><span style={{fontSize:9,color:'var(--muted)'}}>Safe floor here: {recommendedStop}. Lower values are auto-raised, and misses are retried once before counting.</span></div></div>}
+          {useAuto&&<div style={{marginBottom:10}}><label style={lbl}>Stop after N misses</label><div style={{display:'flex',alignItems:'center',gap:8}}><input type="number" value={stopAfter} onChange={e=>setStopAfter(e.target.value)} style={{...inp,width:90}}/><span style={{fontSize:9,color:'var(--muted)'}}>~{recommendedStop} consecutive missing IDs = genuine end. Lower values are auto-raised. Order IDs are contiguous, so 100 is safe.</span></div></div>}
           <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:12,fontSize:11,color:'var(--muted)'}}>
             <span>Concurrent fetches</span>
-            <select value={conc} onChange={e=>setConc(e.target.value)} style={{...inp,width:'auto',padding:'5px 8px',fontSize:11}}>{['3','5','8','10'].map(v=><option key={v} value={v}>{v}</option>)}</select>
+            <select value={conc} onChange={e=>setConc(e.target.value)} style={{...inp,width:'auto',padding:'5px 8px',fontSize:11}}>{['5','8','10','15','20'].map(v=><option key={v} value={v}>{v}</option>)}</select>
           </div>
           <button onClick={()=>{
             if(!startId){alert('Enter a Start ID');return}
