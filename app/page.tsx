@@ -1424,7 +1424,7 @@ function SettingsTab({brands,active,runs,onDelete,onSync,onImportOrders,inp,lbl,
   useEffect(()=>setUrl(LS.get(`sheets_${active?.id}`,'')),[ active?.id])
   const btn=(e:any={})=>({background:'var(--surface)',border:'1px solid var(--border)',color:'var(--text)',padding:'8px 12px',borderRadius:6,fontSize:10,fontWeight:700,fontFamily:'inherit',cursor:'pointer',...e})
   async function save(){LS.set(`sheets_${active.id}`,url);setStatus('✓ Saved — auto-syncs after every scan')}
-  async function test(){if(!url){setStatus('⚠ Enter URL first');return};setBusy(true);setStatus('Testing...');try{const r=await fetch('/api/sheets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,orders:[{orderId:'TEST',orderDate:'test',value:'Rs.1',payment:'COD',status:'test',location:'Mumbai',pincode:'400001'}],mode:'test'})});const d=await r.json();setStatus(d.ok?'✓ Connected!':'⚠ '+(d.error||JSON.stringify(d)))}catch(e:any){setStatus('⚠ '+e.message)};setBusy(false)}
+  async function test(){if(!url){setStatus('⚠ Enter URL first');return};setBusy(true);setStatus('Testing...');try{const r=await fetch('/api/sheets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,orders:[{orderId:'TEST',orderDate:'test',value:'Rs.1',payment:'COD',status:'test',location:'Mumbai',pincode:'400001'}],mode:'test'})});const d=await r.json();setStatus(d.ok?('✓ Connected!'+(d.dashboard&&d.dashboard!=='ok'?' · Dashboard '+d.dashboard:' · Dashboard ok')):'⚠ '+(d.error||JSON.stringify(d)))}catch(e:any){setStatus('⚠ '+e.message)};setBusy(false)}
   async function sync(mode:'append'|'replace'){
     if(!url){setStatus('⚠ Save URL first');return}
     if(!active){setStatus('⚠ Select a brand first');return}
@@ -1561,11 +1561,11 @@ function doPost(e){
       if(r){sheet.getRange(r,1,1,row.length).setValues([row]);updated++;}else add.push(row);
     });
     if(add.length)sheet.getRange(sheet.getLastRow()+1,1,add.length,H.length).setValues(add);
-    try{rebuildDashboard(ss);}catch(de){}
-    return json({ok:true,added:add.length,updated:updated});
+    var dash='ok';try{rebuildDashboard(ss);}catch(de){dash='error: '+String(de);}
+    return json({ok:true,added:add.length,updated:updated,dashboard:dash});
   }catch(err){return json({ok:false,error:String(err)});}
 }
-function doGet(){try{rebuildDashboard(SpreadsheetApp.getActiveSpreadsheet());}catch(e){}return json({ok:true,msg:'srtscrap sheet sync is live'});}
+function doGet(){try{rebuildDashboard(SpreadsheetApp.getActiveSpreadsheet());return json({ok:true,msg:'Dashboard rebuilt - srtscrap sheet sync is live'});}catch(e){return json({ok:false,where:'dashboard',error:String(e)});}}
 function json(o){return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON);}
 function dstr(d){return Utilities.formatDate(d,TZ,'yyyy-MM-dd');}
 function addDays(s,n){var d=new Date(s+'T00:00:00');d.setDate(d.getDate()+n);return dstr(d);}
