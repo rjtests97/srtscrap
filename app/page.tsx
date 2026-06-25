@@ -1545,6 +1545,8 @@ function SettingsTab({brands,active,runs,onDelete,onSync,onImportOrders,inp,lbl,
         <details style={{marginBottom:10}}><summary style={{fontSize:9,color:'var(--muted)',cursor:'pointer',marginBottom:6}}>▼ Apps Script code</summary>
           <pre style={{background:'var(--surface2)',border:'1px solid var(--border)',borderRadius:4,padding:8,fontSize:8,color:'var(--muted)',overflow:'auto',maxHeight:180,lineHeight:1.6,whiteSpace:'pre-wrap'}}>{`var TZ='Asia/Kolkata';
 var H=['Order ID','Date','Time','Value','Payment','Status','Location','Pincode','dateYMD','Updated'];
+var MON={Jan:'01',Feb:'02',Mar:'03',Apr:'04',May:'05',Jun:'06',Jul:'07',Aug:'08',Sep:'09',Oct:'10',Nov:'11',Dec:'12'};
+function rowYMD(r){var dy=String(r[8]||'').trim();if(/^\\d{4}-\\d{2}-\\d{2}/.test(dy))return dy.substring(0,10);var m=String(r[1]||'').match(/^(\\d{1,2})\\s+(\\w{3})\\s+(\\d{4})/);return m?(m[3]+'-'+(MON[m[2]]||'00')+'-'+('0'+m[1]).slice(-2)):'';}
 function doPost(e){
   try{
     var data=JSON.parse(e.postData.contents||'{}');
@@ -1579,7 +1581,7 @@ function rebuildDashboard(ss){
   var wStart=addDays(today,-(dow-1)),mStart=today.substring(0,8)+'01';
   var cT=0,cY=0,cW=0,cM=0,total=0,revT=0,revM=0,loc={},pin={},status={},daily={};
   rows.forEach(function(r){
-    var dy=String(r[8]||'');if(!dy)return;
+    var dy=rowYMD(r);if(!dy)return;
     var st=String(r[5]||''),lc=String(r[6]||''),pc=String(r[7]||'');
     var val=parseFloat(String(r[3]||'').replace(/[^0-9.]/g,''))||0;
     total++;

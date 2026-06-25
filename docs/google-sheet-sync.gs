@@ -20,6 +20,17 @@
 
 var TZ = 'Asia/Kolkata';
 var H = ['Order ID','Date','Time','Value','Payment','Status','Location','Pincode','dateYMD','Updated'];
+var MON = { Jan:'01',Feb:'02',Mar:'03',Apr:'04',May:'05',Jun:'06',Jul:'07',Aug:'08',Sep:'09',Oct:'10',Nov:'11',Dec:'12' };
+
+// Resolve a row's YYYY-MM-DD. Prefers the dateYMD column, but falls back to
+// parsing the human "Date" column ("23 May 2026") so rows written by the older
+// 8-column script (no dateYMD) are still counted.
+function rowYMD(r) {
+  var dy = String(r[8] || '').trim();
+  if (/^\d{4}-\d{2}-\d{2}/.test(dy)) return dy.substring(0, 10);
+  var m = String(r[1] || '').match(/^(\d{1,2})\s+(\w{3})\s+(\d{4})/);
+  return m ? (m[3] + '-' + (MON[m[2]] || '00') + '-' + ('0' + m[1]).slice(-2)) : '';
+}
 
 function doPost(e) {
   try {
@@ -88,7 +99,7 @@ function rebuildDashboard(ss) {
   var cToday = 0, cYest = 0, cWtd = 0, cMtd = 0, total = 0, revToday = 0, revMtd = 0;
   var loc = {}, pin = {}, status = {}, daily = {};
   rows.forEach(function (r) {
-    var dy = String(r[8] || ''); if (!dy) return;
+    var dy = rowYMD(r); if (!dy) return;
     var st = String(r[5] || ''), lc = String(r[6] || ''), pc = String(r[7] || '');
     var val = parseFloat(String(r[3] || '').replace(/[^0-9.]/g, '')) || 0;
     total++;
