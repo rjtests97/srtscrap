@@ -515,7 +515,8 @@ class Scanner {
   async scanRange(scanStart:number,scanEnd:number,fromDate:string,toDate:string,concurrency:number,startedAt:number):Promise<Order[]>{
     const orders:Order[]=[]
     let scanned=0,matched=0,fromCacheCount=0,burstNum=0
-    let burstSize=Scanner.BURST_MAX
+    // Warm up small so the first burst doesn't trip rate limiting; grows on clean bursts.
+    let burstSize=Scanner.BURST_MIN
     const total=scanEnd-scanStart+1
 
     for(let base=scanStart;base<=scanEnd&&!this.stopped;){
@@ -585,8 +586,9 @@ class Scanner {
     const orders:Order[]=[]
     let scanned=0,matched=0,consNulls=0,burstNum=0
     let lastGoodId:number|null=null
-    // Adaptive burst: shrinks on RL, recovers after clean bursts
-    let burstSize=Scanner.BURST_MAX
+    // Adaptive burst: warm up small, grow on clean bursts, shrink on RL.
+    // Starting at BURST_MIN avoids tripping the rate limiter on the very first try.
+    let burstSize=Scanner.BURST_MIN
     let cleanBursts=0      // consecutive bursts with no RL
     let rlCooldowns=0      // total RL cooldowns taken (for escalating wait)
 

@@ -54,61 +54,90 @@ function parseApidata(apidata: any, originalId: string|number) {
   }
 }
 
-const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+// Rotate through a few realistic browser UA strings so concurrent requests
+// don't all look identical (a common bot-detection signal).
+const UAS = [
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
+]
 
 // Min size of a real tracking page with order data (~160KB normally, use 40KB as RL threshold)
 const MIN_REAL_PAGE_SIZE = 40000
 
-async function fetchOneOrder(subdomain: string, orderId: string|number): Promise<any> {
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
+
+// Single raw attempt. Returns 'rl' for transient/throttle signals, null for a
+// genuine miss, or the parsed order.
+async function attemptOnce(subdomain: string, orderId: string|number): Promise<any> {
   const id = String(orderId)
+  const ua = UAS[Math.floor(Math.random() * UAS.length)]
+  const origin = `https://${subdomain}.shiprocket.co`
 
-  try {
-    const res = await fetch(`https://${subdomain}.shiprocket.co/tracking/order/${id}`, {
-      headers: {
-        'Accept': 'text/html,application/xhtml+xml',
-        'User-Agent': UA,
-        'Accept-Language': 'en-IN,en;q=0.9',
-        'Cache-Control': 'no-cache',
-      },
-      signal: AbortSignal.timeout(12000),
-    })
+  const res = await fetch(`${origin}/tracking/order/${id}`, {
+    headers: {
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      'User-Agent': ua,
+      'Accept-Language': 'en-IN,en;q=0.9',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Referer': `${origin}/`,
+      'Upgrade-Insecure-Requests': '1',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'same-origin',
+      'Sec-Fetch-User': '?1',
+      'sec-ch-ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': '"macOS"',
+    },
+    signal: AbortSignal.timeout(12000),
+  })
 
-    // Explicit RL status codes
-    if (res.status === 429 || res.status === 503 || res.status === 403) return 'rl'
-    if (!res.ok) return null
+  // Explicit RL status codes
+  if (res.status === 429 || res.status === 503 || res.status === 403) return 'rl'
+  if (!res.ok) return null
 
-    const html = await res.text()
+  const html = await res.text()
 
-    // KEY FIX: If page is too small, Shiprocket is rate-limiting us
-    // Real tracking pages are ~150-170KB. A rate-limit/challenge page is tiny.
-    if (html.length < MIN_REAL_PAGE_SIZE) {
-      // Small page = rate limited or redirect, not a real response
-      return 'rl'
+  // Small page = rate-limit/challenge page, not a real response.
+  // Real tracking pages are ~150-170KB.
+  if (html.length < MIN_REAL_PAGE_SIZE) return 'rl'
+
+  const apidata = extractApidata(html)
+  // apidata missing on a full-sized page = partial/challenged load = treat as rl
+  if (!apidata) return 'rl'
+  // Has apidata but no order = order genuinely doesn't exist at this ID
+  if (!apidata.order?.order_date) return null
+
+  return parseApidata(apidata, orderId)
+}
+
+async function fetchOneOrder(subdomain: string, orderId: string|number): Promise<any> {
+  // Retry transient 'rl' once with a short backoff before declaring rate-limit.
+  // A single WAF challenge / cold response shouldn't poison the whole burst.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const r = await attemptOnce(subdomain, orderId)
+      if (r !== 'rl') return r          // genuine miss or real order — done
+      if (attempt === 0) await sleep(400 + Math.random() * 400)
+    } catch (e: any) {
+      // Timeout / network error — retry once, then treat as rl
+      if (attempt === 0) await sleep(400 + Math.random() * 400)
     }
-
-    const apidata = extractApidata(html)
-
-    // apidata present but no order = order genuinely doesn't exist at this ID
-    // apidata missing = page structure changed or partial load = treat as rl
-    if (!apidata) return 'rl'
-
-    if (!apidata.order?.order_date) {
-      // Has apidata but no order data. Could be:
-      // 1. Order ID doesn't belong to this brand (rare on brand's own subdomain)
-      // 2. Order ID genuinely doesn't exist
-      // Return null (genuine miss) only if page is full-sized
-      return null
-    }
-
-    return parseApidata(apidata, orderId)
-  } catch (e: any) {
-    if (e.name === 'TimeoutError' || e.name === 'AbortError') return 'rl'
-    return 'rl'  // Any network error = treat as rl, not genuine null
   }
+  return 'rl'
 }
 
 export async function POST(req: NextRequest) {
   const { subdomain, ids } = await req.json() as { subdomain: string; ids: Array<string|number> }
-  const results = await Promise.all(ids.map(id => fetchOneOrder(subdomain, id).catch(() => 'rl')))
+  // Stagger concurrent requests so they don't hit the origin at the same instant
+  // (simultaneous bursts from one IP are the fastest way to trip rate limiting).
+  const results = await Promise.all(
+    ids.map((id, i) =>
+      sleep(i * 180 + Math.random() * 120)
+        .then(() => fetchOneOrder(subdomain, id))
+        .catch(() => 'rl')
+    )
+  )
   return NextResponse.json({ results })
 }
