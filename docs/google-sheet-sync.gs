@@ -46,16 +46,24 @@ function doPost(e) {
     });
     if (add.length) sheet.getRange(sheet.getLastRow() + 1, 1, add.length, H.length).setValues(add);
 
-    try { rebuildDashboard(ss); } catch (de) {}   // never fail the upsert over a chart
-    return json({ ok: true, added: add.length, updated: updated });
+    // Rebuild the dashboard, but never fail the upsert over it — surface any
+    // error in the response instead so it's visible in the app's sync status.
+    var dash = 'ok';
+    try { rebuildDashboard(ss); } catch (de) { dash = 'error: ' + String(de); }
+    return json({ ok: true, added: add.length, updated: updated, dashboard: dash });
   } catch (err) {
     return json({ ok: false, error: String(err) });
   }
 }
 
+// Open the /exec URL in a browser to force-rebuild the dashboard and see any error.
 function doGet() {
-  try { rebuildDashboard(SpreadsheetApp.getActiveSpreadsheet()); } catch (e) {}
-  return json({ ok: true, msg: 'srtscrap sheet sync is live' });
+  try {
+    rebuildDashboard(SpreadsheetApp.getActiveSpreadsheet());
+    return json({ ok: true, msg: 'Dashboard rebuilt — srtscrap sheet sync is live' });
+  } catch (e) {
+    return json({ ok: false, where: 'dashboard', error: String(e) });
+  }
 }
 
 function json(o) {
