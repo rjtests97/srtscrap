@@ -46,7 +46,19 @@ Already configured in `vercel.json`:
 `30 2 * * *` = 02:30 UTC = **08:00 IST** daily. Change the time by editing the
 cron string (it's UTC).
 
-## 4. Test it now (don't wait until morning)
+## 4. Seed the Sheet with what you've already scanned
+
+So the Sheet doesn't start empty:
+
+1. In the app, **Settings → Google Sheets Sync**, paste the same `/exec` URL,
+   click **Save**.
+2. (If the browser cache is empty) first **Settings → Import from CSV** and
+   upload your latest Full Report, so the cache holds your existing orders.
+3. Click **Sync to Sheets (Append)**. This pushes **everything in the cache**
+   (all orders ever scanned/imported), upserted by Order ID. From then on the
+   daily cron just adds/updates each day on top.
+
+## 5. Test it now (don't wait until morning)
 
 With `CRON_SECRET` set, open in a browser:
 
@@ -63,5 +75,7 @@ appear in your Sheet. Drop `&date=...` to scan yesterday.
   it updates (e.g. a Pending order that later shows Delivered).
 - The Sheet is now your durable history; the in-browser cache and CSV import
   are only for manual/backfill scans.
-- A single daily run scans ~a few hundred IDs and finishes well within the 60s
-  function limit.
+- **Large days are fine.** A run scans up to 300 IDs then hands the rest to a
+  fresh invocation (continuation passed in the URL — no server state), so a day
+  with 500+ orders completes across a few automatic chunks. The Sheet upsert
+  dedupes, so the chunk hand-off never double-counts.

@@ -25,7 +25,11 @@ function doPost(e) {
   try {
     var body = JSON.parse(e.postData.contents || '{}');
     var orders = body.orders || [];
-    var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = ss.getSheetByName('Orders') || ss.insertSheet('Orders');
+
+    // 'replace' clears first (used by the app's "Replace" button); otherwise upsert.
+    if (body.mode === 'replace') sheet.clearContents();
 
     // Ensure header row.
     if (sheet.getLastRow() === 0) {

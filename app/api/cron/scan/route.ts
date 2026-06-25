@@ -99,25 +99,41 @@ export async function GET(req: NextRequest) {
   }
 
   // Target date: ?date=YYYY-MM-DD or yesterday in IST.
+  const q = req.nextUrl.searchParams
   const nowIST = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }))
   const yest = new Date(nowIST.getTime() - 86400000).toISOString().split('T')[0]
-  const dateStr = req.nextUrl.searchParams.get('date') || yest
+  const dateStr = q.get('date') || yest
   const origin = `https://${req.headers.get('host')}`
   const nextD = new Date(new Date(dateStr + 'T00:00:00').getTime() + 86400000).toISOString().split('T')[0]
 
-  // Bracket the day's ID range from the anchor.
-  const fromB = await walk(origin, ANCHOR_ID, ANCHOR_DATE, dateStr)
-  const refE = fromB.lo > ANCHOR_ID ? { id: fromB.lo, date: dateStr } : { id: ANCHOR_ID, date: ANCHOR_DATE }
-  const toB = await walk(origin, refE.id, refE.date, nextD)
-  const scanStart = Math.max(1, fromB.lo - 30)
-  const scanEnd = toB.hi + 30
+  // Stateless chunking: a day can hold 500+ orders, which won't fit one 60s
+  // run. We scan up to CHUNK IDs per invocation and pass the continuation
+  // (from / scanEnd / running totals) in the URL — no /tmp, so it's reliable
+  // across serverless instances. The Sheet upsert dedupes, so an accidental
+  // re-run is harmless.
+  const CHUNK = 300, CONC = 10
+  const carriedFrom = parseInt(q.get('from') || '0')
+  const carriedEnd = parseInt(q.get('scanEnd') || '0')
+  let priorFound = parseInt(q.get('found') || '0')
+  let priorScanned = parseInt(q.get('scanned') || '0')
 
-  // Single-pass scan of the bracket (fits in 60s for a day's ~60 orders).
-  const CONC = 10
+  let scanStart: number, scanEnd: number
+  if (carriedFrom && carriedEnd) {
+    scanStart = carriedFrom; scanEnd = carriedEnd          // continuation chunk
+  } else {
+    // First invocation — bracket the day's ID range from the anchor.
+    const fromB = await walk(origin, ANCHOR_ID, ANCHOR_DATE, dateStr)
+    const refE = fromB.lo > ANCHOR_ID ? { id: fromB.lo, date: dateStr } : { id: ANCHOR_ID, date: ANCHOR_DATE }
+    const toB = await walk(origin, refE.id, refE.date, nextD)
+    scanStart = Math.max(1, fromB.lo - 30)
+    scanEnd = toB.hi + 30
+  }
+
+  const chunkEnd = Math.min(scanStart + CHUNK - 1, scanEnd)
   const collected: any[] = []
   let scanned = 0
-  for (let base = scanStart; base <= scanEnd; base += CONC) {
-    const ids = Array.from({ length: Math.min(CONC, scanEnd - base + 1) }, (_, i) => base + i)
+  for (let base = scanStart; base <= chunkEnd; base += CONC) {
+    const ids = Array.from({ length: Math.min(CONC, chunkEnd - base + 1) }, (_, i) => base + i)
     const results = await callProxy(origin, ids)
     results.forEach((o: any) => {
       scanned++
@@ -126,24 +142,38 @@ export async function GET(req: NextRequest) {
     await sleep(40)
   }
 
-  // Push to the Google Sheet.
+  // Push this chunk's orders to the Sheet right away (upsert dedupes).
   const pushed = await pushToSheet(collected)
+  const totalFound = priorFound + collected.length
+  const totalScanned = priorScanned + scanned
+  const done = chunkEnd >= scanEnd
 
-  // Optional Telegram confirmation.
+  if (!done) {
+    // Hand off the next chunk to a fresh invocation (stateless).
+    const next = new URL(`${origin}/api/cron/scan`)
+    next.searchParams.set('date', dateStr)
+    next.searchParams.set('from', String(chunkEnd + 1))
+    next.searchParams.set('scanEnd', String(scanEnd))
+    next.searchParams.set('found', String(totalFound))
+    next.searchParams.set('scanned', String(totalScanned))
+    if (SECRET) next.searchParams.set('secret', SECRET)
+    fetch(next.toString()).catch(() => {})
+    return NextResponse.json({
+      ok: true, done: false, date: dateStr,
+      chunk: `${scanStart}-${chunkEnd}`, found: totalFound, remaining: scanEnd - chunkEnd,
+    })
+  }
+
+  // Final chunk done — send the optional Telegram summary with the day total.
   if (TG_TOKEN && TG_CHAT) {
-    const cityMap: Record<string, number> = {}
-    collected.forEach(o => { const c = o.location; if (c && c !== 'N/A') cityMap[c] = (cityMap[c] || 0) + 1 })
-    const top = Object.entries(cityMap).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([c, n]) => `${c} (${n})`).join(' · ')
     await tg([
       `✅ <b>${BRAND_NAME}</b> — ${fmtDate(dateStr)}`,
-      `📦 <b>${collected.length}</b> orders` + (pushed.ok ? ` → Sheet (${pushed.added ?? collected.length} rows)` : ` (⚠️ sheet push failed)`),
-      top ? `📍 ${top}` : '',
-    ].filter(Boolean).join('\n'))
+      `📦 <b>${totalFound}</b> orders` + (pushed.ok ? ` → Google Sheet` : ` (⚠️ last sheet push failed)`),
+    ].join('\n'))
   }
 
   return NextResponse.json({
-    ok: true, date: dateStr,
-    range: `${scanStart}-${scanEnd}`, scanned, found: collected.length,
-    sheet: pushed,
+    ok: true, done: true, date: dateStr,
+    range: `${scanStart}-${scanEnd}`, scanned: totalScanned, found: totalFound, sheet: pushed,
   })
 }
