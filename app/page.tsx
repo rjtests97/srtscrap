@@ -2,7 +2,7 @@
 import { useState, useEffect, useRef, useCallback, ChangeEvent } from 'react'
 
 interface Brand { id:string; name:string; subdomain:string; slug:string; companyName:string; anchorId:number; anchorDate:string; avgPerDay:number; regressionPoints:Array<{date:string,id:number}>; idPrefix:string }
-interface Order { orderId:number|string; slug:string; orderDate:string; orderTime:string; dateYMD:string|null; value:string; valueNum:number; payment:string; status:string; pincode:string; location:string; source?:'cache'|'fresh' }
+interface Order { orderId:number|string; slug:string; orderDate:string; orderTime:string; dateYMD:string|null; value:string; valueNum:number; payment:string; status:string; pincode:string; location:string; source?:'cache'|'fresh'; archived?:boolean; awb?:string|null; deliveredDate?:string|null }
 interface Run { runId:string; dateRange:string; found:number; orders:Order[]; createdAt:string }
 interface Analytics {
   totalOrders:number
@@ -640,7 +640,9 @@ class Scanner {
             lastGoodId=ids[i]
             this.onStats?.({lastMatchedId:Scanner.numericPart(fo.orderId)})
             this.onOrder(fo)
-            this.onLog('#'+ids[i]+'  '+fo.orderDate+'  '+fo.value+'  '+fo.payment+'  '+fo.location,'ok')
+            this.onLog(fo.archived
+              ?'#'+ids[i]+'  [archived '+fo.status+']  '+fo.orderDate+(fo.deliveredDate?'  delivered '+fo.deliveredDate:'')
+              :'#'+ids[i]+'  '+fo.orderDate+'  '+fo.value+'  '+fo.payment+'  '+fo.location,'ok')
           }else{
             consNulls++
             // Reached null threshold — check if rate-limited before stopping/waiting

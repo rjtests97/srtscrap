@@ -62,10 +62,41 @@ const UAS = [
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
 ]
 
-// Min size of a real tracking page with order data (~160KB normally, use 40KB as RL threshold)
-const MIN_REAL_PAGE_SIZE = 40000
-
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
+
+const COURIERS = ['Blue Dart','Delhivery','DTDC','Ekart','Xpressbees','Amazon Shipping','India Post','Shadowfax','Ecom Express','Smartr','Bluedart','Shree Maruti','Professional','DP World']
+
+// Archived tracking pages hide the order behind buyer-OTP verification, so the
+// full `apidata` blob is gone. We still scrape the bits that remain public:
+// status, courier, AWB, delivered date, and the (day-masked) placed month.
+// The order-placed DAY is masked, so dateYMD stays null — these orders are
+// counted in manual scans but excluded from date-range / revenue analytics.
+function parseArchived(html: string, orderId: string|number): any {
+  const pick = (re: RegExp) => { const m = html.match(re); return m ? m[1].trim() : '' }
+  const status = pick(/class="status-value[^"]*"[^>]*>\s*([^<]+?)\s*</i) || 'ARCHIVED'
+  const deliveredDate = pick(/class="delivered-date"[^>]*>\s*([^<]+?)\s*</i)
+  const awb = pick(/data-awb="([^"]+)"/i)
+  const courier = COURIERS.find(c => new RegExp(c.replace(/\s+/g, '\\s+'), 'i').test(html)) || ''
+  // "Order Placed On ** May 2026" — day masked, month/year still visible
+  const monthYear = pick(/Placed On[\s\S]{0,80}?\*+\s*([A-Za-z]{3,9}\s+20\d{2})/i)
+  return {
+    orderId,
+    slug:        courier ? courier.toLowerCase().replace(/\s+/g, '') : '',
+    companyName: courier,
+    orderDate:   monthYear || deliveredDate || 'Archived',
+    orderTime:   'N/A',
+    dateYMD:     null,                 // placed-day masked → cannot pin a calendar day
+    value:       'N/A',
+    valueNum:    0,
+    payment:     'N/A',
+    status:      status.toUpperCase(),
+    pincode:     'N/A',
+    location:    'N/A',
+    archived:    true,
+    awb:         awb || null,
+    deliveredDate: deliveredDate || null,
+  }
+}
 
 // Single raw attempt. Returns 'rl' for transient/throttle signals, null for a
 // genuine miss, or the parsed order.
@@ -98,18 +129,32 @@ async function attemptOnce(subdomain: string, orderId: string|number): Promise<a
   if (!res.ok) return null
 
   const html = await res.text()
+  const title = (html.match(/<title>([^<]*)<\/title>/i)?.[1] || '').toLowerCase()
 
-  // Small page = rate-limit/challenge page, not a real response.
-  // Real tracking pages are ~150-170KB.
-  if (html.length < MIN_REAL_PAGE_SIZE) return 'rl'
+  // Classify by page CONTENT, not size. Shiprocket now serves three kinds of
+  // page where it used to serve only the full tracking page:
+  //   1. Full tracking page  → has `var apidata`           → parse fully
+  //   2. "Order Tracking - Archived" → OTP-gated real order → parse partial
+  //   3. "AWB Not Found"      → order genuinely doesn't exist → null (true end)
 
+  // Genuine miss — the real end of the ID range.
+  if (title.includes('not found') || /order\s+not\s+found|does\s+not\s+exist/i.test(html)) return null
+
+  // Archived order — real order with public data behind OTP. Scrape what's left.
+  if (title.includes('archived') || /archived tracking view/i.test(html)) {
+    return parseArchived(html, orderId)
+  }
+
+  // Full tracking page with embedded order data.
   const apidata = extractApidata(html)
-  // apidata missing on a full-sized page = partial/challenged load = treat as rl
-  if (!apidata) return 'rl'
-  // Has apidata but no order = order genuinely doesn't exist at this ID
-  if (!apidata.order?.order_date) return null
+  if (apidata) {
+    if (!apidata.order?.order_date) return null
+    return parseApidata(apidata, orderId)
+  }
 
-  return parseApidata(apidata, orderId)
+  // Unrecognized page with no order structure (e.g. a Cloudflare/WAF
+  // interstitial) — genuinely retryable.
+  return 'rl'
 }
 
 async function fetchOneOrder(subdomain: string, orderId: string|number): Promise<any> {
@@ -130,11 +175,11 @@ async function fetchOneOrder(subdomain: string, orderId: string|number): Promise
 
 export async function POST(req: NextRequest) {
   const { subdomain, ids } = await req.json() as { subdomain: string; ids: Array<string|number> }
-  // Stagger concurrent requests so they don't hit the origin at the same instant
-  // (simultaneous bursts from one IP are the fastest way to trip rate limiting).
+  // Light stagger so a batch doesn't hit the origin at the exact same instant
+  // (cheap insurance against tripping a real limit under sustained load).
   const results = await Promise.all(
     ids.map((id, i) =>
-      sleep(i * 180 + Math.random() * 120)
+      sleep(i * 60 + Math.random() * 40)
         .then(() => fetchOneOrder(subdomain, id))
         .catch(() => 'rl')
     )
