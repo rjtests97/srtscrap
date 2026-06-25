@@ -823,7 +823,8 @@ export default function App(){
     for(let i=0;i<orders.length;i+=200){
       // Only the first batch carries 'replace' (clears the sheet); the rest append.
       const batchMode=i===0?mode:'append'
-      try{const res=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({orders:orders.slice(i,i+200),mode:batchMode})});const d=await res.json();if(d.ok)added+=d.added||0}catch{}
+      // Routed through our same-origin proxy to avoid Apps Script CORS.
+      try{const res=await fetch('/api/sheets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,orders:orders.slice(i,i+200),mode:batchMode})});const d=await res.json();if(d.ok)added+=(d.added||0)+(d.updated||0)}catch{}
       await sleep(500)
     }
     return added
@@ -1423,7 +1424,7 @@ function SettingsTab({brands,active,runs,onDelete,onSync,onImportOrders,inp,lbl,
   useEffect(()=>setUrl(LS.get(`sheets_${active?.id}`,'')),[ active?.id])
   const btn=(e:any={})=>({background:'var(--surface)',border:'1px solid var(--border)',color:'var(--text)',padding:'8px 12px',borderRadius:6,fontSize:10,fontWeight:700,fontFamily:'inherit',cursor:'pointer',...e})
   async function save(){LS.set(`sheets_${active.id}`,url);setStatus('✓ Saved — auto-syncs after every scan')}
-  async function test(){if(!url){setStatus('⚠ Enter URL first');return};setBusy(true);setStatus('Testing...');try{const r=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({orders:[{orderId:'TEST',orderDate:'test',value:'Rs.1',payment:'COD',status:'test',location:'Mumbai',pincode:'400001'}],mode:'test'})});const d=await r.json();setStatus(d.ok?'✓ Connected!':'⚠ '+JSON.stringify(d))}catch(e:any){setStatus('⚠ '+e.message)};setBusy(false)}
+  async function test(){if(!url){setStatus('⚠ Enter URL first');return};setBusy(true);setStatus('Testing...');try{const r=await fetch('/api/sheets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,orders:[{orderId:'TEST',orderDate:'test',value:'Rs.1',payment:'COD',status:'test',location:'Mumbai',pincode:'400001'}],mode:'test'})});const d=await r.json();setStatus(d.ok?'✓ Connected!':'⚠ '+(d.error||JSON.stringify(d)))}catch(e:any){setStatus('⚠ '+e.message)};setBusy(false)}
   async function sync(mode:'append'|'replace'){
     if(!url){setStatus('⚠ Save URL first');return}
     if(!active){setStatus('⚠ Select a brand first');return}
