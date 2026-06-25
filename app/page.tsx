@@ -359,6 +359,11 @@ class OrderCache {
 
   save() { if (this.dirty > 0) this.flush() }
 
+  // Every cached order (most complete merged view) — used to seed the Sheet.
+  all(): Order[] {
+    return Object.values(this.data).map(e => ({ ...e, source: 'cache' as const }))
+  }
+
   isFinal(orderId: number|string): boolean {
     const e = this.data[String(orderId)]
     return e ? this.canTreatAsFinal(e) : false
@@ -813,10 +818,12 @@ export default function App(){
     setAnalytics(buildAnalytics(cleaned))
   }
 
-  async function syncToSheets(url:string,orders:Order[]):Promise<number>{
+  async function syncToSheets(url:string,orders:Order[],mode:'append'|'replace'='append'):Promise<number>{
     let added=0
     for(let i=0;i<orders.length;i+=200){
-      try{const res=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({orders:orders.slice(i,i+200),mode:i===0?'append':'append'})});const d=await res.json();if(d.ok)added+=d.added||0}catch{}
+      // Only the first batch carries 'replace' (clears the sheet); the rest append.
+      const batchMode=i===0?mode:'append'
+      try{const res=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({orders:orders.slice(i,i+200),mode:batchMode})});const d=await res.json();if(d.ok)added+=d.added||0}catch{}
       await sleep(500)
     }
     return added
@@ -995,7 +1002,7 @@ export default function App(){
           {tab==='analytics'&&<AnalyticsTab analytics={analytics}/>}
           {tab==='compare'&&<CompareTab brands={brands}/>}
           {tab==='history'&&<HistoryTab runs={runs} brandName={active.name} onClear={()=>{localStorage.removeItem(`runs_${active.id}`);setRuns([]);setLastOrders([]);setAnalytics(null)}}/>}
-          {tab==='settings'&&<SettingsTab brands={brands} active={active} runs={runs} onDelete={deleteBrand} onSync={(url:string,orders:Order[])=>syncToSheets(url,orders)} onImportOrders={(orders:Order[], label:string)=>active&&importOrdersToBrand(active,orders,label)} inp={inp} lbl={lbl} forceRefresh={forceRefresh} setForceRefresh={setForceRefresh}/>}
+          {tab==='settings'&&<SettingsTab brands={brands} active={active} runs={runs} onDelete={deleteBrand} onSync={(url:string,orders:Order[],mode:'append'|'replace'='append')=>syncToSheets(url,orders,mode)} onImportOrders={(orders:Order[], label:string)=>active&&importOrdersToBrand(active,orders,label)} inp={inp} lbl={lbl} forceRefresh={forceRefresh} setForceRefresh={setForceRefresh}/>}
         </>
       )}
     </div>
@@ -1417,7 +1424,19 @@ function SettingsTab({brands,active,runs,onDelete,onSync,onImportOrders,inp,lbl,
   const btn=(e:any={})=>({background:'var(--surface)',border:'1px solid var(--border)',color:'var(--text)',padding:'8px 12px',borderRadius:6,fontSize:10,fontWeight:700,fontFamily:'inherit',cursor:'pointer',...e})
   async function save(){LS.set(`sheets_${active.id}`,url);setStatus('✓ Saved — auto-syncs after every scan')}
   async function test(){if(!url){setStatus('⚠ Enter URL first');return};setBusy(true);setStatus('Testing...');try{const r=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({orders:[{orderId:'TEST',orderDate:'test',value:'Rs.1',payment:'COD',status:'test',location:'Mumbai',pincode:'400001'}],mode:'test'})});const d=await r.json();setStatus(d.ok?'✓ Connected!':'⚠ '+JSON.stringify(d))}catch(e:any){setStatus('⚠ '+e.message)};setBusy(false)}
-  async function sync(mode:'append'|'replace'){if(!url){setStatus('⚠ Save URL first');return};const all=runs.flatMap((r:Run)=>r.orders);if(!all.length){setStatus('⚠ No orders to sync');return};setBusy(true);setStatus(`Syncing ${all.length} orders...`);const n=await onSync(url,all);setStatus(`✓ Synced ${n} rows`);setBusy(false)}
+  async function sync(mode:'append'|'replace'){
+    if(!url){setStatus('⚠ Save URL first');return}
+    if(!active){setStatus('⚠ Select a brand first');return}
+    // Push the full cache (everything ever scanned/imported), merged with any
+    // run orders — so the Sheet is seeded with all our existing values, not
+    // just the latest runs. The Apps Script upserts by Order ID (no dupes).
+    const cached=new OrderCache(active.id,active.slug||active.subdomain).all()
+    const all=mergeOrdersById([...cached,...runs.flatMap((r:Run)=>r.orders)])
+    if(!all.length){setStatus('⚠ No orders to sync — run a scan or import a CSV first');return}
+    setBusy(true);setStatus(`Syncing ${all.length} orders (${mode})...`)
+    const n=await onSync(url,all,mode)
+    setStatus(`✓ Synced ${all.length} orders → ${n} rows`);setBusy(false)
+  }
   const [tgStatus,setTgStatus]=useState('')
   const [tgBusy,setTgBusy]=useState(false)
   const [tgToken,setTgToken]=useState(()=>LS.get('tg_token',''))
@@ -1528,16 +1547,26 @@ function SettingsTab({brands,active,runs,onDelete,onSync,onImportOrders,inp,lbl,
     var data = JSON.parse(e.postData.contents);
     var ss = SpreadsheetApp.getActiveSpreadsheet();
     var sheet = ss.getSheetByName('Orders') || ss.insertSheet('Orders');
-    if (data.mode === 'replace' || sheet.getLastRow() === 0) {
-      sheet.clearContents();
-      sheet.appendRow(['Order ID','Date','Time','Value','Payment','Status','Location','Pincode']);
+    var H = ['Order ID','Date','Time','Value','Payment','Status','Location','Pincode','dateYMD','Updated'];
+    if (data.mode === 'replace') sheet.clearContents();
+    if (sheet.getLastRow() === 0) { sheet.appendRow(H); sheet.setFrozenRows(1); }
+    // Upsert by Order ID so re-runs / daily syncs never duplicate.
+    var lastRow = sheet.getLastRow(), map = {};
+    if (lastRow > 1) {
+      var ids = sheet.getRange(2,1,lastRow-1,1).getValues();
+      for (var i=0;i<ids.length;i++) map[String(ids[i][0])] = i+2;
     }
-    data.orders.forEach(function(o) {
-      sheet.appendRow([o.orderId,o.orderDate,o.orderTime,o.value,o.payment,o.status,o.location,o.pincode]);
+    var now = new Date(), add = [], updated = 0;
+    (data.orders||[]).forEach(function(o) {
+      var row = [String(o.orderId),o.orderDate||'',o.orderTime||'',o.value||'',o.payment||'',o.status||'',o.location||'',o.pincode||'',o.dateYMD||'',now];
+      var r = map[String(o.orderId)];
+      if (r) { sheet.getRange(r,1,1,row.length).setValues([row]); updated++; }
+      else add.push(row);
     });
-    return ContentService.createTextOutput(JSON.stringify({ok:true,added:data.orders.length})).setMimeType(ContentService.MimeType.JSON);
-  } catch(e) {
-    return ContentService.createTextOutput(JSON.stringify({ok:false,error:e.message})).setMimeType(ContentService.MimeType.JSON);
+    if (add.length) sheet.getRange(sheet.getLastRow()+1,1,add.length,H.length).setValues(add);
+    return ContentService.createTextOutput(JSON.stringify({ok:true,added:add.length,updated:updated})).setMimeType(ContentService.MimeType.JSON);
+  } catch(err) {
+    return ContentService.createTextOutput(JSON.stringify({ok:false,error:String(err)})).setMimeType(ContentService.MimeType.JSON);
   }
 }`}</pre>
         </details>
