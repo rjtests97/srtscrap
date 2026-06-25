@@ -823,7 +823,8 @@ export default function App(){
     for(let i=0;i<orders.length;i+=200){
       // Only the first batch carries 'replace' (clears the sheet); the rest append.
       const batchMode=i===0?mode:'append'
-      try{const res=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({orders:orders.slice(i,i+200),mode:batchMode})});const d=await res.json();if(d.ok)added+=d.added||0}catch{}
+      // Routed through our same-origin proxy to avoid Apps Script CORS.
+      try{const res=await fetch('/api/sheets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,orders:orders.slice(i,i+200),mode:batchMode})});const d=await res.json();if(d.ok)added+=(d.added||0)+(d.updated||0)}catch{}
       await sleep(500)
     }
     return added
@@ -1423,7 +1424,7 @@ function SettingsTab({brands,active,runs,onDelete,onSync,onImportOrders,inp,lbl,
   useEffect(()=>setUrl(LS.get(`sheets_${active?.id}`,'')),[ active?.id])
   const btn=(e:any={})=>({background:'var(--surface)',border:'1px solid var(--border)',color:'var(--text)',padding:'8px 12px',borderRadius:6,fontSize:10,fontWeight:700,fontFamily:'inherit',cursor:'pointer',...e})
   async function save(){LS.set(`sheets_${active.id}`,url);setStatus('✓ Saved — auto-syncs after every scan')}
-  async function test(){if(!url){setStatus('⚠ Enter URL first');return};setBusy(true);setStatus('Testing...');try{const r=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({orders:[{orderId:'TEST',orderDate:'test',value:'Rs.1',payment:'COD',status:'test',location:'Mumbai',pincode:'400001'}],mode:'test'})});const d=await r.json();setStatus(d.ok?'✓ Connected!':'⚠ '+JSON.stringify(d))}catch(e:any){setStatus('⚠ '+e.message)};setBusy(false)}
+  async function test(){if(!url){setStatus('⚠ Enter URL first');return};setBusy(true);setStatus('Testing...');try{const r=await fetch('/api/sheets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,orders:[{orderId:'TEST',orderDate:'test',value:'Rs.1',payment:'COD',status:'test',location:'Mumbai',pincode:'400001'}],mode:'test'})});const d=await r.json();setStatus(d.ok?'✓ Connected!':'⚠ '+(d.error||JSON.stringify(d)))}catch(e:any){setStatus('⚠ '+e.message)};setBusy(false)}
   async function sync(mode:'append'|'replace'){
     if(!url){setStatus('⚠ Save URL first');return}
     if(!active){setStatus('⚠ Select a brand first');return}
@@ -1540,34 +1541,85 @@ function SettingsTab({brands,active,runs,onDelete,onSync,onImportOrders,inp,lbl,
       </div>
       <div style={{background:'var(--surface)',border:'1px solid var(--border)',borderRadius:8,padding:14,marginBottom:14}}>
         <div style={{fontSize:10,fontWeight:700,color:'var(--accent)',marginBottom:10,textTransform:'uppercase',letterSpacing:'.06em'}}>Google Sheets Sync</div>
-        <div style={{fontSize:9,color:'var(--muted)',marginBottom:10,lineHeight:1.8}}>1. Go to <a href="https://script.google.com" target="_blank" style={{color:'var(--accent)'}}>script.google.com</a> → New project<br/>2. Paste the code below → Deploy as web app (execute as: Me, who has access: Anyone)<br/>3. Copy the /exec URL and paste here</div>
+        <div style={{fontSize:9,color:'var(--muted)',marginBottom:10,lineHeight:1.8}}>Syncs orders to an <b>Orders</b> tab and auto-builds a <b>Dashboard</b> tab (Today / Yesterday / WTD / MTD, top locations & pincodes, status mix + charts).<br/>1. Go to <a href="https://script.google.com" target="_blank" style={{color:'var(--accent)'}}>script.google.com</a> → New project<br/>2. Paste the code below → Deploy as web app (execute as: Me, who has access: Anyone)<br/>3. Copy the /exec URL and paste here</div>
         <details style={{marginBottom:10}}><summary style={{fontSize:9,color:'var(--muted)',cursor:'pointer',marginBottom:6}}>▼ Apps Script code</summary>
-          <pre style={{background:'var(--surface2)',border:'1px solid var(--border)',borderRadius:4,padding:8,fontSize:8,color:'var(--muted)',overflow:'auto',maxHeight:180,lineHeight:1.6,whiteSpace:'pre-wrap'}}>{`function doPost(e) {
-  try {
-    var data = JSON.parse(e.postData.contents);
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
-    var sheet = ss.getSheetByName('Orders') || ss.insertSheet('Orders');
-    var H = ['Order ID','Date','Time','Value','Payment','Status','Location','Pincode','dateYMD','Updated'];
-    if (data.mode === 'replace') sheet.clearContents();
-    if (sheet.getLastRow() === 0) { sheet.appendRow(H); sheet.setFrozenRows(1); }
-    // Upsert by Order ID so re-runs / daily syncs never duplicate.
-    var lastRow = sheet.getLastRow(), map = {};
-    if (lastRow > 1) {
-      var ids = sheet.getRange(2,1,lastRow-1,1).getValues();
-      for (var i=0;i<ids.length;i++) map[String(ids[i][0])] = i+2;
-    }
-    var now = new Date(), add = [], updated = 0;
-    (data.orders||[]).forEach(function(o) {
-      var row = [String(o.orderId),o.orderDate||'',o.orderTime||'',o.value||'',o.payment||'',o.status||'',o.location||'',o.pincode||'',o.dateYMD||'',now];
-      var r = map[String(o.orderId)];
-      if (r) { sheet.getRange(r,1,1,row.length).setValues([row]); updated++; }
-      else add.push(row);
+          <pre style={{background:'var(--surface2)',border:'1px solid var(--border)',borderRadius:4,padding:8,fontSize:8,color:'var(--muted)',overflow:'auto',maxHeight:180,lineHeight:1.6,whiteSpace:'pre-wrap'}}>{`var TZ='Asia/Kolkata';
+var H=['Order ID','Date','Time','Value','Payment','Status','Location','Pincode','dateYMD','Updated'];
+function doPost(e){
+  try{
+    var data=JSON.parse(e.postData.contents||'{}');
+    var ss=SpreadsheetApp.getActiveSpreadsheet();
+    var sheet=ss.getSheetByName('Orders')||ss.insertSheet('Orders');
+    if(data.mode==='replace')sheet.clearContents();
+    if(sheet.getLastRow()===0){sheet.appendRow(H);sheet.setFrozenRows(1);}
+    var lastRow=sheet.getLastRow(),map={};
+    if(lastRow>1){var ids=sheet.getRange(2,1,lastRow-1,1).getValues();for(var i=0;i<ids.length;i++)map[String(ids[i][0])]=i+2;}
+    var now=new Date(),add=[],updated=0;
+    (data.orders||[]).forEach(function(o){
+      var row=[String(o.orderId),o.orderDate||'',o.orderTime||'',o.value||'',o.payment||'',o.status||'',o.location||'',o.pincode||'',o.dateYMD||'',now];
+      var r=map[String(o.orderId)];
+      if(r){sheet.getRange(r,1,1,row.length).setValues([row]);updated++;}else add.push(row);
     });
-    if (add.length) sheet.getRange(sheet.getLastRow()+1,1,add.length,H.length).setValues(add);
-    return ContentService.createTextOutput(JSON.stringify({ok:true,added:add.length,updated:updated})).setMimeType(ContentService.MimeType.JSON);
-  } catch(err) {
-    return ContentService.createTextOutput(JSON.stringify({ok:false,error:String(err)})).setMimeType(ContentService.MimeType.JSON);
-  }
+    if(add.length)sheet.getRange(sheet.getLastRow()+1,1,add.length,H.length).setValues(add);
+    try{rebuildDashboard(ss);}catch(de){}
+    return json({ok:true,added:add.length,updated:updated});
+  }catch(err){return json({ok:false,error:String(err)});}
+}
+function doGet(){try{rebuildDashboard(SpreadsheetApp.getActiveSpreadsheet());}catch(e){}return json({ok:true,msg:'srtscrap sheet sync is live'});}
+function json(o){return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON);}
+function dstr(d){return Utilities.formatDate(d,TZ,'yyyy-MM-dd');}
+function addDays(s,n){var d=new Date(s+'T00:00:00');d.setDate(d.getDate()+n);return dstr(d);}
+function rebuildDashboard(ss){
+  var orders=ss.getSheetByName('Orders');
+  if(!orders||orders.getLastRow()<2)return;
+  var rows=orders.getRange(2,1,orders.getLastRow()-1,H.length).getValues();
+  var today=dstr(new Date()),yest=addDays(today,-1);
+  var wdMap={Mon:1,Tue:2,Wed:3,Thu:4,Fri:5,Sat:6,Sun:7};
+  var dow=wdMap[Utilities.formatDate(new Date(),TZ,'EEE')]||1;
+  var wStart=addDays(today,-(dow-1)),mStart=today.substring(0,8)+'01';
+  var cT=0,cY=0,cW=0,cM=0,total=0,revT=0,revM=0,loc={},pin={},status={},daily={};
+  rows.forEach(function(r){
+    var dy=String(r[8]||'');if(!dy)return;
+    var st=String(r[5]||''),lc=String(r[6]||''),pc=String(r[7]||'');
+    var val=parseFloat(String(r[3]||'').replace(/[^0-9.]/g,''))||0;
+    total++;
+    if(dy===today){cT++;revT+=val;}
+    if(dy===yest)cY++;
+    if(dy>=wStart&&dy<=today)cW++;
+    if(dy>=mStart&&dy<=today){cM++;revM+=val;}
+    if(lc&&lc!=='N/A')loc[lc]=(loc[lc]||0)+1;
+    if(pc&&pc!=='N/A')pin[pc]=(pin[pc]||0)+1;
+    if(st&&st!=='N/A')status[st]=(status[st]||0)+1;
+    if(dy>=addDays(today,-29)&&dy<=today)daily[dy]=(daily[dy]||0)+1;
+  });
+  var topN=function(obj,n){return Object.keys(obj).map(function(k){return [k,obj[k]];}).sort(function(a,b){return b[1]-a[1];}).slice(0,n);};
+  var dash=ss.getSheetByName('Dashboard')||ss.insertSheet('Dashboard',0);
+  dash.getCharts().forEach(function(c){dash.removeChart(c);});
+  dash.clear();
+  dash.getRange('A1').setValue('📊 CXO Dashboard').setFontSize(16).setFontWeight('bold');
+  dash.getRange('A2').setValue('Updated: '+Utilities.formatDate(new Date(),TZ,'dd MMM yyyy, HH:mm')+' IST');
+  var kpis=[['Today',cT],['Yesterday',cY],['Week to date',cW],['Month to date',cM],['Total tracked',total],['Revenue (today)',Math.round(revT)],['Revenue (MTD)',Math.round(revM)]];
+  dash.getRange(4,1,kpis.length,2).setValues(kpis);
+  dash.getRange(4,1,kpis.length,1).setFontWeight('bold');
+  dash.getRange(4,2,kpis.length,1).setFontSize(13).setFontColor('#0a7d33');
+  var tl=topN(loc,10);
+  dash.getRange('D4').setValue('Top Locations').setFontWeight('bold');
+  dash.getRange(5,4,1,2).setValues([['Location','Orders']]).setFontWeight('bold');
+  if(tl.length)dash.getRange(6,4,tl.length,2).setValues(tl);
+  var tp=topN(pin,10);
+  dash.getRange('G4').setValue('Top Pincodes').setFontWeight('bold');
+  dash.getRange(5,7,1,2).setValues([['Pincode','Orders']]).setFontWeight('bold');
+  if(tp.length)dash.getRange(6,7,tp.length,2).setValues(tp.map(function(x){return [String(x[0]),x[1]];}));
+  var tsr=topN(status,12);
+  dash.getRange('J4').setValue('Status Breakdown').setFontWeight('bold');
+  dash.getRange(5,10,1,2).setValues([['Status','Orders']]).setFontWeight('bold');
+  if(tsr.length)dash.getRange(6,10,tsr.length,2).setValues(tsr);
+  var days=[];for(var i=29;i>=0;i--){var d=addDays(today,-i);days.push([d,daily[d]||0]);}
+  dash.getRange(4,14,1,2).setValues([['Date','Orders']]);
+  dash.getRange(5,14,days.length,2).setValues(days);
+  dash.insertChart(dash.newChart().setChartType(Charts.ChartType.COLUMN).addRange(dash.getRange(4,14,days.length+1,2)).setPosition(20,1,0,0).setOption('title','Orders - last 30 days').setOption('legend',{position:'none'}).setOption('width',560).setOption('height',300).build());
+  if(tl.length)dash.insertChart(dash.newChart().setChartType(Charts.ChartType.BAR).addRange(dash.getRange(5,4,tl.length+1,2)).setPosition(20,8,0,0).setOption('title','Top Locations').setOption('legend',{position:'none'}).setOption('width',460).setOption('height',300).build());
+  if(tsr.length)dash.insertChart(dash.newChart().setChartType(Charts.ChartType.PIE).addRange(dash.getRange(5,10,tsr.length+1,2)).setPosition(36,1,0,0).setOption('title','Status mix').setOption('width',460).setOption('height',300).build());
 }`}</pre>
         </details>
         <div style={{marginBottom:8}}><label style={lbl}>Webhook URL</label><input value={url} onChange={(e:any)=>setUrl(e.target.value)} placeholder="https://script.google.com/macros/s/.../exec" style={inp}/></div>
