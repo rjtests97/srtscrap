@@ -69,6 +69,20 @@ https://srtscrap.vercel.app/api/cron/scan?secret=YOUR_SECRET&date=2026-06-24
 You'll get a JSON summary (`found`, `range`, `sheet`) and the rows should
 appear in your Sheet. Drop `&date=...` to scan yesterday.
 
+## CXO Dashboard (automatic)
+
+Every sync also rebuilds a **`Dashboard`** tab in the same spreadsheet — no
+setup beyond pasting the script. It shows:
+
+- KPI cards: **Today, Yesterday, Week-to-date, Month-to-date, Total tracked**,
+  plus revenue (today / MTD) where order values are available.
+- **Top Locations** and **Top Pincodes** (top 10 each).
+- **Status breakdown**.
+- Charts: orders over the last 30 days, top locations, and status mix.
+
+It recomputes on every sync (manual or the daily cron). You can also force a
+refresh anytime by opening the `/exec` URL in a browser.
+
 ## Notes
 
 - Rows are **upserted by Order ID**, so re-running a day never duplicates —
