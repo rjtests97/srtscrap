@@ -323,7 +323,13 @@ class OrderCache {
   }
 
   set(orderId: number|string, order: Order) {
-    this.data[String(orderId)] = this.compact(stripSource(order))
+    const key = String(orderId)
+    const ex = this.data[key]
+    // Never let a masked "archived" fetch downgrade already-captured full data.
+    // Archived pages have no order value/date/location, so an existing entry
+    // that has a real order date is always richer — keep it.
+    if (order.archived && ex && ex.dateYMD) return
+    this.data[key] = this.compact(stripSource(order))
     this.dirty++
     if (this.dirty >= 200) this.flush()
   }
@@ -552,8 +558,10 @@ class Scanner {
           const o=results[i];scanned++
           if(o==='rl'){rlInBurst++;continue}
           if(o!==null){
-            const tagged={...o,source:'fresh' as const}
-            this.cache?.set(ids[i],tagged)  // save to cache
+            // Prefer richer cached data if this order is now archived (masked).
+            const prior=o.archived?this.cache?.get(ids[i]):null
+            const tagged:Order=prior&&prior.dateYMD?{...prior,source:'cache' as const}:{...o,source:'fresh' as const}
+            if(!(prior&&prior.dateYMD))this.cache?.set(ids[i],tagged)  // save to cache
             if(tagged.dateYMD&&tagged.dateYMD>=fromDate&&tagged.dateYMD<=toDate){
               orders.push(tagged);matched++;this.onOrder(tagged)
               this.onLog('#'+ids[i]+'  '+tagged.orderDate+'  '+tagged.value+'  '+tagged.payment+'  '+tagged.location+'  '+tagged.pincode,'ok')
@@ -634,8 +642,11 @@ class Scanner {
           const o=results[i];scanned++
           if(o==='rl'){rlInBurst++;continue}
           if(o!==null){
-            const fo={...o,source:'fresh' as const}
-            this.cache?.set(ids[i],fo)
+            // If this order is now archived (masked) but we already captured its
+            // full data before, keep the richer cached record.
+            const prior=o.archived?this.cache?.get(ids[i]):null
+            const fo:Order=prior&&prior.dateYMD?{...prior,source:'cache' as const}:{...o,source:'fresh' as const}
+            if(!(prior&&prior.dateYMD))this.cache?.set(ids[i],fo)
             orders.push(fo);matched++;consNulls=0;cleanBursts=0
             lastGoodId=ids[i]
             this.onStats?.({lastMatchedId:Scanner.numericPart(fo.orderId)})
