@@ -22,12 +22,17 @@ var TZ = 'Asia/Kolkata';
 var H = ['Order ID','Date','Time','Value','Payment','Status','Location','Pincode','dateYMD','Updated'];
 var MON = { Jan:'01',Feb:'02',Mar:'03',Apr:'04',May:'05',Jun:'06',Jul:'07',Aug:'08',Sep:'09',Oct:'10',Nov:'11',Dec:'12' };
 
-// Resolve a row's YYYY-MM-DD. Prefers the dateYMD column, but falls back to
-// parsing the human "Date" column ("23 May 2026") so rows written by the older
-// 8-column script (no dateYMD) are still counted.
+// Resolve a row's YYYY-MM-DD. Handles three forms because Google Sheets often
+// auto-converts date-looking text into real Date cells:
+//   1. dateYMD cell as a Date object  -> format it
+//   2. dateYMD cell as "2026-05-23"   -> use as-is
+//   3. "Date" cell as a Date object or "23 May 2026" text -> derive it
+// (the "Date" fallback also covers rows written by the older 8-column script).
 function rowYMD(r) {
+  if (Object.prototype.toString.call(r[8]) === '[object Date]') return Utilities.formatDate(r[8], TZ, 'yyyy-MM-dd');
   var dy = String(r[8] || '').trim();
   if (/^\d{4}-\d{2}-\d{2}/.test(dy)) return dy.substring(0, 10);
+  if (Object.prototype.toString.call(r[1]) === '[object Date]') return Utilities.formatDate(r[1], TZ, 'yyyy-MM-dd');
   var m = String(r[1] || '').match(/^(\d{1,2})\s+(\w{3})\s+(\d{4})/);
   return m ? (m[3] + '-' + (MON[m[2]] || '00') + '-' + ('0' + m[1]).slice(-2)) : '';
 }
