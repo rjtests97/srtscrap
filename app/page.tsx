@@ -637,8 +637,19 @@ export default function App(){
     const scanCache=new OrderCache(brand.id, brand.slug||brand.subdomain)
     scanCache.bulkLoad(cleaned,brand.slug||brand.subdomain)
     scanCache.save()
+    // Patch matching orders in ALL existing runs with fresh status + value
+    const freshById:Record<string,Order>=Object.fromEntries(cleaned.map(o=>[String(o.orderId),o]))
+    const existingRuns=LS.get<Run[]>(`runs_${brand.id}`,[])
+    let patchCount=0
+    const patchedRuns=existingRuns.map(r=>({...r,orders:r.orders.map(o=>{
+      const f=freshById[String(o.orderId)]
+      if(!f)return o
+      if(f.status!==o.status||f.valueNum!==o.valueNum||f.payment!==o.payment){patchCount++;return{...o,status:f.status,value:f.value,valueNum:f.valueNum,payment:f.payment}}
+      return o
+    })}))
+    if(patchCount>0)addLog(`Updated ${patchCount} orders in previous runs`,'ok')
     const run:Run={runId:Date.now().toString(),dateRange:label,found:cleaned.length,orders:cleaned,createdAt:new Date().toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'numeric'})}
-    const updated=[run,...LS.get<Run[]>(`runs_${brand.id}`,[])].slice(0,50)
+    const updated=[run,...patchedRuns].slice(0,50)
     LS.set(`runs_${brand.id}`,updated);setRuns(updated);setLastOrders(cleaned);setAnalytics(buildAnalytics(cleaned))
     const toNum=(id:number|string)=>typeof id==='number'?id:parseInt(String(id).replace(/[^0-9]/g,''))||0
     const byDate:Record<string,{min:number,max:number}>={}
@@ -650,7 +661,7 @@ export default function App(){
     const u2={...brand,regressionPoints:merged.slice(-30),avgPerDay:newAvg}
     setActive(u2);setBrands(brands.map(b=>b.id===brand.id?u2:b));LS.set('brands',brands.map(b=>b.id===brand.id?u2:b))
     const url=LS.get(`sheets_${brand.id}`,'')
-    if(url&&cleaned.length>0)syncToSheets(url,cleaned).then(n=>n>0&&addLog(`✓ Sheets: ${n} rows synced`,'ok'))
+    if(url&&cleaned.length>0)syncAllToSheets(brand).then(n=>n>0&&addLog(`✓ Sheets: ${n} rows synced (full replace)`,'ok'))
 
     // POST run data to server so Vercel Cron can access it for daily report
     const allRuns=LS.get<Run[]>(`runs_${brand.id}`,[])
@@ -668,13 +679,72 @@ export default function App(){
     }
   }
 
-  async function syncToSheets(url:string,orders:Order[]):Promise<number>{
+  async function syncToSheets(url:string,orders:Order[],mode:'append'|'replace'='append'):Promise<number>{
     let added=0
     for(let i=0;i<orders.length;i+=200){
-      try{const res=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({orders:orders.slice(i,i+200),mode:i===0?'append':'append'})});const d=await res.json();if(d.ok)added+=d.added||0}catch{}
-      await sleep(500)
+      const chunkMode=mode==='replace'&&i===0?'replace':'append'
+      try{const res=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({orders:orders.slice(i,i+200),mode:chunkMode})});const d=await res.json();if(d.ok)added+=d.added||d.updated||0}catch{}
+      await sleep(400)
     }
     return added
+  }
+
+  async function syncAllToSheets(brand:Brand):Promise<number>{
+    const url=LS.get(`sheets_${brand.id}`,'')
+    if(!url)return 0
+    const allRuns=LS.get<Run[]>(`runs_${brand.id}`,[])
+    const byId:Record<string,Order>={}
+    allRuns.flatMap(r=>r.orders||[]).slice().reverse().forEach(o=>{byId[String(o.orderId)]=o})
+    const deduped=Object.values(byId).sort((a,b)=>String(a.orderId).localeCompare(String(b.orderId)))
+    return syncToSheets(url,deduped,'replace')
+  }
+
+  async function startRescanHistory(brand:Brand,onlyPending:boolean){
+    const allRuns=LS.get<Run[]>(`runs_${brand.id}`,[])
+    const byId:Record<string,Order>={}
+    allRuns.flatMap(r=>r.orders||[]).slice().reverse().forEach(o=>{byId[String(o.orderId)]=o})
+    const unique=Object.values(byId)
+    const toScan=onlyPending?unique.filter(o=>!['delivered','rto delivered'].some(s=>(o.status||'').toLowerCase().includes(s))):unique
+    if(!toScan.length){addLog('Nothing to re-scan','info');return}
+    addLog(`Re-scanning ${toScan.length} orders${onlyPending?' (pending only)':' (all — getting values too)'}...`,'info')
+    setScanning(true);setScanLabel(`Re-scan ${toScan.length}`);ordersRef.current=[]
+    setScanStats({retries:0,recovered:0,duplicates:0,gapJumps:0,lastMatchedId:null})
+    setProgress({done:0,total:toScan.length,found:0})
+    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,
+      (done,total,found)=>{setProgress({done,total,found})},
+      (o)=>{ordersRef.current=[...ordersRef.current,o]},
+      (s)=>setScanStats(p=>mergeScanStats(p,s)),undefined,true)
+    scannerRef.current=scanner
+    try{
+      const updated:Order[]=[]
+      const BATCH=5
+      for(let i=0;i<toScan.length&&!scanner.stopped;i+=BATCH){
+        const chunk=toScan.slice(i,i+BATCH)
+        const ids=chunk.map(o=>typeof o.orderId==='number'?o.orderId:parseInt(String(o.orderId).replace(/[^0-9]/g,''))||0).filter(Boolean)
+        const results=await scanner['fetchBatch'](ids)
+        chunk.forEach((orig,j)=>{
+          const fresh=results[j]
+          if(fresh&&fresh!=='rl'){
+            const merged={...orig,...fresh,orderId:orig.orderId,dateYMD:orig.dateYMD,orderDate:orig.orderDate}
+            updated.push(merged)
+            if(fresh.status!==orig.status)addLog(`#${orig.orderId} ${orig.status} → ${fresh.status}${fresh.valueNum>0?' Rs.'+fresh.valueNum.toFixed(0):''}`,fresh.status.toLowerCase().includes('delivered')?'ok':'info')
+            else if(fresh.valueNum>0&&orig.valueNum===0)addLog(`#${orig.orderId} value recovered: Rs.${fresh.valueNum.toFixed(0)}`,'ok')
+          }else{updated.push(orig)}
+        })
+        setProgress({done:Math.min(i+BATCH,toScan.length),total:toScan.length,found:updated.filter(o=>o.valueNum>0).length})
+        await sleep(600)
+      }
+      // Patch all runs with updated orders
+      const freshById:Record<string,Order>=Object.fromEntries(updated.map(o=>[String(o.orderId),o]))
+      const patched=LS.get<Run[]>(`runs_${brand.id}`,[]).map(r=>({...r,orders:r.orders.map(o=>freshById[String(o.orderId)]||o)}))
+      LS.set(`runs_${brand.id}`,patched);setRuns(patched)
+      const withVal=updated.filter(o=>o.valueNum>0).length
+      const statusChanged=updated.filter((o,i)=>o.status!==toScan[i]?.status).length
+      addLog(`✓ Done: ${statusChanged} status updates, ${withVal} values recovered`,'ok')
+      const sheetsUrl=LS.get(`sheets_${brand.id}`,'')
+      if(sheetsUrl){addLog('Syncing all to Sheets (replace)...','info');syncAllToSheets(brand).then(n=>addLog(`✓ Sheets: ${n} rows`,'ok'))}
+    }catch(e:any){addLog('Re-scan error: '+e.message,'err')}
+    finally{setScanning(false);setScanLabel('')}
   }
 
   function calcETA(done:number,total:number,sat:number):string{
@@ -841,7 +911,7 @@ export default function App(){
           )}
           {tab==='analytics'&&<AnalyticsTab analytics={analytics}/>}
           {tab==='compare'&&<CompareTab brands={brands}/>}
-          {tab==='history'&&<HistoryTab runs={runs} brandName={active.name} onClear={()=>{localStorage.removeItem(`runs_${active.id}`);setRuns([]);setLastOrders([]);setAnalytics(null)}}/>}
+          {tab==='history'&&<HistoryTab runs={runs} brandName={active.name} brand={active} onStartRescan={startRescanHistory} syncAll={syncAllToSheets} onClear={()=>{localStorage.removeItem(`runs_${active.id}`);setRuns([]);setLastOrders([]);setAnalytics(null)}}/>}
           {tab==='settings'&&<SettingsTab brands={brands} active={active} runs={runs} onDelete={deleteBrand} onSync={(url:string,orders:Order[])=>syncToSheets(url,orders)} inp={inp} lbl={lbl} forceRefresh={forceRefresh} setForceRefresh={setForceRefresh}/>}
         </>
       )}
@@ -1079,11 +1149,36 @@ function CompareTab({brands}:{brands:Brand[]}){
   )
 }
 
-function HistoryTab({runs,brandName,onClear}:{runs:Run[],brandName:string,onClear:()=>void}){
+function HistoryTab({runs,brandName,brand,onStartRescan,syncAll,onClear}:any){
   if(!runs.length)return<div style={{textAlign:'center',padding:'40px 20px',color:'var(--muted)',fontSize:11}}>No runs yet.</div>
+  const allOrders=runs.flatMap((r:Run)=>r.orders||[])
+  const byId:Record<string,Order>={}
+  allOrders.slice().reverse().forEach((o:Order)=>{byId[String(o.orderId)]=o})
+  const unique=Object.values(byId)
+  const pending=unique.filter((o:Order)=>!['delivered','rto delivered'].some(s=>(o.status||'').toLowerCase().includes(s))).length
+  const withVal=unique.filter((o:Order)=>(o.valueNum||0)>0).length
   return(
     <div>
-      {runs.map(r=>{const a=buildAnalytics(r.orders);return(
+      {brand&&<div style={{background:'var(--surface)',border:'1px solid var(--border)',borderRadius:8,padding:12,marginBottom:12}}>
+        <div style={{fontSize:10,fontWeight:700,color:'var(--accent)',marginBottom:8,textTransform:'uppercase' as const,letterSpacing:'.05em'}}>🔄 Re-scan & Update History</div>
+        <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:6,marginBottom:8}}>
+          {([['Total Orders',unique.length,'var(--text)'],['Pending/Active',pending,'var(--warn)'],['Have Value',withVal,'var(--accent)']] as [string,number,string][]).map(([l,v,c])=>(
+            <div key={l} style={{background:'var(--surface2)',borderRadius:6,padding:'7px',textAlign:'center' as const}}>
+              <div style={{fontSize:14,fontWeight:700,color:c}}>{v}</div>
+              <div style={{fontSize:8,color:'var(--muted)',marginTop:2}}>{l}</div>
+            </div>
+          ))}
+        </div>
+        <div style={{fontSize:9,color:'var(--muted)',marginBottom:8,lineHeight:1.6}}>
+          Re-scan updates statuses and recovers order values (now re-enabled by Shiprocket). All runs patch in-place — then replaces Google Sheets with latest data.
+        </div>
+        <div style={{display:'flex',gap:6,flexWrap:'wrap' as const}}>
+          <button onClick={()=>onStartRescan(brand,true)} style={{fontSize:9,padding:'7px 12px',background:'var(--warn)',color:'#000',border:'none',borderRadius:5,cursor:'pointer',fontWeight:600,fontFamily:'inherit'}}>↻ Pending Only ({pending})</button>
+          <button onClick={()=>onStartRescan(brand,false)} style={{fontSize:9,padding:'7px 12px',background:'var(--surface2)',color:'var(--text)',border:'1px solid var(--border)',borderRadius:5,cursor:'pointer',fontFamily:'inherit'}}>↻ All Orders ({unique.length}) — gets values</button>
+          <button onClick={()=>syncAll&&syncAll(brand).then((n:number)=>n>0&&alert(`Synced ${n} rows to Sheets`))} style={{fontSize:9,padding:'7px 12px',background:'var(--surface2)',color:'var(--accent)',border:'1px solid var(--accent)',borderRadius:5,cursor:'pointer',fontFamily:'inherit'}}>↑ Sync All to Sheets</button>
+        </div>
+      </div>}
+      {runs.map((r:Run)=>{const a=buildAnalytics(r.orders);return(
         <div key={r.runId} style={{background:'var(--surface)',border:'1px solid var(--border)',borderRadius:8,padding:12,marginBottom:10}}>
           <div style={{display:'flex',justifyContent:'space-between',marginBottom:6}}><span style={{color:'var(--accent)',fontWeight:700,fontSize:12}}>{r.dateRange}</span><span style={{color:'var(--muted)',fontSize:9}}>{r.createdAt}</span></div>
           <div style={{display:'flex',gap:16,fontSize:10,marginBottom:8,flexWrap:'wrap'}}>
