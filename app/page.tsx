@@ -149,7 +149,7 @@ const lightVars={'--bg':'#f5f5f0','--surface':'#fff','--surface2':'#efefea','--b
 const FINAL_STATUSES = ['delivered', 'rto delivered']
 
 // Compact format stored in localStorage
-interface CacheEntry { d:string; dt:string; t:string; s:string; l:string; p:string }
+interface CacheEntry { d:string; dt:string; t:string; s:string; l:string; p:string; v?:number }
 
 class OrderCache {
   private brandId: string
@@ -183,7 +183,9 @@ class OrderCache {
 
   // Convert full Order to compact entry
   private compact(o: Order): CacheEntry {
-    return { d: o.dateYMD||'', dt: o.orderDate, t: o.orderTime, s: o.status, l: o.location, p: o.pincode }
+    const e:CacheEntry = { d: o.dateYMD||'', dt: o.orderDate, t: o.orderTime, s: o.status, l: o.location, p: o.pincode }
+    if(o.valueNum&&o.valueNum>0)e.v=o.valueNum
+    return e
   }
 
   // Reconstruct full Order from compact entry
@@ -191,8 +193,9 @@ class OrderCache {
     const e = this.data[String(orderId)]
     if (!e) return null
     const id = typeof orderId==='number' ? orderId : parseInt(String(orderId))||orderId
+    const hasVal=e.v&&e.v>0
     return { orderId:id, slug:this.brandSlug, orderDate:e.dt, orderTime:e.t, dateYMD:e.d||null,
-      value:'N/A', valueNum:0, payment:'N/A', status:e.s, pincode:e.p, location:e.l, source:'cache' }
+      value:hasVal?`Rs.${e.v!.toFixed(2)}`:'N/A', valueNum:e.v||0, payment:'N/A', status:e.s, pincode:e.p, location:e.l, source:'cache' }
   }
 
   set(orderId: number|string, order: Order) {
@@ -217,9 +220,14 @@ class OrderCache {
 
   save() { if (this.dirty > 0) this.flush() }
 
-  isFinal(orderId: number|string): boolean {
+  // refreshValues=true: re-fetch final orders that have no value captured yet
+  isFinal(orderId: number|string, refreshValues=false): boolean {
     const e = this.data[String(orderId)]
-    return e ? FINAL_STATUSES.some(f => e.s.toLowerCase().includes(f)) : false
+    if(!e)return false
+    const isFinalStatus=FINAL_STATUSES.some(f=>e.s.toLowerCase().includes(f))
+    if(!isFinalStatus)return false
+    if(refreshValues&&(!e.v||e.v===0))return false  // re-fetch to get value
+    return true
   }
 
   stats() {
@@ -257,6 +265,7 @@ class Scanner {
 
   private cache:OrderCache|null=null
   private forceRefresh=false
+  private refreshValues=false
 
   constructor(subdomain:string,slug:string,idPrefix:string,
     onLog:(m:string,c:string)=>void,
@@ -264,10 +273,11 @@ class Scanner {
     onOrder:(o:Order)=>void,
     onStats?:(s:Partial<ScanStats>)=>void,
     cache?:OrderCache,
-    forceRefresh?:boolean){
+    forceRefresh?:boolean,
+    refreshValues?:boolean){
     this.subdomain=subdomain;this.slug=slug;this.idPrefix=idPrefix
     this.onLog=onLog;this.onProgress=onProgress;this.onOrder=onOrder;this.onStats=onStats
-    this.cache=cache||null;this.forceRefresh=forceRefresh||false
+    this.cache=cache||null;this.forceRefresh=forceRefresh||false;this.refreshValues=refreshValues||false
   }
 
   stop(){this.stopped=true}
@@ -392,7 +402,7 @@ class Scanner {
       // ── Cache check: split IDs into cached-final vs needs-fetch ──
       const toFetch:number[]=[]
       for(let id=base;id<=burstEnd;id++){
-        if(!this.forceRefresh&&this.cache?.isFinal(id)){
+        if(!this.forceRefresh&&this.cache?.isFinal(id,this.refreshValues)){
           // Load from cache — no API call needed
           const cached={...this.cache.get(id)!,source:'cache' as const}
           if(cached.dateYMD&&cached.dateYMD>=fromDate&&cached.dateYMD<=toDate){
@@ -481,7 +491,7 @@ class Scanner {
       // Cache check for manual scan
       const toFetchM:number[]=[]
       for(let id=base;id<=burstEnd;id++){
-        if(!this.forceRefresh&&this.cache?.isFinal(id)){
+        if(!this.forceRefresh&&this.cache?.isFinal(id,this.refreshValues)){
           const cached={...this.cache.get(id)!,source:'cache' as const}
           orders.push(cached);matched++;consNulls=0
           lastGoodId=id;this.onOrder(cached)
@@ -581,6 +591,7 @@ export default function App(){
   const[startedAt,setStartedAt]=useState(0)
   const[scanLabel,setScanLabel]=useState('')
   const[forceRefresh,setForceRefresh]=useState(false)
+  const[refreshValues,setRefreshValues]=useState(true)  // re-fetch delivered orders missing values
   const[showAdd,setShowAdd]=useState(false)
   const scannerRef=useRef<Scanner|null>(null)
   const logRef=useRef<HTMLDivElement>(null)
@@ -773,9 +784,12 @@ export default function App(){
     addLog('⚠ Keep this tab active — switching tabs may pause the scan','info')
     const cache=new OrderCache(brand.id, brand.slug||brand.subdomain)
     const cs=cache.stats()
-    if(cs.total>0&&!forceRefresh)addLog(`Cache: ${cs.delivered} delivered (skip) + ${cs.active} active (rescan) — ${cache.sizeKB()}KB`,'ok')
+    if(cs.total>0&&!forceRefresh){
+      const skippable=refreshValues?cs.active:cs.delivered+cs.active
+      addLog(`Cache: ${cs.total} orders | ${refreshValues?cs.delivered+' delivered with value (skip), '+cs.active+' to fetch':cs.delivered+' delivered (skip), '+cs.active+' active'} — ${cache.sizeKB()}KB`,'ok')
+    }
     if(forceRefresh)addLog('Force refresh: ignoring all cache','info')
-    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)),cache,forceRefresh)
+    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)),cache,forceRefresh,refreshValues)
     scannerRef.current=scanner
     try{
       addLog(`Finding boundaries for ${fromDate} → ${toDate}...`,'info')
@@ -807,8 +821,8 @@ export default function App(){
     if(useAuto)addLog(`Auto hard cap set to #${brand.idPrefix||''}${autoHardCap} based on current brand velocity`,'info')
     const cacheM=new OrderCache(brand.id, brand.slug||brand.subdomain)
     const csM=cacheM.stats()
-    if(csM.total>0&&!forceRefresh)addLog(`Cache: ${csM.delivered} delivered (skip) + ${csM.active} active | ${cacheM.sizeKB()}KB`,'ok')
-    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)),cacheM,forceRefresh)
+    if(csM.total>0&&!forceRefresh)addLog(`Cache: ${csM.total} orders | ${refreshValues?csM.delivered+' del+value (skip), '+(csM.active)+' to fetch':csM.delivered+' del (skip), '+csM.active+' active'} — ${cacheM.sizeKB()}KB`,'ok')
+    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)),cacheM,forceRefresh,refreshValues)
     scannerRef.current=scanner
     try{
       const maxId=useAuto?autoHardCap:endId
@@ -876,8 +890,8 @@ export default function App(){
 
           {(tab==='date'||tab==='manual')&&(
             <>
-              {tab==='date'&&<DateTab active={active} scanning={scanning} scanLabel={scanLabel} onStart={(f:string,t:string,c:number)=>startDateScan(f,t,c)} inp={inp} lbl={lbl} forceRefresh={forceRefresh} setForceRefresh={setForceRefresh}/>}
-              {tab==='manual'&&<ManualTab active={active} scanning={scanning} scanLabel={scanLabel} onStart={(si:number,ei:number,c:number,ua:boolean,sa:number)=>startManualScan(si,ei,c,ua,sa)} inp={inp} lbl={lbl} forceRefresh={forceRefresh} setForceRefresh={setForceRefresh}/>}
+              {tab==='date'&&<DateTab active={active} scanning={scanning} scanLabel={scanLabel} onStart={(f:string,t:string,c:number)=>startDateScan(f,t,c)} inp={inp} lbl={lbl} forceRefresh={forceRefresh} setForceRefresh={setForceRefresh} refreshValues={refreshValues} setRefreshValues={setRefreshValues}/>}
+              {tab==='manual'&&<ManualTab active={active} scanning={scanning} scanLabel={scanLabel} onStart={(si:number,ei:number,c:number,ua:boolean,sa:number)=>startManualScan(si,ei,c,ua,sa)} inp={inp} lbl={lbl} forceRefresh={forceRefresh} setForceRefresh={setForceRefresh} refreshValues={refreshValues} setRefreshValues={setRefreshValues}/>}
               {scanning&&(
                 <div style={{marginBottom:10}}>
                   <div style={{display:'flex',justifyContent:'space-between',fontSize:10,color:'var(--muted)',marginBottom:5}}>
@@ -1007,7 +1021,7 @@ function DashboardStrip({runs}:{runs:Run[]}){
   )
 }
 
-function DateTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setForceRefresh}:any){
+function DateTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setForceRefresh,refreshValues,setRefreshValues}:any){
   const[from,setFrom]=useState(yestStr());const[to,setTo]=useState(todayStr());const[conc,setConc]=useState('5')
   const presetBtn=(label:string,f:string,t:string)=><button key={label} onClick={()=>{setFrom(f);setTo(t)}} style={{background:'var(--surface)',border:'1px solid var(--border)',color:'var(--muted)',padding:'6px 10px',borderRadius:20,fontSize:9,fontFamily:'inherit',cursor:'pointer'}}>{label}</button>
   return(
@@ -1034,9 +1048,15 @@ function DateTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setForc
             <select value={conc} onChange={e=>setConc(e.target.value)} style={{...inp,width:'auto',padding:'5px 8px',fontSize:11}}>{['3','5','8','10','15'].map(v=><option key={v} value={v}>{v}</option>)}</select>
             <span style={{fontSize:9}}>(higher = faster)</span>
           </div>
-          <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:8,padding:'6px 10px',background:'var(--surface)',borderRadius:6,border:'1px solid var(--border)'}}>
-            <input type="checkbox" id="fr_date" checked={forceRefresh} onChange={(e:any)=>setForceRefresh(e.target.checked)} style={{accentColor:'var(--accent)',width:13,height:13,cursor:'pointer'}}/>
-            <label htmlFor="fr_date" style={{fontSize:9,color:'var(--muted)',cursor:'pointer',lineHeight:1.4}}>Force Refresh — re-scan all IDs, ignore cache (slow)</label>
+          <div style={{display:'flex',flexDirection:'column' as const,gap:5,marginBottom:8,padding:'8px 10px',background:'var(--surface)',borderRadius:6,border:'1px solid var(--border)'}}>
+            <div style={{display:'flex',alignItems:'center',gap:6}}>
+              <input type="checkbox" id="rv_date" checked={refreshValues} onChange={(e:any)=>setRefreshValues(e.target.checked)} style={{accentColor:'var(--accent)',width:13,height:13,cursor:'pointer'}}/>
+              <label htmlFor="rv_date" style={{fontSize:9,color:'var(--text)',cursor:'pointer',fontWeight:600}}>↻ Refresh missing values — re-fetch Delivered orders with no value</label>
+            </div>
+            <div style={{display:'flex',alignItems:'center',gap:6}}>
+              <input type="checkbox" id="fr_date" checked={forceRefresh} onChange={(e:any)=>setForceRefresh(e.target.checked)} style={{accentColor:'var(--warn)',width:13,height:13,cursor:'pointer'}}/>
+              <label htmlFor="fr_date" style={{fontSize:9,color:'var(--muted)',cursor:'pointer'}}>Force Refresh — ignore cache entirely</label>
+            </div>
           </div>
           <button onClick={()=>onStart(from,to,parseInt(conc))} style={{width:'100%',background:'var(--accent)',color:'#000',border:'none',padding:11,borderRadius:8,fontSize:12,fontWeight:700,letterSpacing:'.06em',textTransform:'uppercase',marginBottom:12,fontFamily:'inherit',cursor:'pointer'}}>🔍 FIND &amp; SCRAPE</button>
         </>
@@ -1045,7 +1065,7 @@ function DateTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setForc
   )
 }
 
-function ManualTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setForceRefresh}:any){
+function ManualTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setForceRefresh,refreshValues,setRefreshValues}:any){
   const[startId,setStartId]=useState('');const[endId,setEndId]=useState('');const[useAuto,setUseAuto]=useState(false);const[stopAfter,setStopAfter]=useState('500');const[conc,setConc]=useState('5')
   const pfx=active.idPrefix||''
   const recommendedStop=recommendedAutoStop(parseInt(conc)||5,active?.avgPerDay||0)
@@ -1079,9 +1099,15 @@ function ManualTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setFo
             if(!useAuto&&!parsedEnd){alert('Enter a valid numeric End ID');return}
             onStart(parsedStart,parsedEnd,parseInt(conc),useAuto,parseInt(stopAfter))
           }} style={{width:'100%',background:'var(--accent)',color:'#000',border:'none',padding:11,borderRadius:8,fontSize:12,fontWeight:700,letterSpacing:'.06em',textTransform:'uppercase',marginBottom:12,fontFamily:'inherit',cursor:'pointer'}}>▶ START MANUAL SCRAPE</button>
-          <div style={{display:'flex',alignItems:'center',gap:8,marginTop:-6,marginBottom:8,padding:'6px 10px',background:'var(--surface)',borderRadius:6,border:'1px solid var(--border)'}}>
-            <input type="checkbox" id="fr_manual" checked={forceRefresh} onChange={(e:any)=>setForceRefresh(e.target.checked)} style={{accentColor:'var(--accent)',width:13,height:13,cursor:'pointer'}}/>
-            <label htmlFor="fr_manual" style={{fontSize:9,color:'var(--muted)',cursor:'pointer',lineHeight:1.4}}>Force Refresh — re-scan all IDs, ignore cache (slow)</label>
+          <div style={{display:'flex',flexDirection:'column' as const,gap:5,marginTop:-6,marginBottom:8,padding:'8px 10px',background:'var(--surface)',borderRadius:6,border:'1px solid var(--border)'}}>
+            <div style={{display:'flex',alignItems:'center',gap:6}}>
+              <input type="checkbox" id="rv_manual" checked={refreshValues} onChange={(e:any)=>setRefreshValues(e.target.checked)} style={{accentColor:'var(--accent)',width:13,height:13,cursor:'pointer'}}/>
+              <label htmlFor="rv_manual" style={{fontSize:9,color:'var(--text)',cursor:'pointer',fontWeight:600}}>↻ Refresh missing values — re-fetch Delivered orders with no value (recommended)</label>
+            </div>
+            <div style={{display:'flex',alignItems:'center',gap:6}}>
+              <input type="checkbox" id="fr_manual" checked={forceRefresh} onChange={(e:any)=>setForceRefresh(e.target.checked)} style={{accentColor:'var(--warn)',width:13,height:13,cursor:'pointer'}}/>
+              <label htmlFor="fr_manual" style={{fontSize:9,color:'var(--muted)',cursor:'pointer'}}>Force Refresh — re-scan everything including Delivered (very slow)</label>
+            </div>
           </div>
         </>
       )}
