@@ -1,7 +1,7 @@
 {
   "crons": [
     {
-      "path": "/api/cron/scan",
+      "path": "/api/cron/daily-report",
       "schedule": "30 2 * * *"
     }
   ]

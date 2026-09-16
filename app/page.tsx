@@ -1,8 +1,8 @@
 'use client'
-import { useState, useEffect, useRef, useCallback, ChangeEvent } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 
 interface Brand { id:string; name:string; subdomain:string; slug:string; companyName:string; anchorId:number; anchorDate:string; avgPerDay:number; regressionPoints:Array<{date:string,id:number}>; idPrefix:string }
-interface Order { orderId:number|string; slug:string; orderDate:string; orderTime:string; dateYMD:string|null; value:string; valueNum:number; payment:string; status:string; pincode:string; location:string; source?:'cache'|'fresh'; archived?:boolean; awb?:string|null; deliveredDate?:string|null }
+interface Order { orderId:number|string; slug:string; orderDate:string; orderTime:string; dateYMD:string|null; value:string; valueNum:number; payment:string; status:string; pincode:string; location:string; source?:'cache'|'fresh' }
 interface Run { runId:string; dateRange:string; found:number; orders:Order[]; createdAt:string }
 interface Analytics {
   totalOrders:number
@@ -37,10 +37,7 @@ const esc=(v:any)=>`"${String(v??'').replace(/"/g,'""')}"`
 const fmt=(n:number)=>'Rs.'+Number(n||0).toFixed(2)
 const RTO=new Set(['HUB','ETAIL','E-TAIL','SORTING','GATEWAY','DEPOT','FACILITY','WAREHOUSE','PROCESSING','COUNTER','DISPATCH','SURFACE'])
 const isRTO=(c:string)=>{const u=(c||'').toUpperCase().trim();if(!u||u==='N/A')return true;return u.split(/[\s,\-]+/).some(w=>RTO.has(w))}
-// Order IDs are contiguous (no gaps), so a short consecutive-miss streak
-// reliably means the end of the range. ~100 is plenty; scale mildly with
-// concurrency since a wide batch can overshoot the true end.
-const recommendedAutoStop=(concurrency:number,_avgPerDay:number)=>Math.max(100,concurrency*10)
+const recommendedAutoStop=(concurrency:number,avgPerDay:number)=>Math.max(250,concurrency*100,Math.ceil((avgPerDay||0)*4))
 const uniqueOrders=(orders:Order[])=>Object.values(Object.fromEntries(orders.map(o=>[String(o.orderId),o])))
 const mergeScanStats=(prev:ScanStats,patch:Partial<ScanStats>):ScanStats=>({
   retries: prev.retries + (patch.retries||0),
@@ -53,30 +50,6 @@ const normalizeId=(v:any):number=>{
   const digits=String(v??'').replace(/[^0-9]/g,'')
   const n=digits?Number(digits):NaN
   return Number.isFinite(n)&&n>0?Math.floor(n):0
-}
-const normalizeStatus=(status:string)=>String(status||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim()
-// "delivered" — used for the daily-report delivered COUNT (delivered only).
-const isFinalStatus=(status:string)=>normalizeStatus(status)==='delivered'
-// Terminal statuses that never change again → safe to serve from cache and
-// never re-scan. Everything else (Pending, In Transit, Picked Up, …) may still
-// transition, so it gets re-checked each scan.
-const TERMINAL_STATUSES=new Set(['delivered','rto delivered','cancelled','lost'])
-const isTerminalStatus=(status:string)=>TERMINAL_STATUSES.has(normalizeStatus(status))
-const stripSource=(order:Order):Order=>{
-  const { source, ...rest } = order
-  return rest
-}
-const mergeOrdersById=(orders:Order[])=>Object.values(Object.fromEntries(orders.map(order=>[String(order.orderId),order])))
-const loadBrandRuns=(brandId:string)=>LS.get<Run[]>(`runs_${brandId}`,[])
-const loadHistoricalOrders=(brandId:string):Order[]=>{
-  const merged = new Map<string, Order>()
-  loadBrandRuns(brandId).forEach(run=>{
-    run.orders.forEach(order=>{
-      const key=String(order.orderId)
-      if(!merged.has(key))merged.set(key, order)
-    })
-  })
-  return Array.from(merged.values())
 }
 
 function buildAnalytics(orders:Order[]):Analytics|null {
@@ -103,7 +76,7 @@ function buildAnalytics(orders:Order[]):Analytics|null {
   return{totalOrders:N,totalRevenue:rev,avgOrderVal:rev/N,codCount:cod.length,prepaidCount:N-cod.length,codPct:Math.round((cod.length/N)*100),topCities,topPincodes,repeatLocations,statuses,daily,hours,valueBuckets:valMap,velocity,avgDailyOrders:Math.round((N/Math.max(daily.length,1))*10)/10,avgDailyRevenue:rev/Math.max(daily.length,1),revenueMomentum}
 }
 
-function buildCSV(orders:Order[]){let s='Order ID,Date,Time,Value,Payment,Status,Location,Pincode,Source\n';sortOrders(orders).forEach(r=>s+=`${esc(r.orderId)},${esc(r.orderDate)},${esc(r.orderTime)},${esc(r.value)},${esc(r.payment)},${esc(r.status)},${esc(r.location)},${esc(r.pincode)},${esc(r.source||'fresh')}\n`);return s}
+function buildCSV(orders:Order[]){let s='Order ID,Date,Time,Value,Payment,Status,Location,Pincode,Source\n';sortOrders(orders).forEach(r=>s+=`${esc(r.orderId)},${esc(r.orderDate)},${esc(r.orderTime)},${esc(r.value)},${esc(r.payment)},${esc(r.status)},${esc(r.location)},${esc(r.pincode)}\n`);return s}
 function buildReport(orders:Order[],brandName:string,dateRange:string){
   const a=buildAnalytics(orders);if(!a)return''
   const fd=(ymd:string)=>{const[y,m,d]=ymd.split('-');return new Date(+y,+m-1,+d).toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'numeric'})}
@@ -163,45 +136,20 @@ function buildWhatsappSummary(orders:Order[],brandName:string,dateRange:string){
   const top=a.topCities[0],pin=a.topPincodes[0],status=a.statuses[0]
   return `📦 *${brandName}*\nRange: ${dateRange}\nOrders: *${a.totalOrders}* | Revenue: *${fmtRs(a.totalRevenue)}*\nAOV: ${fmtRs(a.avgOrderVal)} | COD: ${a.codCount} (${a.codPct}%)\nDaily Avg: ${a.avgDailyOrders} orders | ${fmtRs(a.avgDailyRevenue)}\n`+(top?`Top city: ${top.city} (${top.count})\n`:'')+(pin?`Top pin: ${pin.pincode} (${pin.count})\n`:'')+(status?`Lead status: ${status.status} (${status.count})\n`:'')+`Trend: ${a.velocity} | Revenue momentum: ${a.revenueMomentum}%`
 }
-function buildUnifiedRangeOrders(cache:OrderCache, scannedOrders:Order[], fromDate:string, toDate:string, forceRefresh:boolean):Order[] {
-  if (forceRefresh) return mergeOrdersById(scannedOrders)
-  const cachedRange = cache.getRange(fromDate, toDate).filter(order => cache.isFinal(order.orderId))
-  return mergeOrdersById([...cachedRange, ...scannedOrders])
-}
-function hydrateCacheFromHistory(brand:Brand, cache:OrderCache){
-  const historical = loadHistoricalOrders(brand.id).map(order=>({
-    ...order,
-    slug: order.slug || brand.slug || brand.subdomain,
-  }))
-  if(!historical.length)return { total: 0, delivered: 0 }
-  cache.bulkLoad(historical, brand.slug||brand.subdomain)
-  const delivered = historical.filter(order=>isFinalStatus(order.status)).length
-  return { total: historical.length, delivered }
-}
 
 const darkVars={'--bg':'#0d0d0d','--surface':'#161616','--surface2':'#1e1e1e','--border':'#252525','--accent':'#00ff88','--warn':'#ff6b35','--text':'#e8e8e8','--muted':'#555','--red':'#ff4444'}
 const lightVars={'--bg':'#f5f5f0','--surface':'#fff','--surface2':'#efefea','--border':'#ddd','--accent':'#008844','--warn':'#cc5500','--text':'#111','--muted':'#888','--red':'#cc2222'}
 
 
 // ── Order Cache ───────────────────────────────────────
-// Persistent full-order cache keyed by Order ID.
-// Legacy compact entries are migrated on load and refreshed on first use.
-// Only fully cached Delivered orders are treated as final and skipped.
+// Compact storage: ~80 bytes/order (vs ~250 for full Order)
+// Fits 5000+ orders in <500KB localStorage
+// Final states: Delivered, RTO Delivered → never re-scanned
 
-type CacheEntry = Omit<Order,'source'>
-interface LegacyCacheEntry { d?:string; dt?:string; t?:string; s?:string; l?:string; p?:string }
-interface StoredCacheEntry {
-  sg?:string
-  dt?:string
-  t?:string
-  d?:string
-  v?:string
-  vn?:number
-  py?:string
-  s?:string
-  p?:string
-  l?:string
-}
+const FINAL_STATUSES = ['delivered', 'rto delivered']
+
+// Compact format stored in localStorage
+interface CacheEntry { d:string; dt:string; t:string; s:string; l:string; p:string; v?:number }
 
 class OrderCache {
   private brandId: string
@@ -219,74 +167,13 @@ class OrderCache {
   private load() {
     try {
       const raw = localStorage.getItem(this.key())
-      const parsed = raw ? JSON.parse(raw) : {}
-      this.data = Object.fromEntries(
-        Object.entries(parsed || {}).map(([id, entry]) => [id, this.normalizeEntry(id, entry as CacheEntry | LegacyCacheEntry | StoredCacheEntry)])
-      )
+      this.data = raw ? JSON.parse(raw) : {}
     } catch { this.data = {} }
-  }
-
-  private normalizeEntry(orderId: string, entry: CacheEntry | LegacyCacheEntry | StoredCacheEntry): CacheEntry {
-    const stored = entry as StoredCacheEntry
-    if ('sg' in stored || 'py' in stored || 'vn' in stored) {
-      return {
-        orderId: normalizeId(orderId) || orderId,
-        slug: stored.sg || this.brandSlug,
-        orderDate: stored.dt || 'N/A',
-        orderTime: stored.t || 'N/A',
-        dateYMD: stored.d || null,
-        value: stored.v || 'N/A',
-        valueNum: Number(stored.vn || 0),
-        payment: stored.py || 'N/A',
-        status: stored.s || 'N/A',
-        pincode: stored.p || 'N/A',
-        location: stored.l || 'N/A',
-      }
-    }
-
-    const full = entry as Partial<CacheEntry>
-    if ('orderDate' in full || 'payment' in full || 'value' in full) {
-      return {
-        orderId: normalizeId(full.orderId ?? orderId) || String(full.orderId ?? orderId),
-        slug: full.slug || this.brandSlug,
-        orderDate: full.orderDate || 'N/A',
-        orderTime: full.orderTime || 'N/A',
-        dateYMD: full.dateYMD || null,
-        value: full.value || 'N/A',
-        valueNum: Number(full.valueNum || 0),
-        payment: full.payment || 'N/A',
-        status: full.status || 'N/A',
-        pincode: full.pincode || 'N/A',
-        location: full.location || 'N/A',
-      }
-    }
-
-    const legacy = entry as LegacyCacheEntry
-    return {
-      orderId: normalizeId(orderId) || orderId,
-      slug: this.brandSlug,
-      orderDate: legacy.dt || 'N/A',
-      orderTime: legacy.t || 'N/A',
-      dateYMD: legacy.d || null,
-      value: 'N/A',
-      valueNum: 0,
-      payment: 'N/A',
-      status: legacy.s || 'N/A',
-      pincode: legacy.p || 'N/A',
-      location: legacy.l || 'N/A',
-    }
-  }
-
-  private canTreatAsFinal(entry: CacheEntry) {
-    return isTerminalStatus(entry.status)
   }
 
   private flush() {
     try {
-      const serialized = Object.fromEntries(
-        Object.entries(this.data).map(([id, entry]) => [id, this.serializeEntry(entry)])
-      )
-      localStorage.setItem(this.key(), JSON.stringify(serialized))
+      localStorage.setItem(this.key(), JSON.stringify(this.data))
       this.dirty = 0
     } catch(e) {
       console.error('OrderCache flush failed:', e, 'entries:', Object.keys(this.data).length)
@@ -294,63 +181,37 @@ class OrderCache {
     }
   }
 
-  private serializeEntry(entry: CacheEntry): StoredCacheEntry {
-    return {
-      sg: entry.slug || '',
-      dt: entry.orderDate || 'N/A',
-      t: entry.orderTime || 'N/A',
-      d: entry.dateYMD || '',
-      v: entry.value || 'N/A',
-      vn: Number(entry.valueNum || 0),
-      py: entry.payment || 'N/A',
-      s: entry.status || 'N/A',
-      p: entry.pincode || 'N/A',
-      l: entry.location || 'N/A',
-    }
-  }
-
+  // Convert full Order to compact entry
   private compact(o: Order): CacheEntry {
-    return {
-      orderId: o.orderId,
-      slug: o.slug || this.brandSlug,
-      orderDate: o.orderDate || 'N/A',
-      orderTime: o.orderTime || 'N/A',
-      dateYMD: o.dateYMD || null,
-      value: o.value || 'N/A',
-      valueNum: Number(o.valueNum || 0),
-      payment: o.payment || 'N/A',
-      status: o.status || 'N/A',
-      pincode: o.pincode || 'N/A',
-      location: o.location || 'N/A',
-    }
+    const e:CacheEntry = { d: o.dateYMD||'', dt: o.orderDate, t: o.orderTime, s: o.status, l: o.location, p: o.pincode }
+    if(o.valueNum&&o.valueNum>0)e.v=o.valueNum
+    return e
   }
 
+  // Reconstruct full Order from compact entry
   get(orderId: number|string): Order|null {
     const e = this.data[String(orderId)]
     if (!e) return null
-    return { ...e, source:'cache' }
+    const id = typeof orderId==='number' ? orderId : parseInt(String(orderId))||orderId
+    const hasVal=e.v&&e.v>0
+    return { orderId:id, slug:this.brandSlug, orderDate:e.dt, orderTime:e.t, dateYMD:e.d||null,
+      value:hasVal?`Rs.${e.v!.toFixed(2)}`:'N/A', valueNum:e.v||0, payment:'N/A', status:e.s, pincode:e.p, location:e.l, source:'cache' }
   }
 
   set(orderId: number|string, order: Order) {
-    const key = String(orderId)
-    const ex = this.data[key]
-    // Never let a masked "archived" fetch downgrade already-captured full data.
-    // Archived pages have no order value/date/location, so an existing entry
-    // that has a real order date is always richer — keep it.
-    if (order.archived && ex && ex.dateYMD) return
-    this.data[key] = this.compact(stripSource(order))
+    this.data[String(orderId)] = this.compact(order)
     this.dirty++
     if (this.dirty >= 200) this.flush()
   }
 
+  // Bulk load — single localStorage write at end (no intermediate flushes)
   bulkLoad(orders: Order[], defaultSlug='') {
     let added=0, skipped=0
     orders.forEach(o => {
       const key = String(o.orderId)
-      const incoming = this.compact({ ...stripSource(o), slug: o.slug || defaultSlug || this.brandSlug })
       const ex = this.data[key]
-      if (ex && this.canTreatAsFinal(ex) && isTerminalStatus(incoming.status)) { skipped++; return }
-      this.data[key] = incoming
+      if (ex && FINAL_STATUSES.some(f => ex.s.toLowerCase().includes(f))) { skipped++; return }
+      this.data[key] = this.compact(o)
       added++
     })
     this.dirty += added
@@ -359,25 +220,19 @@ class OrderCache {
 
   save() { if (this.dirty > 0) this.flush() }
 
-  // Every cached order (most complete merged view) — used to seed the Sheet.
-  all(): Order[] {
-    return Object.values(this.data).map(e => ({ ...e, source: 'cache' as const }))
-  }
-
-  isFinal(orderId: number|string): boolean {
+  // refreshValues=true: re-fetch final orders that have no value captured yet
+  isFinal(orderId: number|string, refreshValues=false): boolean {
     const e = this.data[String(orderId)]
-    return e ? this.canTreatAsFinal(e) : false
-  }
-
-  getRange(fromDate:string,toDate:string):Order[] {
-    return Object.values(this.data)
-      .filter(entry => entry.dateYMD && entry.dateYMD >= fromDate && entry.dateYMD <= toDate)
-      .map(entry => ({ ...entry, source:'cache' as const }))
+    if(!e)return false
+    const isFinalStatus=FINAL_STATUSES.some(f=>e.s.toLowerCase().includes(f))
+    if(!isFinalStatus)return false
+    if(refreshValues&&(!e.v||e.v===0))return false  // re-fetch to get value
+    return true
   }
 
   stats() {
     const keys = Object.keys(this.data)
-    const delivered = keys.filter(k => this.canTreatAsFinal(this.data[k])).length
+    const delivered = keys.filter(k => FINAL_STATUSES.some(f => this.data[k].s.toLowerCase().includes(f))).length
     return { total: keys.length, delivered, active: keys.length - delivered }
   }
 
@@ -410,6 +265,7 @@ class Scanner {
 
   private cache:OrderCache|null=null
   private forceRefresh=false
+  private refreshValues=false
 
   constructor(subdomain:string,slug:string,idPrefix:string,
     onLog:(m:string,c:string)=>void,
@@ -417,10 +273,11 @@ class Scanner {
     onOrder:(o:Order)=>void,
     onStats?:(s:Partial<ScanStats>)=>void,
     cache?:OrderCache,
-    forceRefresh?:boolean){
+    forceRefresh?:boolean,
+    refreshValues?:boolean){
     this.subdomain=subdomain;this.slug=slug;this.idPrefix=idPrefix
     this.onLog=onLog;this.onProgress=onProgress;this.onOrder=onOrder;this.onStats=onStats
-    this.cache=cache||null;this.forceRefresh=forceRefresh||false
+    this.cache=cache||null;this.forceRefresh=forceRefresh||false;this.refreshValues=refreshValues||false
   }
 
   stop(){this.stopped=true}
@@ -526,33 +383,16 @@ class Scanner {
     return{scanStart,scanEnd}
   }
 
-  // Reconcile a freshly-fetched order with whatever we already hold in cache.
-  // Archived pages are masked (no value/date/location). If we already captured
-  // this order's full data, keep the rich fields and only adopt the latest
-  // status + delivered date from the archived page — so a Pending→Delivered
-  // transition is recorded (and the order becomes terminal/skippable) without
-  // losing the data we can no longer fetch.
-  private reconcile(id:number, fetched:Order):Order{
-    if(!fetched.archived) return {...fetched, source:'fresh'}
-    const prior=this.cache?.get(id)
-    if(prior&&prior.dateYMD){
-      return {...prior, status:fetched.status||prior.status, deliveredDate:fetched.deliveredDate??prior.deliveredDate, source:'cache'}
-    }
-    return {...fetched, source:'fresh'}
-  }
-
-  // Adaptive burst controller. There is no real server-side rate limit (the
-  // origin answers every request in ~0.3s), so rests are short; the adaptive
-  // shrink/grow only kicks in on genuine transient errors (timeouts).
-  private static BURST_MAX=120
-  private static BURST_MIN=20
-  private static REST_BASE=400   // ms between bursts
+  // Adaptive burst controller
+  // Starts at BURST_MAX, halves on RL cooldown, recovers slowly
+  private static BURST_MAX=80
+  private static BURST_MIN=10
+  private static REST_BASE=3000  // ms between bursts
 
   async scanRange(scanStart:number,scanEnd:number,fromDate:string,toDate:string,concurrency:number,startedAt:number):Promise<Order[]>{
     const orders:Order[]=[]
     let scanned=0,matched=0,fromCacheCount=0,burstNum=0
-    // Warm up small so the first burst doesn't trip rate limiting; grows on clean bursts.
-    let burstSize=Scanner.BURST_MIN
+    let burstSize=Scanner.BURST_MAX
     const total=scanEnd-scanStart+1
 
     for(let base=scanStart;base<=scanEnd&&!this.stopped;){
@@ -562,7 +402,7 @@ class Scanner {
       // ── Cache check: split IDs into cached-final vs needs-fetch ──
       const toFetch:number[]=[]
       for(let id=base;id<=burstEnd;id++){
-        if(!this.forceRefresh&&this.cache?.isFinal(id)){
+        if(!this.forceRefresh&&this.cache?.isFinal(id,this.refreshValues)){
           // Load from cache — no API call needed
           const cached={...this.cache.get(id)!,source:'cache' as const}
           if(cached.dateYMD&&cached.dateYMD>=fromDate&&cached.dateYMD<=toDate){
@@ -588,8 +428,7 @@ class Scanner {
           const o=results[i];scanned++
           if(o==='rl'){rlInBurst++;continue}
           if(o!==null){
-            // Merge archived (masked) results onto any richer cached record.
-            const tagged=this.reconcile(ids[i],o)
+            const tagged={...o,source:'fresh' as const}
             this.cache?.set(ids[i],tagged)  // save to cache
             if(tagged.dateYMD&&tagged.dateYMD>=fromDate&&tagged.dateYMD<=toDate){
               orders.push(tagged);matched++;this.onOrder(tagged)
@@ -622,74 +461,115 @@ class Scanner {
   async scanManual(startId:number,endId:number,concurrency:number,useAuto:boolean,stopAfter:number,startedAt:number):Promise<Order[]>{
     const orders:Order[]=[]
     let scanned=0,matched=0,consNulls=0,burstNum=0
-    let cacheHits=0,fetched=0,statusUpdates=0
-    // Warm up small, grow on clean bursts, shrink only on genuine transient errors.
-    let burstSize=Scanner.BURST_MIN
-    let cleanBursts=0
-    let ended=false
+    let lastGoodId:number|null=null
+    // Adaptive burst: shrinks on RL, recovers after clean bursts
+    let burstSize=Scanner.BURST_MAX
+    let cleanBursts=0      // consecutive bursts with no RL
+    let rlCooldowns=0      // total RL cooldowns taken (for escalating wait)
 
-    for(let base=startId;base<=endId&&!this.stopped&&!ended;){
+    // Check if we're rate-limited by probing a known-good ID 3 times
+    // Only declare "genuine end" if ALL 3 probes return a real order
+    const isRateLimited=async():Promise<boolean>=>{
+      if(!lastGoodId)return false
+      this.onLog('Verifying x3 on #'+this.toId(lastGoodId)+'...','info')
+      let successCount=0
+      for(let i=0;i<3;i++){
+        const r=(await this.callProxy([lastGoodId]))[0]
+        if(r&&r!=='rl'&&r!==null)successCount++
+        await sleep(2000)
+      }
+      const rl=successCount<3  // rate limited if ANY probe fails
+      this.onLog(rl?'Rate limited ('+successCount+'/3 probes succeeded)':'All 3 probes OK — genuine end','info')
+      return rl
+    }
+
+    for(let base=startId;base<=endId&&!this.stopped;){
       const burstEnd=Math.min(base+burstSize-1,endId)
       burstNum++
+      this.onLog('Burst '+burstNum+' (sz='+burstSize+'): #'+this.toId(base)+' → #'+this.toId(burstEnd),'info')
 
-      // ── Cache: skip terminal/delivered orders entirely (no fetch) ──
+      // Cache check for manual scan
       const toFetchM:number[]=[]
       for(let id=base;id<=burstEnd;id++){
-        if(!this.forceRefresh&&this.cache?.isFinal(id)){
+        if(!this.forceRefresh&&this.cache?.isFinal(id,this.refreshValues)){
           const cached={...this.cache.get(id)!,source:'cache' as const}
-          orders.push(cached);matched++;consNulls=0;cacheHits++
-          this.onOrder(cached)
+          orders.push(cached);matched++;consNulls=0
+          lastGoodId=id;this.onOrder(cached)
+          this.onLog('#'+id+'  '+cached.orderDate+'  [cached '+cached.status+']','ok')
           scanned++
         }else toFetchM.push(id)
       }
-      this.onLog('Burst '+burstNum+' (sz='+burstSize+'): #'+this.toId(base)+'→#'+this.toId(burstEnd)+' | '+(burstEnd-base+1-toFetchM.length)+' cached, '+toFetchM.length+' to fetch','info')
 
-      let errInBurst=0
-      for(let b=0;b<toFetchM.length&&!this.stopped&&!ended;b+=concurrency){
+      let rlInBurst=0
+      for(let b=0;b<toFetchM.length&&!this.stopped;b+=concurrency){
         const ids=toFetchM.slice(b,b+concurrency)
         const results=await this.fetchBatch(ids)
 
         for(let i=0;i<ids.length&&!this.stopped;i++){
           const o=results[i];scanned++
-          if(o==='rl'){errInBurst++;continue}  // genuine transient error (timeout)
+          if(o==='rl'){rlInBurst++;continue}
           if(o!==null){
-            fetched++
-            const fo=this.reconcile(ids[i],o)
-            if(o.archived&&!fo.archived)statusUpdates++  // archived masked merged onto cached full data
+            const fo={...o,source:'fresh' as const}
             this.cache?.set(ids[i],fo)
             orders.push(fo);matched++;consNulls=0;cleanBursts=0
+            lastGoodId=ids[i]
             this.onStats?.({lastMatchedId:Scanner.numericPart(fo.orderId)})
             this.onOrder(fo)
-            this.onLog(fo.archived
-              ?'#'+ids[i]+'  [archived '+fo.status+']  '+fo.orderDate+(fo.deliveredDate?'  delivered '+fo.deliveredDate:'')
-              :'#'+ids[i]+'  '+fo.orderDate+'  '+fo.value+'  '+fo.payment+'  '+fo.location+(o.archived?'  [status←'+fo.status+']':''),'ok')
+            this.onLog('#'+ids[i]+'  '+fo.orderDate+'  '+fo.value+'  '+fo.payment+'  '+fo.location,'ok')
           }else{
             consNulls++
-            // ~stopAfter consecutive missing AWBs (IDs are contiguous) = genuine end.
+            // Reached null threshold — check if rate-limited before stopping/waiting
             if(useAuto&&consNulls>=stopAfter){
-              this.onLog('Genuine end of orders — '+consNulls+' consecutive misses after '+matched+' orders','ok')
-              ended=true;this.stopped=true;break
+              const rl=await isRateLimited()
+              if(!rl){
+                // Genuine end
+                this.onLog('Genuine end of orders after '+matched+' orders','ok')
+                this.stopped=true
+                break
+              }
+              // Rate limited — escalating cooldown
+              rlCooldowns++
+              cleanBursts=0
+              // Cooldown escalates: 120s, 180s, 300s, 300s, ...
+              const coolSec=[30,60,90,180,300][Math.min(rlCooldowns-1,4)]
+              this.onLog('Rate-limit cooldown #'+rlCooldowns+' — waiting '+coolSec+'s then resuming...','info')
+              await this.wait(coolSec*1000,'Cooldown')
+              if(this.stopped)break
+              // After cooldown: shrink burst size and reset null counter
+              burstSize=Math.max(Scanner.BURST_MIN,Math.floor(burstSize/2))
+              consNulls=0
+              this.onLog('Resuming with smaller bursts (sz='+burstSize+')','ok')
             }
           }
         }
         this.onProgress(startId+scanned-1,endId,matched)
-        await sleep(40)
+        await sleep(120)
       }
 
-      // Adapt burst size: shrink on transient errors, grow on clean bursts.
-      if(errInBurst>0){burstSize=Math.max(Scanner.BURST_MIN,Math.floor(burstSize/2));cleanBursts=0}
-      else{cleanBursts++;if(cleanBursts>=2&&burstSize<Scanner.BURST_MAX)burstSize=Math.min(Scanner.BURST_MAX,burstSize+30)}
+      // Adapt burst size based on this burst's health
+      if(rlInBurst>0){
+        burstSize=Math.max(Scanner.BURST_MIN,Math.floor(burstSize/2))
+        cleanBursts=0
+        this.onLog('RL in burst — reduced size to '+burstSize,'info')
+      }else{
+        cleanBursts++
+        if(cleanBursts>=3&&burstSize<Scanner.BURST_MAX){
+          burstSize=Math.min(Scanner.BURST_MAX,burstSize+20)
+          this.onLog('Clean burst streak — increased size to '+burstSize,'info')
+        }
+      }
 
       base=burstEnd+1
-      if(base>endId||this.stopped||ended)break
+      if(base>endId||this.stopped)break
 
+      // Longer rest after RL cooldowns to let rate limit fully reset
+      const rest=rlCooldowns>0?Scanner.REST_BASE*2:Scanner.REST_BASE
       this.cache?.save()
+      this.onLog('Rest '+(rest/1000)+'s — burst '+burstNum+' | '+matched+' found | '+consNulls+' null streak','info')
       this.onStats?.({retries:this.rlStreak})
-      const rest=Scanner.REST_BASE
       for(let t=0;t<rest&&!this.stopped;t+=300)await sleep(Math.min(300,rest-t))
     }
     this.cache?.save()
-    this.onLog('Done — '+matched+' orders ('+cacheHits+' from cache, '+fetched+' fetched'+(statusUpdates?', '+statusUpdates+' status updates':'')+')','ok')
     return orders
   }
 }
@@ -711,6 +591,7 @@ export default function App(){
   const[startedAt,setStartedAt]=useState(0)
   const[scanLabel,setScanLabel]=useState('')
   const[forceRefresh,setForceRefresh]=useState(false)
+  const[refreshValues,setRefreshValues]=useState(true)  // re-fetch delivered orders missing values
   const[showAdd,setShowAdd]=useState(false)
   const scannerRef=useRef<Scanner|null>(null)
   const logRef=useRef<HTMLDivElement>(null)
@@ -756,7 +637,7 @@ export default function App(){
 
   const addLog=useCallback((msg:string,cls:string='')=>setLog(p=>[...p.slice(-400),{msg,cls}]),[])
 
-  function loadRuns(b:Brand){const r=loadBrandRuns(b.id);setRuns(r);if(r.length>0){setLastOrders(r[0].orders);setAnalytics(buildAnalytics(r[0].orders))}else{setLastOrders([]);setAnalytics(null)}}
+  function loadRuns(b:Brand){const r=LS.get<Run[]>(`runs_${b.id}`,[]);setRuns(r);if(r.length>0){setLastOrders(r[0].orders);setAnalytics(buildAnalytics(r[0].orders))}else{setLastOrders([]);setAnalytics(null)}}
   function selectBrand(b:Brand){setActive(b);LS.set('activeBrandId',b.id);loadRuns(b)}
   function deleteBrand(id:string){if(!confirm('Delete this brand and all data?'))return;const u=brands.filter(b=>b.id!==id);setBrands(u);LS.set('brands',u);localStorage.removeItem(`runs_${id}`);const n=u[0]||null;setActive(n);if(n)loadRuns(n);else{setRuns([]);setLastOrders([]);setAnalytics(null)}}
 
@@ -767,8 +648,19 @@ export default function App(){
     const scanCache=new OrderCache(brand.id, brand.slug||brand.subdomain)
     scanCache.bulkLoad(cleaned,brand.slug||brand.subdomain)
     scanCache.save()
+    // Patch matching orders in ALL existing runs with fresh status + value
+    const freshById:Record<string,Order>=Object.fromEntries(cleaned.map(o=>[String(o.orderId),o]))
+    const existingRuns=LS.get<Run[]>(`runs_${brand.id}`,[])
+    let patchCount=0
+    const patchedRuns=existingRuns.map(r=>({...r,orders:r.orders.map(o=>{
+      const f=freshById[String(o.orderId)]
+      if(!f)return o
+      if(f.status!==o.status||f.valueNum!==o.valueNum||f.payment!==o.payment){patchCount++;return{...o,status:f.status,value:f.value,valueNum:f.valueNum,payment:f.payment}}
+      return o
+    })}))
+    if(patchCount>0)addLog(`Updated ${patchCount} orders in previous runs`,'ok')
     const run:Run={runId:Date.now().toString(),dateRange:label,found:cleaned.length,orders:cleaned,createdAt:new Date().toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'numeric'})}
-    const updated=[run,...loadBrandRuns(brand.id)].slice(0,50)
+    const updated=[run,...patchedRuns].slice(0,50)
     LS.set(`runs_${brand.id}`,updated);setRuns(updated);setLastOrders(cleaned);setAnalytics(buildAnalytics(cleaned))
     const toNum=(id:number|string)=>typeof id==='number'?id:parseInt(String(id).replace(/[^0-9]/g,''))||0
     const byDate:Record<string,{min:number,max:number}>={}
@@ -780,10 +672,10 @@ export default function App(){
     const u2={...brand,regressionPoints:merged.slice(-30),avgPerDay:newAvg}
     setActive(u2);setBrands(brands.map(b=>b.id===brand.id?u2:b));LS.set('brands',brands.map(b=>b.id===brand.id?u2:b))
     const url=LS.get(`sheets_${brand.id}`,'')
-    if(url&&cleaned.length>0)syncToSheets(url,cleaned).then(n=>n>0&&addLog(`✓ Sheets: ${n} rows synced`,'ok'))
+    if(url&&cleaned.length>0)syncAllToSheets(brand).then(n=>n>0&&addLog(`✓ Sheets: ${n} rows synced (full replace)`,'ok'))
 
     // POST run data to server so Vercel Cron can access it for daily report
-    const allRuns=loadBrandRuns(brand.id)
+    const allRuns=LS.get<Run[]>(`runs_${brand.id}`,[])
     fetch('/api/run-store',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({subdomain:brand.subdomain,runs:allRuns.slice(0,15)})}).catch(()=>{})
 
@@ -798,36 +690,72 @@ export default function App(){
     }
   }
 
-  function importOrdersToBrand(brand:Brand, importedOrders:Order[], sourceLabel:string){
-    const cleaned=mergeOrdersById(importedOrders.map(order=>({
-      ...order,
-      slug: order.slug || brand.slug || brand.subdomain,
-      source: order.source || 'cache',
-    })))
-    if(!cleaned.length)return
-    const cache=new OrderCache(brand.id, brand.slug||brand.subdomain)
-    cache.bulkLoad(cleaned,brand.slug||brand.subdomain)
-    cache.save()
-    const dates=cleaned.map(order=>order.dateYMD).filter(Boolean).sort() as string[]
-    const label=dates.length===0?sourceLabel:dates[0]===dates[dates.length-1]?dates[0]:`${dates[0]} to ${dates[dates.length-1]}`
-    const run:Run={runId:'import_'+Date.now(),dateRange:label,found:cleaned.length,orders:cleaned,createdAt:'Imported'}
-    const updated=[run,...loadBrandRuns(brand.id).filter(existing=>existing.runId!==run.runId)].slice(0,50)
-    LS.set(`runs_${brand.id}`,updated)
-    setRuns(updated)
-    setLastOrders(cleaned)
-    setAnalytics(buildAnalytics(cleaned))
-  }
-
   async function syncToSheets(url:string,orders:Order[],mode:'append'|'replace'='append'):Promise<number>{
     let added=0
     for(let i=0;i<orders.length;i+=200){
-      // Only the first batch carries 'replace' (clears the sheet); the rest append.
-      const batchMode=i===0?mode:'append'
-      // Routed through our same-origin proxy to avoid Apps Script CORS.
-      try{const res=await fetch('/api/sheets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,orders:orders.slice(i,i+200),mode:batchMode})});const d=await res.json();if(d.ok)added+=(d.added||0)+(d.updated||0)}catch{}
-      await sleep(500)
+      const chunkMode=mode==='replace'&&i===0?'replace':'append'
+      try{const res=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({orders:orders.slice(i,i+200),mode:chunkMode})});const d=await res.json();if(d.ok)added+=d.added||d.updated||0}catch{}
+      await sleep(400)
     }
     return added
+  }
+
+  async function syncAllToSheets(brand:Brand):Promise<number>{
+    const url=LS.get(`sheets_${brand.id}`,'')
+    if(!url)return 0
+    const allRuns=LS.get<Run[]>(`runs_${brand.id}`,[])
+    const byId:Record<string,Order>={}
+    allRuns.flatMap(r=>r.orders||[]).slice().reverse().forEach(o=>{byId[String(o.orderId)]=o})
+    const deduped=Object.values(byId).sort((a,b)=>String(a.orderId).localeCompare(String(b.orderId)))
+    return syncToSheets(url,deduped,'replace')
+  }
+
+  async function startRescanHistory(brand:Brand,onlyPending:boolean){
+    const allRuns=LS.get<Run[]>(`runs_${brand.id}`,[])
+    const byId:Record<string,Order>={}
+    allRuns.flatMap(r=>r.orders||[]).slice().reverse().forEach(o=>{byId[String(o.orderId)]=o})
+    const unique=Object.values(byId)
+    const toScan=onlyPending?unique.filter(o=>!['delivered','rto delivered'].some(s=>(o.status||'').toLowerCase().includes(s))):unique
+    if(!toScan.length){addLog('Nothing to re-scan','info');return}
+    addLog(`Re-scanning ${toScan.length} orders${onlyPending?' (pending only)':' (all — getting values too)'}...`,'info')
+    setScanning(true);setScanLabel(`Re-scan ${toScan.length}`);ordersRef.current=[]
+    setScanStats({retries:0,recovered:0,duplicates:0,gapJumps:0,lastMatchedId:null})
+    setProgress({done:0,total:toScan.length,found:0})
+    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,
+      (done,total,found)=>{setProgress({done,total,found})},
+      (o)=>{ordersRef.current=[...ordersRef.current,o]},
+      (s)=>setScanStats(p=>mergeScanStats(p,s)),undefined,true)
+    scannerRef.current=scanner
+    try{
+      const updated:Order[]=[]
+      const BATCH=5
+      for(let i=0;i<toScan.length&&!scanner.stopped;i+=BATCH){
+        const chunk=toScan.slice(i,i+BATCH)
+        const ids=chunk.map(o=>typeof o.orderId==='number'?o.orderId:parseInt(String(o.orderId).replace(/[^0-9]/g,''))||0).filter(Boolean)
+        const results=await scanner['fetchBatch'](ids)
+        chunk.forEach((orig,j)=>{
+          const fresh=results[j]
+          if(fresh&&fresh!=='rl'){
+            const merged={...orig,...fresh,orderId:orig.orderId,dateYMD:orig.dateYMD,orderDate:orig.orderDate}
+            updated.push(merged)
+            if(fresh.status!==orig.status)addLog(`#${orig.orderId} ${orig.status} → ${fresh.status}${fresh.valueNum>0?' Rs.'+fresh.valueNum.toFixed(0):''}`,fresh.status.toLowerCase().includes('delivered')?'ok':'info')
+            else if(fresh.valueNum>0&&orig.valueNum===0)addLog(`#${orig.orderId} value recovered: Rs.${fresh.valueNum.toFixed(0)}`,'ok')
+          }else{updated.push(orig)}
+        })
+        setProgress({done:Math.min(i+BATCH,toScan.length),total:toScan.length,found:updated.filter(o=>o.valueNum>0).length})
+        await sleep(600)
+      }
+      // Patch all runs with updated orders
+      const freshById:Record<string,Order>=Object.fromEntries(updated.map(o=>[String(o.orderId),o]))
+      const patched=LS.get<Run[]>(`runs_${brand.id}`,[]).map(r=>({...r,orders:r.orders.map(o=>freshById[String(o.orderId)]||o)}))
+      LS.set(`runs_${brand.id}`,patched);setRuns(patched)
+      const withVal=updated.filter(o=>o.valueNum>0).length
+      const statusChanged=updated.filter((o,i)=>o.status!==toScan[i]?.status).length
+      addLog(`✓ Done: ${statusChanged} status updates, ${withVal} values recovered`,'ok')
+      const sheetsUrl=LS.get(`sheets_${brand.id}`,'')
+      if(sheetsUrl){addLog('Syncing all to Sheets (replace)...','info');syncAllToSheets(brand).then(n=>addLog(`✓ Sheets: ${n} rows`,'ok'))}
+    }catch(e:any){addLog('Re-scan error: '+e.message,'err')}
+    finally{setScanning(false);setScanLabel('')}
   }
 
   function calcETA(done:number,total:number,sat:number):string{
@@ -855,23 +783,20 @@ export default function App(){
     if('wakeLock' in navigator){try{(navigator as any).wakeLock.request('screen').catch(()=>{})}catch{}}
     addLog('⚠ Keep this tab active — switching tabs may pause the scan','info')
     const cache=new OrderCache(brand.id, brand.slug||brand.subdomain)
-    const seeded=hydrateCacheFromHistory(brand, cache)
     const cs=cache.stats()
-    if(seeded.delivered>0&&!forceRefresh)addLog(`History seed: ${seeded.delivered} delivered loaded from saved runs`,'ok')
-    if(cs.total>0&&!forceRefresh)addLog(`Cache: ${cs.delivered} delivered (skip) + ${cs.active} active (rescan) — ${cache.sizeKB()}KB`,'ok')
+    if(cs.total>0&&!forceRefresh){
+      const skippable=refreshValues?cs.active:cs.delivered+cs.active
+      addLog(`Cache: ${cs.total} orders | ${refreshValues?cs.delivered+' delivered with value (skip), '+cs.active+' to fetch':cs.delivered+' delivered (skip), '+cs.active+' active'} — ${cache.sizeKB()}KB`,'ok')
+    }
     if(forceRefresh)addLog('Force refresh: ignoring all cache','info')
-    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)),cache,forceRefresh)
+    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)),cache,forceRefresh,refreshValues)
     scannerRef.current=scanner
     try{
       addLog(`Finding boundaries for ${fromDate} → ${toDate}...`,'info')
       const{scanStart,scanEnd}=await scanner.findBoundaries(brand.anchorId,brand.anchorDate,brand.regressionPoints||[],fromDate,toDate)
       if(scanner['stopped']){if(ordersRef.current.length>0){const o=ordersRef.current;const dates=o.map(r=>r.dateYMD).filter(Boolean).sort();saveRun(brand,o,`${dates[0]} to ${dates[dates.length-1]} (partial)`);addLog(`Saved ${o.length} partial orders`,'info')}; return}
       setProgress({done:0,total:scanEnd-scanStart+1,found:0});const sa2=Date.now();setStartedAt(sa2)
-      const scannedOrders=await scanner.scanRange(scanStart,scanEnd,fromDate,toDate,concurrency,sa2)
-      const orders=buildUnifiedRangeOrders(cache,scannedOrders,fromDate,toDate,forceRefresh)
-      const cacheLoaded=orders.filter(o=>o.source==='cache').length
-      const freshLoaded=orders.length-cacheLoaded
-      addLog(`Unified result: ${orders.length} orders (${cacheLoaded} cache + ${freshLoaded} fresh)`,'ok')
+      const orders=await scanner.scanRange(scanStart,scanEnd,fromDate,toDate,concurrency,sa2)
       const dates=orders.map(r=>r.dateYMD).filter(Boolean).sort()
       const label=dates.length===0?`${fromDate} to ${toDate}`:dates[0]===dates[dates.length-1]?dates[0]!:`${dates[0]} to ${dates[dates.length-1]}`
       saveRun(brand,orders,label)
@@ -895,11 +820,9 @@ export default function App(){
     if(useAuto&&safeStopAfter!==stopAfter)addLog(`Raised auto-stop from ${stopAfter} to ${safeStopAfter} for safer scanning`,'info')
     if(useAuto)addLog(`Auto hard cap set to #${brand.idPrefix||''}${autoHardCap} based on current brand velocity`,'info')
     const cacheM=new OrderCache(brand.id, brand.slug||brand.subdomain)
-    const seededM=hydrateCacheFromHistory(brand, cacheM)
     const csM=cacheM.stats()
-    if(seededM.delivered>0&&!forceRefresh)addLog(`History seed: ${seededM.delivered} delivered loaded from saved runs`,'ok')
-    if(csM.total>0&&!forceRefresh)addLog(`Cache: ${csM.delivered} delivered (skip) + ${csM.active} active | ${cacheM.sizeKB()}KB`,'ok')
-    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)),cacheM,forceRefresh)
+    if(csM.total>0&&!forceRefresh)addLog(`Cache: ${csM.total} orders | ${refreshValues?csM.delivered+' del+value (skip), '+(csM.active)+' to fetch':csM.delivered+' del (skip), '+csM.active+' active'} — ${cacheM.sizeKB()}KB`,'ok')
+    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)),cacheM,forceRefresh,refreshValues)
     scannerRef.current=scanner
     try{
       const maxId=useAuto?autoHardCap:endId
@@ -967,8 +890,8 @@ export default function App(){
 
           {(tab==='date'||tab==='manual')&&(
             <>
-              {tab==='date'&&<DateTab active={active} scanning={scanning} scanLabel={scanLabel} onStart={(f:string,t:string,c:number)=>startDateScan(f,t,c)} inp={inp} lbl={lbl} forceRefresh={forceRefresh} setForceRefresh={setForceRefresh}/>}
-              {tab==='manual'&&<ManualTab active={active} scanning={scanning} scanLabel={scanLabel} onStart={(si:number,ei:number,c:number,ua:boolean,sa:number)=>startManualScan(si,ei,c,ua,sa)} inp={inp} lbl={lbl} forceRefresh={forceRefresh} setForceRefresh={setForceRefresh}/>}
+              {tab==='date'&&<DateTab active={active} scanning={scanning} scanLabel={scanLabel} onStart={(f:string,t:string,c:number)=>startDateScan(f,t,c)} inp={inp} lbl={lbl} forceRefresh={forceRefresh} setForceRefresh={setForceRefresh} refreshValues={refreshValues} setRefreshValues={setRefreshValues}/>}
+              {tab==='manual'&&<ManualTab active={active} scanning={scanning} scanLabel={scanLabel} onStart={(si:number,ei:number,c:number,ua:boolean,sa:number)=>startManualScan(si,ei,c,ua,sa)} inp={inp} lbl={lbl} forceRefresh={forceRefresh} setForceRefresh={setForceRefresh} refreshValues={refreshValues} setRefreshValues={setRefreshValues}/>}
               {scanning&&(
                 <div style={{marginBottom:10}}>
                   <div style={{display:'flex',justifyContent:'space-between',fontSize:10,color:'var(--muted)',marginBottom:5}}>
@@ -1002,8 +925,8 @@ export default function App(){
           )}
           {tab==='analytics'&&<AnalyticsTab analytics={analytics}/>}
           {tab==='compare'&&<CompareTab brands={brands}/>}
-          {tab==='history'&&<HistoryTab runs={runs} brandName={active.name} onClear={()=>{localStorage.removeItem(`runs_${active.id}`);setRuns([]);setLastOrders([]);setAnalytics(null)}}/>}
-          {tab==='settings'&&<SettingsTab brands={brands} active={active} runs={runs} onDelete={deleteBrand} onSync={(url:string,orders:Order[],mode:'append'|'replace'='append')=>syncToSheets(url,orders,mode)} onImportOrders={(orders:Order[], label:string)=>active&&importOrdersToBrand(active,orders,label)} inp={inp} lbl={lbl} forceRefresh={forceRefresh} setForceRefresh={setForceRefresh}/>}
+          {tab==='history'&&<HistoryTab runs={runs} brandName={active.name} brand={active} onStartRescan={startRescanHistory} syncAll={syncAllToSheets} onClear={()=>{localStorage.removeItem(`runs_${active.id}`);setRuns([]);setLastOrders([]);setAnalytics(null)}}/>}
+          {tab==='settings'&&<SettingsTab brands={brands} active={active} runs={runs} onDelete={deleteBrand} onSync={(url:string,orders:Order[])=>syncToSheets(url,orders)} inp={inp} lbl={lbl} forceRefresh={forceRefresh} setForceRefresh={setForceRefresh}/>}
         </>
       )}
     </div>
@@ -1098,8 +1021,8 @@ function DashboardStrip({runs}:{runs:Run[]}){
   )
 }
 
-function DateTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setForceRefresh}:any){
-  const[from,setFrom]=useState(yestStr());const[to,setTo]=useState(todayStr());const[conc,setConc]=useState('10')
+function DateTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setForceRefresh,refreshValues,setRefreshValues}:any){
+  const[from,setFrom]=useState(yestStr());const[to,setTo]=useState(todayStr());const[conc,setConc]=useState('5')
   const presetBtn=(label:string,f:string,t:string)=><button key={label} onClick={()=>{setFrom(f);setTo(t)}} style={{background:'var(--surface)',border:'1px solid var(--border)',color:'var(--muted)',padding:'6px 10px',borderRadius:20,fontSize:9,fontFamily:'inherit',cursor:'pointer'}}>{label}</button>
   return(
     <div>
@@ -1122,12 +1045,18 @@ function DateTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setForc
           </div>
           <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:12,fontSize:11,color:'var(--muted)'}}>
             <span>Concurrent fetches</span>
-            <select value={conc} onChange={e=>setConc(e.target.value)} style={{...inp,width:'auto',padding:'5px 8px',fontSize:11}}>{['5','8','10','15','20'].map(v=><option key={v} value={v}>{v}</option>)}</select>
+            <select value={conc} onChange={e=>setConc(e.target.value)} style={{...inp,width:'auto',padding:'5px 8px',fontSize:11}}>{['3','5','8','10','15'].map(v=><option key={v} value={v}>{v}</option>)}</select>
             <span style={{fontSize:9}}>(higher = faster)</span>
           </div>
-          <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:8,padding:'6px 10px',background:'var(--surface)',borderRadius:6,border:'1px solid var(--border)'}}>
-            <input type="checkbox" id="fr_date" checked={forceRefresh} onChange={(e:any)=>setForceRefresh(e.target.checked)} style={{accentColor:'var(--accent)',width:13,height:13,cursor:'pointer'}}/>
-            <label htmlFor="fr_date" style={{fontSize:9,color:'var(--muted)',cursor:'pointer',lineHeight:1.4}}>Force Refresh — re-scan all IDs, ignore cache (slow)</label>
+          <div style={{display:'flex',flexDirection:'column' as const,gap:5,marginBottom:8,padding:'8px 10px',background:'var(--surface)',borderRadius:6,border:'1px solid var(--border)'}}>
+            <div style={{display:'flex',alignItems:'center',gap:6}}>
+              <input type="checkbox" id="rv_date" checked={refreshValues} onChange={(e:any)=>setRefreshValues(e.target.checked)} style={{accentColor:'var(--accent)',width:13,height:13,cursor:'pointer'}}/>
+              <label htmlFor="rv_date" style={{fontSize:9,color:'var(--text)',cursor:'pointer',fontWeight:600}}>↻ Refresh missing values — re-fetch Delivered orders with no value</label>
+            </div>
+            <div style={{display:'flex',alignItems:'center',gap:6}}>
+              <input type="checkbox" id="fr_date" checked={forceRefresh} onChange={(e:any)=>setForceRefresh(e.target.checked)} style={{accentColor:'var(--warn)',width:13,height:13,cursor:'pointer'}}/>
+              <label htmlFor="fr_date" style={{fontSize:9,color:'var(--muted)',cursor:'pointer'}}>Force Refresh — ignore cache entirely</label>
+            </div>
           </div>
           <button onClick={()=>onStart(from,to,parseInt(conc))} style={{width:'100%',background:'var(--accent)',color:'#000',border:'none',padding:11,borderRadius:8,fontSize:12,fontWeight:700,letterSpacing:'.06em',textTransform:'uppercase',marginBottom:12,fontFamily:'inherit',cursor:'pointer'}}>🔍 FIND &amp; SCRAPE</button>
         </>
@@ -1136,8 +1065,8 @@ function DateTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setForc
   )
 }
 
-function ManualTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setForceRefresh}:any){
-  const[startId,setStartId]=useState('');const[endId,setEndId]=useState('');const[useAuto,setUseAuto]=useState(true);const[stopAfter,setStopAfter]=useState('100');const[conc,setConc]=useState('10')
+function ManualTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setForceRefresh,refreshValues,setRefreshValues}:any){
+  const[startId,setStartId]=useState('');const[endId,setEndId]=useState('');const[useAuto,setUseAuto]=useState(false);const[stopAfter,setStopAfter]=useState('500');const[conc,setConc]=useState('5')
   const pfx=active.idPrefix||''
   const recommendedStop=recommendedAutoStop(parseInt(conc)||5,active?.avgPerDay||0)
   const storedResume=LS.get(`manual_resume_${active?.id}`,'')
@@ -1157,10 +1086,10 @@ function ManualTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setFo
             <input type="checkbox" checked={useAuto} onChange={e=>setUseAuto(e.target.checked)} style={{accentColor:'var(--accent)',width:16,height:16}}/>
           </div>
           {resumeId>0&&<div style={{display:'flex',justifyContent:'space-between',alignItems:'center',background:'var(--surface2)',border:'1px solid var(--border)',borderRadius:6,padding:'8px 10px',marginBottom:10,fontSize:10,color:'var(--muted)'}}><span>Resume suggestion: start from #{pfx}{resumeId}</span><button onClick={()=>setStartId(String(resumeId))} style={{background:'none',border:'1px solid var(--accent)',color:'var(--accent)',padding:'4px 8px',borderRadius:4,fontSize:9,fontFamily:'inherit',cursor:'pointer'}}>Use resume ID</button></div>}
-          {useAuto&&<div style={{marginBottom:10}}><label style={lbl}>Stop after N misses</label><div style={{display:'flex',alignItems:'center',gap:8}}><input type="number" value={stopAfter} onChange={e=>setStopAfter(e.target.value)} style={{...inp,width:90}}/><span style={{fontSize:9,color:'var(--muted)'}}>~{recommendedStop} consecutive missing IDs = genuine end. Lower values are auto-raised. Order IDs are contiguous, so 100 is safe.</span></div></div>}
+          {useAuto&&<div style={{marginBottom:10}}><label style={lbl}>Stop after N misses</label><div style={{display:'flex',alignItems:'center',gap:8}}><input type="number" value={stopAfter} onChange={e=>setStopAfter(e.target.value)} style={{...inp,width:90}}/><span style={{fontSize:9,color:'var(--muted)'}}>Safe floor here: {recommendedStop}. Lower values are auto-raised, and misses are retried once before counting.</span></div></div>}
           <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:12,fontSize:11,color:'var(--muted)'}}>
             <span>Concurrent fetches</span>
-            <select value={conc} onChange={e=>setConc(e.target.value)} style={{...inp,width:'auto',padding:'5px 8px',fontSize:11}}>{['5','8','10','15','20'].map(v=><option key={v} value={v}>{v}</option>)}</select>
+            <select value={conc} onChange={e=>setConc(e.target.value)} style={{...inp,width:'auto',padding:'5px 8px',fontSize:11}}>{['3','5','8','10'].map(v=><option key={v} value={v}>{v}</option>)}</select>
           </div>
           <button onClick={()=>{
             if(!startId){alert('Enter a Start ID');return}
@@ -1170,9 +1099,15 @@ function ManualTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setFo
             if(!useAuto&&!parsedEnd){alert('Enter a valid numeric End ID');return}
             onStart(parsedStart,parsedEnd,parseInt(conc),useAuto,parseInt(stopAfter))
           }} style={{width:'100%',background:'var(--accent)',color:'#000',border:'none',padding:11,borderRadius:8,fontSize:12,fontWeight:700,letterSpacing:'.06em',textTransform:'uppercase',marginBottom:12,fontFamily:'inherit',cursor:'pointer'}}>▶ START MANUAL SCRAPE</button>
-          <div style={{display:'flex',alignItems:'center',gap:8,marginTop:-6,marginBottom:8,padding:'6px 10px',background:'var(--surface)',borderRadius:6,border:'1px solid var(--border)'}}>
-            <input type="checkbox" id="fr_manual" checked={forceRefresh} onChange={(e:any)=>setForceRefresh(e.target.checked)} style={{accentColor:'var(--accent)',width:13,height:13,cursor:'pointer'}}/>
-            <label htmlFor="fr_manual" style={{fontSize:9,color:'var(--muted)',cursor:'pointer',lineHeight:1.4}}>Force Refresh — re-scan all IDs, ignore cache (slow)</label>
+          <div style={{display:'flex',flexDirection:'column' as const,gap:5,marginTop:-6,marginBottom:8,padding:'8px 10px',background:'var(--surface)',borderRadius:6,border:'1px solid var(--border)'}}>
+            <div style={{display:'flex',alignItems:'center',gap:6}}>
+              <input type="checkbox" id="rv_manual" checked={refreshValues} onChange={(e:any)=>setRefreshValues(e.target.checked)} style={{accentColor:'var(--accent)',width:13,height:13,cursor:'pointer'}}/>
+              <label htmlFor="rv_manual" style={{fontSize:9,color:'var(--text)',cursor:'pointer',fontWeight:600}}>↻ Refresh missing values — re-fetch Delivered orders with no value (recommended)</label>
+            </div>
+            <div style={{display:'flex',alignItems:'center',gap:6}}>
+              <input type="checkbox" id="fr_manual" checked={forceRefresh} onChange={(e:any)=>setForceRefresh(e.target.checked)} style={{accentColor:'var(--warn)',width:13,height:13,cursor:'pointer'}}/>
+              <label htmlFor="fr_manual" style={{fontSize:9,color:'var(--muted)',cursor:'pointer'}}>Force Refresh — re-scan everything including Delivered (very slow)</label>
+            </div>
           </div>
         </>
       )}
@@ -1240,11 +1175,36 @@ function CompareTab({brands}:{brands:Brand[]}){
   )
 }
 
-function HistoryTab({runs,brandName,onClear}:{runs:Run[],brandName:string,onClear:()=>void}){
+function HistoryTab({runs,brandName,brand,onStartRescan,syncAll,onClear}:any){
   if(!runs.length)return<div style={{textAlign:'center',padding:'40px 20px',color:'var(--muted)',fontSize:11}}>No runs yet.</div>
+  const allOrders=runs.flatMap((r:Run)=>r.orders||[])
+  const byId:Record<string,Order>={}
+  allOrders.slice().reverse().forEach((o:Order)=>{byId[String(o.orderId)]=o})
+  const unique=Object.values(byId)
+  const pending=unique.filter((o:Order)=>!['delivered','rto delivered'].some(s=>(o.status||'').toLowerCase().includes(s))).length
+  const withVal=unique.filter((o:Order)=>(o.valueNum||0)>0).length
   return(
     <div>
-      {runs.map(r=>{const a=buildAnalytics(r.orders);return(
+      {brand&&<div style={{background:'var(--surface)',border:'1px solid var(--border)',borderRadius:8,padding:12,marginBottom:12}}>
+        <div style={{fontSize:10,fontWeight:700,color:'var(--accent)',marginBottom:8,textTransform:'uppercase' as const,letterSpacing:'.05em'}}>🔄 Re-scan & Update History</div>
+        <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:6,marginBottom:8}}>
+          {([['Total Orders',unique.length,'var(--text)'],['Pending/Active',pending,'var(--warn)'],['Have Value',withVal,'var(--accent)']] as [string,number,string][]).map(([l,v,c])=>(
+            <div key={l} style={{background:'var(--surface2)',borderRadius:6,padding:'7px',textAlign:'center' as const}}>
+              <div style={{fontSize:14,fontWeight:700,color:c}}>{v}</div>
+              <div style={{fontSize:8,color:'var(--muted)',marginTop:2}}>{l}</div>
+            </div>
+          ))}
+        </div>
+        <div style={{fontSize:9,color:'var(--muted)',marginBottom:8,lineHeight:1.6}}>
+          Re-scan updates statuses and recovers order values (now re-enabled by Shiprocket). All runs patch in-place — then replaces Google Sheets with latest data.
+        </div>
+        <div style={{display:'flex',gap:6,flexWrap:'wrap' as const}}>
+          <button onClick={()=>onStartRescan(brand,true)} style={{fontSize:9,padding:'7px 12px',background:'var(--warn)',color:'#000',border:'none',borderRadius:5,cursor:'pointer',fontWeight:600,fontFamily:'inherit'}}>↻ Pending Only ({pending})</button>
+          <button onClick={()=>onStartRescan(brand,false)} style={{fontSize:9,padding:'7px 12px',background:'var(--surface2)',color:'var(--text)',border:'1px solid var(--border)',borderRadius:5,cursor:'pointer',fontFamily:'inherit'}}>↻ All Orders ({unique.length}) — gets values</button>
+          <button onClick={()=>syncAll&&syncAll(brand).then((n:number)=>n>0&&alert(`Synced ${n} rows to Sheets`))} style={{fontSize:9,padding:'7px 12px',background:'var(--surface2)',color:'var(--accent)',border:'1px solid var(--accent)',borderRadius:5,cursor:'pointer',fontFamily:'inherit'}}>↑ Sync All to Sheets</button>
+        </div>
+      </div>}
+      {runs.map((r:Run)=>{const a=buildAnalytics(r.orders);return(
         <div key={r.runId} style={{background:'var(--surface)',border:'1px solid var(--border)',borderRadius:8,padding:12,marginBottom:10}}>
           <div style={{display:'flex',justifyContent:'space-between',marginBottom:6}}><span style={{color:'var(--accent)',fontWeight:700,fontSize:12}}>{r.dateRange}</span><span style={{color:'var(--muted)',fontSize:9}}>{r.createdAt}</span></div>
           <div style={{display:'flex',gap:16,fontSize:10,marginBottom:8,flexWrap:'wrap'}}>
@@ -1273,65 +1233,36 @@ function parseCSVDate(d:string):string|null{
   return m2?m2[1]:null
 }
 
-function parseCSVLine(line:string):string[]{
-  const out:string[]=[]
-  let cur='',inQuotes=false
-  for(let i=0;i<line.length;i++){
-    const ch=line[i]
-    if(ch==='"'){
-      if(inQuotes&&line[i+1]==='"'){cur+='"';i++}
-      else inQuotes=!inQuotes
-    }else if(ch===','&&!inQuotes){
-      out.push(cur.trim())
-      cur=''
-    }else cur+=ch
-  }
-  out.push(cur.trim())
-  return out
-}
-
 function parseFullReportCSV(text:string):Order[]{
-  const lines=text.split(/\r?\n/)
+  const lines=text.split('\n')
+  // Find the "Order ID,Date,Time..." header line
   let headerIdx=-1
   for(let i=0;i<lines.length;i++){
-    const normalized=lines[i].replace(/"/g,'').trim()
-    if(normalized.startsWith('Order ID,Date,Time')){headerIdx=i;break}
+    if(lines[i].replace(/"/g,'').trim().startsWith('Order ID,Date')){headerIdx=i;break}
   }
   if(headerIdx<0)return[]
-  const header=parseCSVLine(lines[headerIdx]).map(col=>col.replace(/^"|"$/g,'').trim().toLowerCase())
-  const idx=(name:string)=>header.indexOf(name)
-  const orderIdx=idx('order id'),dateIdx=idx('date'),timeIdx=idx('time'),valueIdx=idx('value'),paymentIdx=idx('payment'),statusIdx=idx('status'),locationIdx=idx('location'),pincodeIdx=idx('pincode')
-  if(orderIdx<0||dateIdx<0||timeIdx<0||statusIdx<0||locationIdx<0||pincodeIdx<0)return[]
+  const clean=(s:string)=>s.replace(/^"|"$/g,'').trim()
   const orders:Order[]=[]
   for(let i=headerIdx+1;i<lines.length;i++){
-    const cols=parseCSVLine(lines[i]).map(col=>col.replace(/^"|"$/g,'').trim())
-    if(cols.length<header.length)continue
-    const orderId=cols[orderIdx]
-    if(!orderId||isNaN(Number(orderId)))continue
-    const orderDate=cols[dateIdx]||'N/A'
-    const orderTime=cols[timeIdx]||'N/A'
-    const value=valueIdx>=0?(cols[valueIdx]||'N/A'):'N/A'
-    const payment=paymentIdx>=0?(cols[paymentIdx]||'N/A'):'N/A'
-    const status=cols[statusIdx]||'N/A'
-    const location=cols[locationIdx]||'N/A'
-    const pincode=cols[pincodeIdx]||'N/A'
+    const row=lines[i].match(/("([^"]*)"|([^,]*))(,|$)/g)
+    if(!row||row.length<8)continue
+    const cols=row.map(c=>clean(c.replace(/,$/,'')))
+    const orderId=cols[0];if(!orderId||isNaN(Number(orderId)))continue
+    const orderDate=cols[1],orderTime=cols[2],value=cols[3]||'N/A',payment=cols[4]||'N/A',status=cols[5]||'N/A',location=cols[6]||'N/A',pincode=cols[7]||'N/A'
     const dateYMD=parseCSVDate(orderDate)
     orders.push({orderId:parseInt(orderId),slug:'',orderDate,orderTime,dateYMD,value,valueNum:parseFloat(value.replace(/[^0-9.]/g,''))||0,payment,status,pincode,location,source:'cache'})
   }
   return orders
 }
 
-function CachePanel({active,brands,forceRefresh,setForceRefresh,onImportOrders}:any){
+function CachePanel({active,brands,forceRefresh,setForceRefresh}:any){
   const[stats,setStats]=useState<{total:number,delivered:number,active:number,sizeKB:number}|null>(null)
   const[cleared,setCleared]=useState(false)
   const[importResult,setImportResult]=useState('')
-  const[fileName,setFileName]=useState('')
-  const fileInputRef=useRef<HTMLInputElement|null>(null)
 
   const refresh=()=>{
     if(!active)return
     const c=new OrderCache(active.id, active.slug||active.subdomain)
-    hydrateCacheFromHistory(active, c)
     const s=c.stats()
     setStats({...s,sizeKB:c.sizeKB()})
     setCleared(false)
@@ -1349,33 +1280,11 @@ function CachePanel({active,brands,forceRefresh,setForceRefresh,onImportOrders}:
 
   const pct=stats?.total?Math.round(stats.delivered/stats.total*100):0
 
-  async function handleImportFile(e:ChangeEvent<HTMLInputElement>){
-    const file=e.target.files?.[0]
-    if(!file||!active)return
-    setFileName(file.name)
-    const text=await file.text()
-    const parsed=parseFullReportCSV(text)
-    if(!parsed.length){
-      setImportResult('⚠ No orders found — upload a Full Report or export CSV with an Order ID,Date,Time header')
-      e.target.value=''
-      return
-    }
-    const cache=new OrderCache(active.id, active.slug||active.subdomain)
-    const {added,skipped}=cache.bulkLoad(parsed,active.slug||active.subdomain)
-    cache.save()
-    const final=parsed.filter(o=>isFinalStatus(o.status)).length
-    const newStats=cache.stats()
-    setStats({...newStats,sizeKB:cache.sizeKB()})
-    setImportResult(`✓ Imported ${parsed.length} orders from ${file.name} (${final} delivered, ${added} written, ${skipped} unchanged)`)
-    onImportOrders?.(parsed, file.name.replace(/\.csv$/i,''))
-    e.target.value=''
-  }
-
   return(
     <div style={{background:'var(--surface)',border:'1px solid var(--border)',borderRadius:8,padding:14,marginBottom:14}}>
       <div style={{fontSize:10,fontWeight:700,color:'var(--accent)',marginBottom:8,textTransform:'uppercase',letterSpacing:'.06em'}}>⚡ Order Cache</div>
       {!stats||stats.total===0?(
-        <div style={{fontSize:10,color:'var(--muted)'}}>No cache yet — run a scan to build the cache. Subsequent scans will skip cached Delivered orders automatically.</div>
+        <div style={{fontSize:10,color:'var(--muted)'}}>No cache yet — run a scan to build the cache. Subsequent scans will skip Delivered orders automatically.</div>
       ):(
         <>
           <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:6,marginBottom:10}}>
@@ -1404,41 +1313,53 @@ function CachePanel({active,brands,forceRefresh,setForceRefresh,onImportOrders}:
       {/* Import CSV */}
       <div style={{marginTop:10,paddingTop:10,borderTop:'1px solid var(--border)'}}>
         <div style={{fontSize:9,fontWeight:700,color:'var(--accent)',marginBottom:6,textTransform:'uppercase',letterSpacing:'.05em'}}>Import from CSV</div>
-        <div style={{fontSize:9,color:'var(--muted)',marginBottom:6,lineHeight:1.6}}>Upload a Full Report CSV to seed the cache. Cached Delivered orders will be skipped on the next scan.</div>
-        <input ref={fileInputRef} type="file" accept=".csv" style={{display:'none'}} onChange={handleImportFile}/>
-        <button onClick={()=>fileInputRef.current?.click()} style={{display:'block',width:'100%',padding:'8px 12px',background:'var(--surface2)',border:'1px dashed var(--border)',borderRadius:6,cursor:'pointer',fontSize:9,color:'var(--muted)',textAlign:'center'}}>
-          📂 {fileName?`Selected: ${fileName}`:'Click to upload Full Report CSV'}
-        </button>
+        <div style={{fontSize:9,color:'var(--muted)',marginBottom:6,lineHeight:1.6}}>Upload a Full Report CSV to seed the cache. Delivered orders will be skipped on next scan.</div>
+        <label style={{display:'block',padding:'8px 12px',background:'var(--surface2)',border:'1px dashed var(--border)',borderRadius:6,cursor:'pointer',fontSize:9,color:'var(--muted)',textAlign:'center' as const}}>
+          📂 Click to upload Full Report CSV
+          <input type="file" accept=".csv" style={{display:'none'}} onChange={async(e:any)=>{
+            const file=e.target.files?.[0];if(!file||!active)return
+            const text=await file.text()
+            const parsed=parseFullReportCSV(text)
+            if(!parsed.length){setImportResult('⚠ No orders found — make sure this is a Full Report CSV');return}
+            const cache=new OrderCache(active.id, active.slug||active.subdomain)
+            // bulkLoad = no intermediate flushes, single write at end
+            const {added,skipped}=cache.bulkLoad(parsed,active.slug||active.subdomain)
+            cache.save()  // single localStorage write for all orders
+            const final=parsed.filter(o=>FINAL_STATUSES.some(f=>o.status.toLowerCase().includes(f))).length
+            // Update stats directly from in-memory cache (avoids stale read)
+            const newStats=cache.stats()
+            setStats({...newStats,sizeKB:cache.sizeKB()})
+            setImportResult(`✓ Imported ${added} orders (${final} final/cached, ${skipped} already in cache)`)
+            // Also save as a run so dashboard shows historical data
+            const byDate:Record<string,Order[]>={}
+            parsed.forEach(o=>{if(o.dateYMD){if(!byDate[o.dateYMD])byDate[o.dateYMD]=[];byDate[o.dateYMD].push(o)}})
+            const dates=Object.keys(byDate).sort()
+            if(dates.length>0){
+              const run:any={runId:'import_'+Date.now(),dateRange:`${dates[0]} to ${dates[dates.length-1]}`,found:parsed.length,orders:parsed,createdAt:'Imported'}
+              const existing=LS.get<any[]>(`runs_${active.id}`,[])
+              const merged=[run,...existing.filter((r:any)=>r.runId!==run.runId)].slice(0,50)
+              LS.set(`runs_${active.id}`,merged)
+            }
+            e.target.value=''
+          }}/>
+        </label>
         {importResult&&<div style={{fontSize:9,marginTop:6,padding:'5px 8px',borderRadius:4,background:importResult.startsWith('✓')?'#00ff8815':'#ff444415',border:`1px solid ${importResult.startsWith('✓')?'var(--accent)':'var(--red)'}`,color:importResult.startsWith('✓')?'var(--accent)':'var(--red)'}}>{importResult}</div>}
       </div>
       <div style={{fontSize:8,color:'var(--muted)',marginTop:8,lineHeight:1.7}}>
-        <b>How it works:</b> Complete order records are cached by Order ID. On the next scan, cached <b>Delivered</b> orders load instantly with full data and only non-final orders are re-fetched.<br/>
-        Final state: <b>Delivered</b>
+        <b>How it works:</b> Delivered orders are saved permanently. On the next scan, they load from cache instantly — no API calls. Only non-delivered orders are re-fetched.<br/>
+        Final states: <b>Delivered</b> · <b>RTO Delivered</b>
       </div>
     </div>
   )
 }
 
-function SettingsTab({brands,active,runs,onDelete,onSync,onImportOrders,inp,lbl,forceRefresh,setForceRefresh}:any){
+function SettingsTab({brands,active,runs,onDelete,onSync,inp,lbl,forceRefresh,setForceRefresh}:any){
   const[url,setUrl]=useState(()=>LS.get(`sheets_${active?.id}`,''));const[status,setStatus]=useState('');const[busy,setBusy]=useState(false)
   useEffect(()=>setUrl(LS.get(`sheets_${active?.id}`,'')),[ active?.id])
   const btn=(e:any={})=>({background:'var(--surface)',border:'1px solid var(--border)',color:'var(--text)',padding:'8px 12px',borderRadius:6,fontSize:10,fontWeight:700,fontFamily:'inherit',cursor:'pointer',...e})
   async function save(){LS.set(`sheets_${active.id}`,url);setStatus('✓ Saved — auto-syncs after every scan')}
-  async function test(){if(!url){setStatus('⚠ Enter URL first');return};setBusy(true);setStatus('Testing...');try{const r=await fetch('/api/sheets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,orders:[{orderId:'TEST',orderDate:'test',value:'Rs.1',payment:'COD',status:'test',location:'Mumbai',pincode:'400001'}],mode:'test'})});const d=await r.json();setStatus(d.ok?('✓ Connected!'+(d.dashboard&&d.dashboard!=='ok'?' · Dashboard '+d.dashboard:' · Dashboard ok')):'⚠ '+(d.error||JSON.stringify(d)))}catch(e:any){setStatus('⚠ '+e.message)};setBusy(false)}
-  async function sync(mode:'append'|'replace'){
-    if(!url){setStatus('⚠ Save URL first');return}
-    if(!active){setStatus('⚠ Select a brand first');return}
-    // Push the full cache (everything ever scanned/imported), merged with any
-    // run orders — so the Sheet is seeded with all our existing values, not
-    // just the latest runs. The Apps Script upserts by Order ID (no dupes).
-    const cached=new OrderCache(active.id,active.slug||active.subdomain).all()
-    const all=mergeOrdersById([...cached,...runs.flatMap((r:Run)=>r.orders)])
-    if(!all.length){setStatus('⚠ No orders to sync — run a scan or import a CSV first');return}
-    if(mode==='replace'&&!confirm(`Replace CLEARS the whole sheet first, then writes these ${all.length} cached orders. If the sheet has more rows than your cache, you'll lose them. Use Append instead unless you're sure.\n\nProceed with Replace?`))return
-    setBusy(true);setStatus(`Syncing ${all.length} orders (${mode})...`)
-    const n=await onSync(url,all,mode)
-    setStatus(`✓ Synced ${all.length} orders → ${n} rows`);setBusy(false)
-  }
+  async function test(){if(!url){setStatus('⚠ Enter URL first');return};setBusy(true);setStatus('Testing...');try{const r=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({orders:[{orderId:'TEST',orderDate:'test',value:'Rs.1',payment:'COD',status:'test',location:'Mumbai',pincode:'400001'}],mode:'test'})});const d=await r.json();setStatus(d.ok?'✓ Connected!':'⚠ '+JSON.stringify(d))}catch(e:any){setStatus('⚠ '+e.message)};setBusy(false)}
+  async function sync(mode:'append'|'replace'){if(!url){setStatus('⚠ Save URL first');return};const all=runs.flatMap((r:Run)=>r.orders);if(!all.length){setStatus('⚠ No orders to sync');return};setBusy(true);setStatus(`Syncing ${all.length} orders...`);const n=await onSync(url,all);setStatus(`✓ Synced ${n} rows`);setBusy(false)}
   const [tgStatus,setTgStatus]=useState('')
   const [tgBusy,setTgBusy]=useState(false)
   const [tgToken,setTgToken]=useState(()=>LS.get('tg_token',''))
@@ -1494,7 +1415,7 @@ function SettingsTab({brands,active,runs,onDelete,onSync,onImportOrders,inp,lbl,
   return(
     <div>
       {/* Cache Management */}
-      <CachePanel active={active} brands={brands} forceRefresh={forceRefresh} setForceRefresh={setForceRefresh} onImportOrders={onImportOrders}/>
+      <CachePanel active={active} brands={brands} forceRefresh={forceRefresh} setForceRefresh={setForceRefresh}/>
 
       {/* Telegram */}
       <div style={{background:'var(--surface)',border:'1px solid var(--border)',borderRadius:8,padding:14,marginBottom:14}}>
@@ -1542,94 +1463,24 @@ function SettingsTab({brands,active,runs,onDelete,onSync,onImportOrders,inp,lbl,
       </div>
       <div style={{background:'var(--surface)',border:'1px solid var(--border)',borderRadius:8,padding:14,marginBottom:14}}>
         <div style={{fontSize:10,fontWeight:700,color:'var(--accent)',marginBottom:10,textTransform:'uppercase',letterSpacing:'.06em'}}>Google Sheets Sync</div>
-        <div style={{fontSize:9,color:'var(--muted)',marginBottom:10,lineHeight:1.8}}>Syncs orders to an <b>Orders</b> tab and auto-builds a <b>Dashboard</b> tab (Today / Yesterday / WTD / MTD, top locations & pincodes, status mix + charts).<br/>1. Go to <a href="https://script.google.com" target="_blank" style={{color:'var(--accent)'}}>script.google.com</a> → New project<br/>2. Paste the code below → Deploy as web app (execute as: Me, who has access: Anyone)<br/>3. Copy the /exec URL and paste here</div>
+        <div style={{fontSize:9,color:'var(--muted)',marginBottom:10,lineHeight:1.8}}>1. Go to <a href="https://script.google.com" target="_blank" style={{color:'var(--accent)'}}>script.google.com</a> → New project<br/>2. Paste the code below → Deploy as web app (execute as: Me, who has access: Anyone)<br/>3. Copy the /exec URL and paste here</div>
         <details style={{marginBottom:10}}><summary style={{fontSize:9,color:'var(--muted)',cursor:'pointer',marginBottom:6}}>▼ Apps Script code</summary>
-          <pre style={{background:'var(--surface2)',border:'1px solid var(--border)',borderRadius:4,padding:8,fontSize:8,color:'var(--muted)',overflow:'auto',maxHeight:180,lineHeight:1.6,whiteSpace:'pre-wrap'}}>{`var TZ='Asia/Kolkata';
-var H=['Order ID','Date','Time','Value','Payment','Status','Location','Pincode','dateYMD','Updated'];
-var MON={Jan:'01',Feb:'02',Mar:'03',Apr:'04',May:'05',Jun:'06',Jul:'07',Aug:'08',Sep:'09',Oct:'10',Nov:'11',Dec:'12'};
-var CRON_URL='';
-var CRON_SECRET='';
-function onOpen(){SpreadsheetApp.getUi().createMenu('srtscrap').addItem('Refresh Dashboard','menuRefresh').addItem('Run scan now (yesterday)','menuScanYesterday').addItem('Run scan for a date','menuScanDate').addToUi();}
-function menuRefresh(){rebuildDashboard(SpreadsheetApp.getActiveSpreadsheet());SpreadsheetApp.getActiveSpreadsheet().toast('Dashboard refreshed','srtscrap',4);}
-function triggerScan(date){if(!CRON_URL){SpreadsheetApp.getUi().alert('Set CRON_URL at the top of the script first.');return;}var u=CRON_URL+'?'+(date?'date='+date+'&':'')+(CRON_SECRET?'secret='+CRON_SECRET:'');UrlFetchApp.fetch(u,{muteHttpExceptions:true});SpreadsheetApp.getActiveSpreadsheet().toast('Scan triggered - rows arrive in a moment','srtscrap',6);}
-function menuScanYesterday(){triggerScan('');}
-function menuScanDate(){var ui=SpreadsheetApp.getUi();var resp=ui.prompt('Scan a date','Enter date as YYYY-MM-DD:',ui.ButtonSet.OK_CANCEL);if(resp.getSelectedButton()!==ui.Button.OK)return;var d=resp.getResponseText().trim();if(/^\\d{4}-\\d{2}-\\d{2}$/.test(d))triggerScan(d);else ui.alert('Invalid date - use YYYY-MM-DD.');}
-function rowYMD(r){if(Object.prototype.toString.call(r[8])==='[object Date]')return Utilities.formatDate(r[8],TZ,'yyyy-MM-dd');var dy=String(r[8]||'').trim();if(/^\\d{4}-\\d{2}-\\d{2}/.test(dy))return dy.substring(0,10);if(Object.prototype.toString.call(r[1])==='[object Date]')return Utilities.formatDate(r[1],TZ,'yyyy-MM-dd');var m=String(r[1]||'').match(/^(\\d{1,2})\\s+(\\w{3})\\s+(\\d{4})/);return m?(m[3]+'-'+(MON[m[2]]||'00')+'-'+('0'+m[1]).slice(-2)):'';}
-function doPost(e){
-  try{
-    var data=JSON.parse(e.postData.contents||'{}');
-    var ss=SpreadsheetApp.getActiveSpreadsheet();
-    var sheet=ss.getSheetByName('Orders')||ss.insertSheet('Orders');
-    if(data.mode==='replace')sheet.clearContents();
-    if(sheet.getLastRow()===0){sheet.appendRow(H);sheet.setFrozenRows(1);}
-    var lastRow=sheet.getLastRow(),map={};
-    if(lastRow>1){var ids=sheet.getRange(2,1,lastRow-1,1).getValues();for(var i=0;i<ids.length;i++)map[String(ids[i][0])]=i+2;}
-    var now=new Date(),add=[],updated=0;
-    (data.orders||[]).forEach(function(o){
-      var row=[String(o.orderId),o.orderDate||'',o.orderTime||'',o.value||'',o.payment||'',o.status||'',o.location||'',o.pincode||'',o.dateYMD||'',now];
-      var r=map[String(o.orderId)];
-      if(r){sheet.getRange(r,1,1,row.length).setValues([row]);updated++;}else add.push(row);
+          <pre style={{background:'var(--surface2)',border:'1px solid var(--border)',borderRadius:4,padding:8,fontSize:8,color:'var(--muted)',overflow:'auto',maxHeight:180,lineHeight:1.6,whiteSpace:'pre-wrap'}}>{`function doPost(e) {
+  try {
+    var data = JSON.parse(e.postData.contents);
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = ss.getSheetByName('Orders') || ss.insertSheet('Orders');
+    if (data.mode === 'replace' || sheet.getLastRow() === 0) {
+      sheet.clearContents();
+      sheet.appendRow(['Order ID','Date','Time','Value','Payment','Status','Location','Pincode']);
+    }
+    data.orders.forEach(function(o) {
+      sheet.appendRow([o.orderId,o.orderDate,o.orderTime,o.value,o.payment,o.status,o.location,o.pincode]);
     });
-    if(add.length)sheet.getRange(sheet.getLastRow()+1,1,add.length,H.length).setValues(add);
-    var dash='ok';try{rebuildDashboard(ss);}catch(de){dash='error: '+String(de);}
-    return json({ok:true,added:add.length,updated:updated,dashboard:dash});
-  }catch(err){return json({ok:false,error:String(err)});}
-}
-function doGet(){try{rebuildDashboard(SpreadsheetApp.getActiveSpreadsheet());return json({ok:true,msg:'Dashboard rebuilt - srtscrap sheet sync is live'});}catch(e){return json({ok:false,where:'dashboard',error:String(e)});}}
-function json(o){return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON);}
-function dstr(d){return Utilities.formatDate(d,TZ,'yyyy-MM-dd');}
-function addDays(s,n){var d=new Date(s+'T00:00:00');d.setDate(d.getDate()+n);return dstr(d);}
-function rebuildDashboard(ss){
-  var orders=ss.getSheetByName('Orders');
-  if(!orders||orders.getLastRow()<2)return;
-  var rows=orders.getRange(2,1,orders.getLastRow()-1,H.length).getValues();
-  var today=dstr(new Date()),yest=addDays(today,-1);
-  var wdMap={Mon:1,Tue:2,Wed:3,Thu:4,Fri:5,Sat:6,Sun:7};
-  var dow=wdMap[Utilities.formatDate(new Date(),TZ,'EEE')]||1;
-  var wStart=addDays(today,-(dow-1)),mStart=today.substring(0,8)+'01';
-  var cT=0,cY=0,cW=0,cM=0,total=0,revT=0,revM=0,loc={},pin={},status={},daily={};
-  rows.forEach(function(r){
-    var dy=rowYMD(r);if(!dy)return;
-    var st=String(r[5]||''),lc=String(r[6]||''),pc=String(r[7]||'');
-    var val=parseFloat(String(r[3]||'').replace(/[^0-9.]/g,''))||0;
-    total++;
-    if(dy===today){cT++;revT+=val;}
-    if(dy===yest)cY++;
-    if(dy>=wStart&&dy<=today)cW++;
-    if(dy>=mStart&&dy<=today){cM++;revM+=val;}
-    if(lc&&lc!=='N/A')loc[lc]=(loc[lc]||0)+1;
-    if(pc&&pc!=='N/A')pin[pc]=(pin[pc]||0)+1;
-    if(st&&st!=='N/A')status[st]=(status[st]||0)+1;
-    if(dy>=addDays(today,-29)&&dy<=today)daily[dy]=(daily[dy]||0)+1;
-  });
-  var topN=function(obj,n){return Object.keys(obj).map(function(k){return [k,obj[k]];}).sort(function(a,b){return b[1]-a[1];}).slice(0,n);};
-  var dash=ss.getSheetByName('Dashboard')||ss.insertSheet('Dashboard',0);
-  dash.getCharts().forEach(function(c){dash.removeChart(c);});
-  dash.clear();
-  dash.getRange('A1').setValue('📊 CXO Dashboard').setFontSize(16).setFontWeight('bold');
-  dash.getRange('A2').setValue('Updated: '+Utilities.formatDate(new Date(),TZ,'dd MMM yyyy, HH:mm')+' IST');
-  var kpis=[['Today',cT],['Yesterday',cY],['Week to date',cW],['Month to date',cM],['Total tracked',total],['Revenue (today)',Math.round(revT)],['Revenue (MTD)',Math.round(revM)]];
-  dash.getRange(4,1,kpis.length,2).setValues(kpis);
-  dash.getRange(4,1,kpis.length,1).setFontWeight('bold');
-  dash.getRange(4,2,kpis.length,1).setFontSize(13).setFontColor('#0a7d33');
-  var tl=topN(loc,10);
-  dash.getRange('D4').setValue('Top Locations').setFontWeight('bold');
-  dash.getRange(5,4,1,2).setValues([['Location','Orders']]).setFontWeight('bold');
-  if(tl.length)dash.getRange(6,4,tl.length,2).setValues(tl);
-  var tp=topN(pin,10);
-  dash.getRange('G4').setValue('Top Pincodes').setFontWeight('bold');
-  dash.getRange(5,7,1,2).setValues([['Pincode','Orders']]).setFontWeight('bold');
-  if(tp.length)dash.getRange(6,7,tp.length,2).setValues(tp.map(function(x){return [String(x[0]),x[1]];}));
-  var tsr=topN(status,12);
-  dash.getRange('J4').setValue('Status Breakdown').setFontWeight('bold');
-  dash.getRange(5,10,1,2).setValues([['Status','Orders']]).setFontWeight('bold');
-  if(tsr.length)dash.getRange(6,10,tsr.length,2).setValues(tsr);
-  var days=[];for(var i=29;i>=0;i--){var d=addDays(today,-i);days.push([d,daily[d]||0]);}
-  dash.getRange(4,14,1,2).setValues([['Date','Orders']]);
-  dash.getRange(5,14,days.length,2).setValues(days);
-  dash.insertChart(dash.newChart().setChartType(Charts.ChartType.COLUMN).addRange(dash.getRange(4,14,days.length+1,2)).setPosition(20,1,0,0).setOption('title','Orders - last 30 days').setOption('legend',{position:'none'}).setOption('width',560).setOption('height',300).build());
-  if(tl.length)dash.insertChart(dash.newChart().setChartType(Charts.ChartType.BAR).addRange(dash.getRange(5,4,tl.length+1,2)).setPosition(20,8,0,0).setOption('title','Top Locations').setOption('legend',{position:'none'}).setOption('width',460).setOption('height',300).build());
-  if(tsr.length)dash.insertChart(dash.newChart().setChartType(Charts.ChartType.PIE).addRange(dash.getRange(5,10,tsr.length+1,2)).setPosition(36,1,0,0).setOption('title','Status mix').setOption('width',460).setOption('height',300).build());
+    return ContentService.createTextOutput(JSON.stringify({ok:true,added:data.orders.length})).setMimeType(ContentService.MimeType.JSON);
+  } catch(e) {
+    return ContentService.createTextOutput(JSON.stringify({ok:false,error:e.message})).setMimeType(ContentService.MimeType.JSON);
+  }
 }`}</pre>
         </details>
         <div style={{marginBottom:8}}><label style={lbl}>Webhook URL</label><input value={url} onChange={(e:any)=>setUrl(e.target.value)} placeholder="https://script.google.com/macros/s/.../exec" style={inp}/></div>
