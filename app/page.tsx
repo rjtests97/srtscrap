@@ -837,7 +837,9 @@ export default function App(){
     setScanning(true);setLog([]);ordersRef.current=[];rateWindow.current=[]
     setScanStats({retries:0,recovered:0,duplicates:0,gapJumps:0,lastMatchedId:null})
     setProgress({done:0,total:useAuto?0:endId-startId+1,found:0});const sa=Date.now();setStartedAt(sa);setScanLabel(`#${brand.idPrefix||''}${startId}–${useAuto?'auto':'#'+(brand.idPrefix||'')+endId}`)
-    addLog(`Manual: #${brand.idPrefix||''}${startId}–${useAuto?'auto':'#'+(brand.idPrefix||'')+endId} | ${concurrency}x | stop after ${stopAfter} misses`,'info')
+    const effectiveStop=useAuto?Math.max(stopAfter,500):stopAfter
+    addLog(`Manual: #${brand.idPrefix||''}${startId}–${useAuto?'auto':'#'+(brand.idPrefix||'')+endId} | ${concurrency}x | stop after ${effectiveStop} empty IDs`,'info')
+    if(useAuto&&effectiveStop>stopAfter)addLog(`ℹ Auto-stop raised to ${effectiveStop} — Shiprocket shares IDs across all sellers, gaps are normal`,'info')
     if(useAuto)addLog(`Hard cap: #${brand.idPrefix||''}${autoHardCap}`,'info')
     const cacheM=cacheEnabled?new OrderCache(brand.id, brand.slug||brand.subdomain):null
     if(cacheM){const csM=cacheM.stats();if(csM.total>0)addLog(`Cache: ${csM.delivered} delivered (skip) + ${csM.active} active — ${cacheM.sizeKB()}KB`,'ok')}
@@ -846,7 +848,7 @@ export default function App(){
     scannerRef.current=scanner
     try{
       const maxId=useAuto?autoHardCap:endId
-      const orders=await scanner.scanManual(startId,maxId,concurrency,useAuto,stopAfter,sa)
+      const orders=await scanner.scanManual(startId,maxId,concurrency,useAuto,effectiveStop,sa)
       const dates=orders.map(r=>r.dateYMD).filter(Boolean).sort()
       const label=dates.length<2?'manual':`${dates[0]} to ${dates[dates.length-1]}`
       if(orders.length>0){const highest=Math.max(...orders.map(o=>parseInt(String(o.orderId).replace(/[^0-9]/g,''))||0));LS.set(`manual_resume_${brand.id}`,highest+1)}

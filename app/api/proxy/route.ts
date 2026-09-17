@@ -14,6 +14,7 @@ function toYMD(s: string) {
   return m2 ? m2[1] : null
 }
 
+// Extract var apidata = {...} from full tracking page
 function extractApidata(html: string): any {
   const idx = html.indexOf('var apidata = ')
   if (idx < 0) return null
@@ -28,50 +29,79 @@ function extractApidata(html: string): any {
   try { return JSON.parse(html.slice(start, i + 1)) } catch { return null }
 }
 
+// Parse a full apidata object (regular tracking page)
 function parseApidata(apidata: any, originalId: string|number) {
   if (!apidata) return null
-
-  // Need at minimum: a date OR a status to consider this a valid order
-  const order    = apidata.order
-  const company  = apidata.company
+  const order     = apidata.order
   const orderDate = order?.order_date || ''
   const status    = apidata.shipment_status_text || ''
-  const slug      = company?.slug || ''
-
-  // No order date AND no status = order doesn't exist at this ID
   if (!orderDate && !status) return null
 
-  // Location: try tracking activities first, fall back to order fields
-  const acts = apidata.tracking_data?.shipment_track_activities ?? []
+  const acts    = apidata.tracking_data?.shipment_track_activities ?? []
   const lastAct = acts.length > 0 ? acts[acts.length-1] : null
-  const city = lastAct?.location
-            || order?.customer_city
-            || order?.billing_city
-            || order?.customer_state
-            || 'N/A'
+  const city    = lastAct?.location || order?.customer_city || order?.customer_state || 'N/A'
   const rawTime = acts[0]?.date || orderDate || ''
 
-  // Values — available for recent orders (Aug+), N/A for archived (May-Jul)
-  const orderTotal   = order?.order_total
-  const paymentMethod = order?.payment_method
+  return {
+    orderId:   originalId,
+    slug:      apidata.company?.slug || '',
+    orderDate: orderDate || 'N/A',
+    orderTime: rawTime.length >= 16 ? rawTime.slice(11,16) : 'N/A',
+    dateYMD:   toYMD(orderDate),
+    value:     order?.order_total ? `Rs.${parseFloat(order.order_total).toFixed(2)}` : 'N/A',
+    valueNum:  parseFloat(order?.order_total||'0') || 0,
+    payment:   order?.payment_method || 'N/A',
+    status:    status || 'N/A',
+    pincode:   order?.customer_pincode || 'N/A',
+    location:  city,
+  }
+}
+
+// STATUS keywords that confirm this is a real order page
+const ORDER_STATUSES = [
+  'DELIVERED','RTO DELIVERED','CANCELLED','IN TRANSIT',
+  'OUT FOR DELIVERY','PENDING','UNDELIVERED','PICKUP GENERATED',
+  'SHIPPED','AT DESTINATION HUB','REACHED','RTO OFD',
+  'RTO IN TRANSIT','RTO INITIATED','ATTEMPT FAILURE',
+  'OUT FOR PICKUP','MISROUTED','UNTRACEABLE'
+]
+
+// Parse archived tracking page — "This is an archived tracking view. Verify as buyer"
+// These have no var apidata but contain status info in visible HTML
+function parseArchivedPage(html: string, originalId: string|number) {
+  // Extract status — look for known status keywords in HTML text
+  let status = 'N/A'
+  const upperHtml = html.toUpperCase()
+  for (const s of ORDER_STATUSES) {
+    if (upperHtml.includes(s)) { status = s.charAt(0) + s.slice(1).toLowerCase(); break }
+  }
+
+  // Extract first full date visible in the page e.g. "12 Aug 2026"
+  const dateMatch = html.match(/\b(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})\b/i)
+  const orderDate = dateMatch ? `${dateMatch[1]} ${dateMatch[2]} ${dateMatch[3]}` : 'N/A'
+  const dateYMD   = dateMatch ? toYMD(orderDate) : null
+
+  // Extract pincode (6-digit number)
+  const pinMatch = html.match(/\b(\d{6})\b/)
+  const pincode  = pinMatch ? pinMatch[1] : 'N/A'
 
   return {
-    orderId:     originalId,
-    slug,
-    orderDate:   orderDate || 'N/A',
-    orderTime:   rawTime.length >= 16 ? rawTime.slice(11,16) : 'N/A',
-    dateYMD:     toYMD(orderDate),
-    value:       orderTotal  ? `Rs.${parseFloat(orderTotal).toFixed(2)}`  : 'N/A',
-    valueNum:    parseFloat(orderTotal||'0') || 0,
-    payment:     paymentMethod || 'N/A',
-    status:      status || 'N/A',
-    pincode:     order?.customer_pincode || 'N/A',
-    location:    city,
+    orderId:   originalId,
+    slug:      '',
+    orderDate,
+    orderTime: 'N/A',
+    dateYMD,
+    value:     'N/A',
+    valueNum:  0,
+    payment:   'N/A',
+    status,
+    pincode,
+    location:  'N/A',
   }
 }
 
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-const MIN_REAL_PAGE = 40000  // pages under 40KB = rate limit / challenge page
+const MIN_REAL_PAGE = 40000  // rate-limit/challenge pages are tiny
 
 async function fetchOneOrder(subdomain: string, orderId: string|number): Promise<any> {
   const id = String(orderId)
@@ -88,12 +118,31 @@ async function fetchOneOrder(subdomain: string, orderId: string|number): Promise
     if (res.status === 429 || res.status === 503 || res.status === 403) return 'rl'
     if (!res.ok) return null
     const html = await res.text()
-    if (html.length < MIN_REAL_PAGE) return 'rl'   // challenge/rate-limit page
 
+    // Small page = rate-limit challenge page, not a real tracking page
+    if (html.length < MIN_REAL_PAGE) return 'rl'
+
+    // ── Try 1: Regular tracking page with var apidata ──
     const apidata = extractApidata(html)
-    if (!apidata) return 'rl'                       // page loaded but no data = rl
+    if (apidata) {
+      const result = parseApidata(apidata, orderId)
+      if (result) return result
+      // apidata present but empty order = order not found at this ID
+      return null
+    }
 
-    return parseApidata(apidata, orderId)
+    // ── Try 2: Archived tracking page (no apidata, different template) ──
+    // On brand subdomain, any full-size page that isn't apidata = archived order
+    // Check for any status keyword to confirm it's a real order
+    const upperHtml = html.toUpperCase()
+    const isOrderPage = ORDER_STATUSES.some(s => upperHtml.includes(s))
+    if (isOrderPage) {
+      return parseArchivedPage(html, orderId)
+    }
+
+    // Full-size page but no order data and no status — treat as rl (unexpected)
+    return 'rl'
+
   } catch (e: any) {
     if (e.name === 'TimeoutError' || e.name === 'AbortError') return 'rl'
     return 'rl'
