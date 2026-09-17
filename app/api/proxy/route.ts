@@ -14,7 +14,6 @@ function toYMD(s: string) {
   return m2 ? m2[1] : null
 }
 
-// Extract var apidata = {...} from full tracking page
 function extractApidata(html: string): any {
   const idx = html.indexOf('var apidata = ')
   if (idx < 0) return null
@@ -29,7 +28,6 @@ function extractApidata(html: string): any {
   try { return JSON.parse(html.slice(start, i + 1)) } catch { return null }
 }
 
-// Parse a full apidata object (regular tracking page)
 function parseApidata(apidata: any, originalId: string|number) {
   if (!apidata) return null
   const order     = apidata.order
@@ -57,109 +55,116 @@ function parseApidata(apidata: any, originalId: string|number) {
   }
 }
 
-// STATUS keywords that confirm this is a real order page
-const ORDER_STATUSES = [
-  'DELIVERED','RTO DELIVERED','CANCELLED','IN TRANSIT',
-  'OUT FOR DELIVERY','PENDING','UNDELIVERED','PICKUP GENERATED',
-  'SHIPPED','AT DESTINATION HUB','REACHED','RTO OFD',
-  'RTO IN TRANSIT','RTO INITIATED','ATTEMPT FAILURE',
-  'OUT FOR PICKUP','MISROUTED','UNTRACEABLE'
-]
+const ORDER_STATUSES = ['DELIVERED','RTO DELIVERED','CANCELLED','IN TRANSIT','OUT FOR DELIVERY',
+  'PENDING','UNDELIVERED','PICKUP GENERATED','SHIPPED','AT DESTINATION','REACHED','RTO OFD',
+  'RTO IN TRANSIT','RTO INITIATED','ATTEMPT FAILURE','OUT FOR PICKUP','MISROUTED','UNTRACEABLE']
 
-// Parse archived tracking page — "This is an archived tracking view. Verify as buyer"
-// These have no var apidata but contain status info in visible HTML
 function parseArchivedPage(html: string, originalId: string|number) {
-  // Extract status — look for known status keywords in HTML text
+  const upper = html.toUpperCase()
   let status = 'N/A'
-  const upperHtml = html.toUpperCase()
   for (const s of ORDER_STATUSES) {
-    if (upperHtml.includes(s)) { status = s.charAt(0) + s.slice(1).toLowerCase(); break }
+    if (upper.includes(s)) { status = s.charAt(0) + s.slice(1).toLowerCase(); break }
   }
-
-  // Extract first full date visible in the page e.g. "12 Aug 2026"
   const dateMatch = html.match(/\b(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})\b/i)
   const orderDate = dateMatch ? `${dateMatch[1]} ${dateMatch[2]} ${dateMatch[3]}` : 'N/A'
-  const dateYMD   = dateMatch ? toYMD(orderDate) : null
-
-  // Extract pincode (6-digit number)
-  const pinMatch = html.match(/\b(\d{6})\b/)
-  const pincode  = pinMatch ? pinMatch[1] : 'N/A'
-
+  const pinMatch  = html.match(/\b(\d{6})\b/)
   return {
-    orderId:   originalId,
-    slug:      '',
-    orderDate,
-    orderTime: 'N/A',
-    dateYMD,
-    value:     'N/A',
-    valueNum:  0,
-    payment:   'N/A',
-    status,
-    pincode,
-    location:  'N/A',
+    orderId: originalId, slug: '', orderDate, orderTime: 'N/A',
+    dateYMD: dateMatch ? toYMD(orderDate) : null,
+    value: 'N/A', valueNum: 0, payment: 'N/A',
+    status: status !== 'N/A' ? status : 'Archived',
+    pincode: pinMatch?.[1] || 'N/A', location: 'N/A',
   }
 }
 
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-const MIN_REAL_PAGE = 40000  // rate-limit/challenge pages are tiny
+const MIN_REAL_PAGE = 40000
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
+
+async function tryFetch(url: string, headers: any): Promise<{status:number, html:string}|null> {
+  try {
+    const res = await fetch(url, { headers, signal: AbortSignal.timeout(12000) })
+    const html = await res.text()
+    return { status: res.status, html }
+  } catch { return null }
+}
+
+function parseHtml(html: string, orderId: string|number) {
+  if (html.length < MIN_REAL_PAGE) return null  // too small = challenge page
+  const apidata = extractApidata(html)
+  if (apidata) {
+    const result = parseApidata(apidata, orderId)
+    if (result) return result
+    return null  // apidata found but empty = order doesn't exist
+  }
+  // No apidata — try archived page format
+  const upper = html.toUpperCase()
+  if (ORDER_STATUSES.some(s => upper.includes(s))) return parseArchivedPage(html, orderId)
+  return null
+}
 
 async function fetchOneOrder(subdomain: string, orderId: string|number): Promise<any> {
-  const id = String(orderId)
-  try {
-    const res = await fetch(`https://${subdomain}.shiprocket.co/tracking/order/${id}`, {
-      headers: {
-        'Accept': 'text/html,application/xhtml+xml',
-        'User-Agent': UA,
-        'Accept-Language': 'en-IN,en;q=0.9',
-        'Cache-Control': 'no-cache',
-      },
-      signal: AbortSignal.timeout(12000),
-    })
-
-    // Rate limiting
-    if (res.status === 429 || res.status === 503 || res.status === 403) return 'rl'
-
-    // HTTP 500 = Shiprocket backend error for this order (common for archived orders)
-    // The order EXISTS but Shiprocket can't serve it from the server side
-    // Return a stub so the scanner counts it as found and keeps going
-    if (res.status === 500) {
-      return {
-        orderId, slug: '', orderDate: 'N/A', orderTime: 'N/A', dateYMD: null,
-        value: 'N/A', valueNum: 0, payment: 'N/A', status: 'Archived',
-        pincode: 'N/A', location: 'N/A',
-      }
-    }
-
-    if (!res.ok) return null  // 404 = genuinely doesn't exist
-    const html = await res.text()
-
-    // Small page = rate-limit challenge page
-    if (html.length < MIN_REAL_PAGE) return 'rl'
-
-    // ── Regular tracking page with var apidata ──
-    const apidata = extractApidata(html)
-    if (apidata) {
-      const result = parseApidata(apidata, orderId)
-      if (result) return result
-      return null  // apidata exists but empty = order not found
-    }
-
-    // ── Archived tracking page (no apidata, different HTML template) ──
-    const upperHtml = html.toUpperCase()
-    if (ORDER_STATUSES.some(s => upperHtml.includes(s))) {
-      return parseArchivedPage(html, orderId)
-    }
-
-    return 'rl'  // full page but unrecognised format
-
-  } catch (e: any) {
-    if (e.name === 'TimeoutError' || e.name === 'AbortError') return 'rl'
-    return 'rl'
+  const id  = String(orderId)
+  const url = `https://${subdomain}.shiprocket.co/tracking/order/${id}`
+  const headers = {
+    'Accept': 'text/html,application/xhtml+xml',
+    'User-Agent': UA,
+    'Accept-Language': 'en-IN,en;q=0.9',
+    'Cache-Control': 'no-cache',
+    'Referer': `https://${subdomain}.shiprocket.co/`,
   }
+
+  // ── Attempt 1 ──────────────────────────────────────────
+  const r1 = await tryFetch(url, headers)
+  if (!r1) return 'rl'
+
+  if (r1.status === 429 || r1.status === 503 || r1.status === 403) return 'rl'
+  if (r1.status === 404) return null  // genuinely doesn't exist
+
+  if (r1.status === 200) {
+    const parsed = parseHtml(r1.html, orderId)
+    // parsed = Order → found, null → not found, undefined handled below
+    if (parsed !== undefined) return parsed  // includes null for not-found
+    return 'rl'  // full page but unrecognised format
+  }
+
+  if (r1.status === 500) {
+    // 500 can be transient throttling OR genuine archived order
+    // Retry once after a pause — transient 500s resolve, genuine ones don't
+    await sleep(1500)
+
+    const r2 = await tryFetch(url, headers)
+    if (!r2) return 'rl'
+
+    if (r2.status === 200) {
+      const parsed2 = parseHtml(r2.html, orderId)
+      if (parsed2 !== undefined) return parsed2
+      return 'rl'
+    }
+
+    if (r2.status === 429 || r2.status === 503) return 'rl'
+
+    // Both attempts returned 500 (or other error) → persistent failure
+    // Order exists (it's on the brand subdomain) but data is unavailable
+    return {
+      orderId, slug: '', orderDate: 'N/A', orderTime: 'N/A', dateYMD: null,
+      value: 'N/A', valueNum: 0, payment: 'N/A', status: 'Archived',
+      pincode: 'N/A', location: 'N/A',
+    }
+  }
+
+  return 'rl'  // any other status
 }
 
 export async function POST(req: NextRequest) {
   const { subdomain, ids } = await req.json() as { subdomain: string; ids: Array<string|number> }
-  const results = await Promise.all(ids.map(id => fetchOneOrder(subdomain, id).catch(() => 'rl')))
+  // Stagger parallel requests slightly to reduce server-side throttling
+  const results = await Promise.all(
+    ids.map((id, i) =>
+      sleep(i * 150)  // 150ms stagger: 0ms, 150ms, 300ms... for a batch of 8
+        .then(() => fetchOneOrder(subdomain, id))
+        .catch(() => 'rl' as const)
+    )
+  )
   return NextResponse.json({ results })
 }
