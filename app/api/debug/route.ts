@@ -17,52 +17,33 @@ function extractApidata(html: string): any {
 
 export async function POST(req: NextRequest) {
   const { subdomain, orderId } = await req.json()
-  const id = String(orderId || '70932')
+  const id = String(orderId)
   const sub = subdomain || 'minnies'
 
   const res = await fetch(`https://${sub}.shiprocket.co/tracking/order/${id}`, {
-    headers: {
-      'Accept': 'text/html',
-      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-      'Accept-Language': 'en-IN,en;q=0.9',
-    },
+    headers: { 'Accept': 'text/html', 'User-Agent': 'Mozilla/5.0', 'Accept-Language': 'en-IN' },
     signal: AbortSignal.timeout(15000),
   })
   const html = await res.text()
   const apidata = extractApidata(html)
 
-  // Search entire apidata for payment-related fields
-  const flat: Record<string,any> = {}
-  function flattenObj(obj: any, prefix = '') {
-    if (!obj || typeof obj !== 'object') return
-    for (const [k, v] of Object.entries(obj)) {
-      const key = prefix ? `${prefix}.${k}` : k
-      if (typeof v === 'object' && v !== null && !Array.isArray(v)) {
-        flattenObj(v, key)
-      } else {
-        flat[key] = v
-      }
-    }
-  }
-  flattenObj(apidata)
-
-  const paymentFields = Object.entries(flat).filter(([k]) =>
-    k.toLowerCase().includes('pay') || k.toLowerCase().includes('cod') || k.toLowerCase().includes('method')
-  )
-  const totalFields = Object.entries(flat).filter(([k]) =>
-    k.toLowerCase().includes('total') || k.toLowerCase().includes('amount') || k.toLowerCase().includes('price') || k.toLowerCase().includes('value')
-  )
-
   return NextResponse.json({
     pageLength: html.length,
     hasApidata: !!apidata,
+    // Key fields that determine if proxy returns null
+    order_date: apidata?.order?.order_date,
+    system_order_id: apidata?.order?.system_order_id,
+    shipment_status_text: apidata?.shipment_status_text,
+    shipment_status: apidata?.shipment_status,
     show_pii: apidata?.show_pii,
-    shipment_status: apidata?.shipment_status_text,
     order_keys: apidata?.order ? Object.keys(apidata.order) : null,
-    order_full: apidata?.order,
-    payment_fields: paymentFields,
-    total_fields: totalFields,
-    // First tracking activity
+    // Tracking activities (may have date even if order_date is empty)
+    activities_count: apidata?.tracking_data?.shipment_track_activities?.length || 0,
     first_activity: apidata?.tracking_data?.shipment_track_activities?.[0],
+    last_activity: apidata?.tracking_data?.shipment_track_activities?.slice(-1)[0],
+    // Archived page detection
+    hasArchivedBanner: html.includes('archived tracking') || html.includes('Verify as buyer'),
+    // Full order object
+    order_full: apidata?.order,
   })
 }
