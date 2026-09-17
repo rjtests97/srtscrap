@@ -429,10 +429,15 @@ class Scanner {
           if(o==='rl'){rlInBurst++;continue}
           if(o!==null){
             const tagged={...o,source:'fresh' as const}
-            this.cache?.set(ids[i],tagged)  // save to cache
-            if(tagged.dateYMD&&tagged.dateYMD>=fromDate&&tagged.dateYMD<=toDate){
+            this.cache?.set(ids[i],tagged)
+            // Include if in date range OR if dateYMD is null (archived/500 — within scanned ID range so date is implied)
+            const inRange=!tagged.dateYMD||(tagged.dateYMD>=fromDate&&tagged.dateYMD<=toDate)
+            if(inRange){
               orders.push(tagged);matched++;this.onOrder(tagged)
-              this.onLog('#'+ids[i]+'  '+tagged.orderDate+'  '+tagged.value+'  '+tagged.payment+'  '+tagged.location+'  '+tagged.pincode,'ok')
+              const lbl=tagged.dateYMD
+                ?`#${ids[i]}  ${tagged.orderDate}  ${tagged.value}  ${tagged.payment}  ${tagged.location}  ${tagged.pincode}`
+                :`#${ids[i]}  Archived`
+              this.onLog(lbl,'ok')
             }
           }
         }
@@ -515,7 +520,8 @@ class Scanner {
             lastGoodId=ids[i]
             this.onStats?.({lastMatchedId:Scanner.numericPart(fo.orderId)})
             this.onOrder(fo)
-            this.onLog('#'+ids[i]+'  '+fo.orderDate+'  '+fo.value+'  '+fo.payment+'  '+fo.location,'ok')
+            const manualLabel=fo.dateYMD?`#${ids[i]}  ${fo.orderDate}  ${fo.value}  ${fo.payment}  ${fo.location}`:`#${ids[i]}  Archived`
+            this.onLog(manualLabel,'ok')
           }else{
             consNulls++
             // Reached null threshold — check if rate-limited before stopping/waiting

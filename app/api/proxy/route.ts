@@ -115,33 +115,42 @@ async function fetchOneOrder(subdomain: string, orderId: string|number): Promise
       },
       signal: AbortSignal.timeout(12000),
     })
+
+    // Rate limiting
     if (res.status === 429 || res.status === 503 || res.status === 403) return 'rl'
-    if (!res.ok) return null
+
+    // HTTP 500 = Shiprocket backend error for this order (common for archived orders)
+    // The order EXISTS but Shiprocket can't serve it from the server side
+    // Return a stub so the scanner counts it as found and keeps going
+    if (res.status === 500) {
+      return {
+        orderId, slug: '', orderDate: 'N/A', orderTime: 'N/A', dateYMD: null,
+        value: 'N/A', valueNum: 0, payment: 'N/A', status: 'Archived',
+        pincode: 'N/A', location: 'N/A',
+      }
+    }
+
+    if (!res.ok) return null  // 404 = genuinely doesn't exist
     const html = await res.text()
 
-    // Small page = rate-limit challenge page, not a real tracking page
+    // Small page = rate-limit challenge page
     if (html.length < MIN_REAL_PAGE) return 'rl'
 
-    // ── Try 1: Regular tracking page with var apidata ──
+    // ── Regular tracking page with var apidata ──
     const apidata = extractApidata(html)
     if (apidata) {
       const result = parseApidata(apidata, orderId)
       if (result) return result
-      // apidata present but empty order = order not found at this ID
-      return null
+      return null  // apidata exists but empty = order not found
     }
 
-    // ── Try 2: Archived tracking page (no apidata, different template) ──
-    // On brand subdomain, any full-size page that isn't apidata = archived order
-    // Check for any status keyword to confirm it's a real order
+    // ── Archived tracking page (no apidata, different HTML template) ──
     const upperHtml = html.toUpperCase()
-    const isOrderPage = ORDER_STATUSES.some(s => upperHtml.includes(s))
-    if (isOrderPage) {
+    if (ORDER_STATUSES.some(s => upperHtml.includes(s))) {
       return parseArchivedPage(html, orderId)
     }
 
-    // Full-size page but no order data and no status — treat as rl (unexpected)
-    return 'rl'
+    return 'rl'  // full page but unrecognised format
 
   } catch (e: any) {
     if (e.name === 'TimeoutError' || e.name === 'AbortError') return 'rl'
