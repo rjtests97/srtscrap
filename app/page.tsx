@@ -591,7 +591,8 @@ export default function App(){
   const[startedAt,setStartedAt]=useState(0)
   const[scanLabel,setScanLabel]=useState('')
   const[forceRefresh,setForceRefresh]=useState(false)
-  const[refreshValues,setRefreshValues]=useState(true)  // re-fetch delivered orders missing values
+  const[refreshValues,setRefreshValues]=useState(false)
+  const[cacheEnabled,setCacheEnabled]=useState(false)  // OFF by default — scan everything like before
   const[showAdd,setShowAdd]=useState(false)
   const scannerRef=useRef<Scanner|null>(null)
   const logRef=useRef<HTMLDivElement>(null)
@@ -715,46 +716,71 @@ export default function App(){
     const byId:Record<string,Order>={}
     allRuns.flatMap(r=>r.orders||[]).slice().reverse().forEach(o=>{byId[String(o.orderId)]=o})
     const unique=Object.values(byId)
-    const toScan=onlyPending?unique.filter(o=>!['delivered','rto delivered'].some(s=>(o.status||'').toLowerCase().includes(s))):unique
-    if(!toScan.length){addLog('Nothing to re-scan','info');return}
-    addLog(`Re-scanning ${toScan.length} orders${onlyPending?' (pending only)':' (all — getting values too)'}...`,'info')
-    setScanning(true);setScanLabel(`Re-scan ${toScan.length}`);ordersRef.current=[]
+    const toScan=onlyPending
+      ?unique.filter(o=>!['delivered','rto delivered'].some(s=>(o.status||'').toLowerCase().includes(s)))
+      :unique
+    if(!toScan.length){addLog('No orders found in history. Run a scan first.','err');return}
+
+    setScanning(true);setScanLabel(`Re-fetch ${toScan.length} orders`);ordersRef.current=[]
     setScanStats({retries:0,recovered:0,duplicates:0,gapJumps:0,lastMatchedId:null})
     setProgress({done:0,total:toScan.length,found:0})
-    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,
-      (done,total,found)=>{setProgress({done,total,found})},
-      (o)=>{ordersRef.current=[...ordersRef.current,o]},
-      (s)=>setScanStats(p=>mergeScanStats(p,s)),undefined,true)
-    scannerRef.current=scanner
+    addLog(`Re-fetching ${toScan.length} known orders directly (no range scanning)...`,'info')
+    addLog(onlyPending?'Mode: pending/active only — getting latest status':'Mode: ALL orders — getting latest status + values','info')
+
+    let stopped=false
+    const stopHandler=()=>{stopped=true}
+    scannerRef.current={stop:stopHandler} as any
+
     try{
       const updated:Order[]=[]
-      const BATCH=5
-      for(let i=0;i<toScan.length&&!scanner.stopped;i+=BATCH){
+      const BATCH=8  // fetch 8 known IDs at once
+      let statusChanges=0,valuesGot=0,errors=0
+
+      for(let i=0;i<toScan.length&&!stopped;i+=BATCH){
         const chunk=toScan.slice(i,i+BATCH)
-        const ids=chunk.map(o=>typeof o.orderId==='number'?o.orderId:parseInt(String(o.orderId).replace(/[^0-9]/g,''))||0).filter(Boolean)
-        const results=await scanner['fetchBatch'](ids)
-        chunk.forEach((orig,j)=>{
-          const fresh=results[j]
-          if(fresh&&fresh!=='rl'){
-            const merged={...orig,...fresh,orderId:orig.orderId,dateYMD:orig.dateYMD,orderDate:orig.orderDate}
-            updated.push(merged)
-            if(fresh.status!==orig.status)addLog(`#${orig.orderId} ${orig.status} → ${fresh.status}${fresh.valueNum>0?' Rs.'+fresh.valueNum.toFixed(0):''}`,fresh.status.toLowerCase().includes('delivered')?'ok':'info')
-            else if(fresh.valueNum>0&&orig.valueNum===0)addLog(`#${orig.orderId} value recovered: Rs.${fresh.valueNum.toFixed(0)}`,'ok')
-          }else{updated.push(orig)}
-        })
+        const ids=chunk.map(o=>{
+          const n=typeof o.orderId==='number'?o.orderId:parseInt(String(o.orderId).replace(/[^0-9]/g,''))
+          return isNaN(n)?null:(brand.idPrefix?`${brand.idPrefix}${n}`:n)
+        }).filter(Boolean)
+
+        try{
+          const res=await fetch('/api/proxy',{
+            method:'POST',headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({subdomain:brand.subdomain,ids}),
+            signal:AbortSignal.timeout(20000)
+          })
+          if(res.ok){
+            const{results}=await res.json()
+            chunk.forEach((orig,j)=>{
+              const fresh=results[j]
+              if(fresh&&fresh!=='rl'){
+                const merged={...orig,...fresh,orderId:orig.orderId,dateYMD:orig.dateYMD||fresh.dateYMD,orderDate:orig.orderDate||fresh.orderDate,source:'fresh' as const}
+                updated.push(merged)
+                if(fresh.status!==orig.status){statusChanges++;addLog(`#${orig.orderId} ${orig.status} → ${fresh.status}`,fresh.status.toLowerCase().includes('delivered')?'ok':'info')}
+                if(fresh.valueNum>0&&orig.valueNum===0){valuesGot++;addLog(`#${orig.orderId} value: Rs.${fresh.valueNum.toFixed(0)}`,'ok')}
+              }else{updated.push({...orig,source:'cache' as const});if(fresh==='rl')errors++}
+            })
+          }else{chunk.forEach(o=>updated.push(o));errors+=chunk.length}
+        }catch{chunk.forEach(o=>updated.push(o));errors+=chunk.length}
+
         setProgress({done:Math.min(i+BATCH,toScan.length),total:toScan.length,found:updated.filter(o=>o.valueNum>0).length})
-        await sleep(600)
+        // Rate limit protection: 400ms between batches
+        if(!stopped)await sleep(400)
       }
-      // Patch all runs with updated orders
+
+      // Patch all runs in-place with updated data
       const freshById:Record<string,Order>=Object.fromEntries(updated.map(o=>[String(o.orderId),o]))
       const patched=LS.get<Run[]>(`runs_${brand.id}`,[]).map(r=>({...r,orders:r.orders.map(o=>freshById[String(o.orderId)]||o)}))
       LS.set(`runs_${brand.id}`,patched);setRuns(patched)
-      const withVal=updated.filter(o=>o.valueNum>0).length
-      const statusChanged=updated.filter((o,i)=>o.status!==toScan[i]?.status).length
-      addLog(`✓ Done: ${statusChanged} status updates, ${withVal} values recovered`,'ok')
+      addLog(`✓ Complete: ${statusChanges} status updates · ${valuesGot} values recovered · ${errors} errors`,'ok')
+
+      // Sync to Sheets
       const sheetsUrl=LS.get(`sheets_${brand.id}`,'')
-      if(sheetsUrl){addLog('Syncing all to Sheets (replace)...','info');syncAllToSheets(brand).then(n=>addLog(`✓ Sheets: ${n} rows`,'ok'))}
-    }catch(e:any){addLog('Re-scan error: '+e.message,'err')}
+      if(sheetsUrl){
+        addLog('Syncing all orders to Sheets...','info')
+        syncAllToSheets(brand).then(n=>addLog(`✓ Sheets: ${n} rows synced`,'ok'))
+      }
+    }catch(e:any){addLog('Error: '+e.message,'err')}
     finally{setScanning(false);setScanLabel('')}
   }
 
@@ -782,14 +808,10 @@ export default function App(){
     setProgress({done:0,total:0,found:0});setStartedAt(Date.now());setScanLabel(`${fromDate} → ${toDate}`)
     if('wakeLock' in navigator){try{(navigator as any).wakeLock.request('screen').catch(()=>{})}catch{}}
     addLog('⚠ Keep this tab active — switching tabs may pause the scan','info')
-    const cache=new OrderCache(brand.id, brand.slug||brand.subdomain)
-    const cs=cache.stats()
-    if(cs.total>0&&!forceRefresh){
-      const skippable=refreshValues?cs.active:cs.delivered+cs.active
-      addLog(`Cache: ${cs.total} orders | ${refreshValues?cs.delivered+' delivered with value (skip), '+cs.active+' to fetch':cs.delivered+' delivered (skip), '+cs.active+' active'} — ${cache.sizeKB()}KB`,'ok')
-    }
-    if(forceRefresh)addLog('Force refresh: ignoring all cache','info')
-    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)),cache,forceRefresh,refreshValues)
+    const cache=cacheEnabled?new OrderCache(brand.id, brand.slug||brand.subdomain):null
+    if(cache){const cs=cache.stats();if(cs.total>0)addLog(`Cache: ${cs.delivered} delivered (skip) + ${cs.active} active — ${cache.sizeKB()}KB`,'ok')}
+    else addLog('Smart cache OFF — scanning all IDs fresh','info')
+    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)),cache||undefined,forceRefresh,false)
     scannerRef.current=scanner
     try{
       addLog(`Finding boundaries for ${fromDate} → ${toDate}...`,'info')
@@ -811,22 +833,20 @@ export default function App(){
     if(!active||scanning)return
     if(!Number.isFinite(startId)||startId<=0){addLog('Invalid start ID. Please enter a real numeric Shiprocket order ID.','err');return}
     const brand=active
-    const safeStopAfter=useAuto?Math.max(stopAfter,recommendedAutoStop(concurrency,brand.avgPerDay||0)):stopAfter
     const autoHardCap=startId+Math.max(20000,Math.min(250000,(brand.avgPerDay||0)*45))
     setScanning(true);setLog([]);ordersRef.current=[];rateWindow.current=[]
     setScanStats({retries:0,recovered:0,duplicates:0,gapJumps:0,lastMatchedId:null})
     setProgress({done:0,total:useAuto?0:endId-startId+1,found:0});const sa=Date.now();setStartedAt(sa);setScanLabel(`#${brand.idPrefix||''}${startId}–${useAuto?'auto':'#'+(brand.idPrefix||'')+endId}`)
-    addLog(`Manual: #${brand.idPrefix||''}${startId}–${useAuto?'auto':'#'+(brand.idPrefix||'')+endId} | ${concurrency}x`,'info')
-    if(useAuto&&safeStopAfter!==stopAfter)addLog(`Raised auto-stop from ${stopAfter} to ${safeStopAfter} for safer scanning`,'info')
-    if(useAuto)addLog(`Auto hard cap set to #${brand.idPrefix||''}${autoHardCap} based on current brand velocity`,'info')
-    const cacheM=new OrderCache(brand.id, brand.slug||brand.subdomain)
-    const csM=cacheM.stats()
-    if(csM.total>0&&!forceRefresh)addLog(`Cache: ${csM.total} orders | ${refreshValues?csM.delivered+' del+value (skip), '+(csM.active)+' to fetch':csM.delivered+' del (skip), '+csM.active+' active'} — ${cacheM.sizeKB()}KB`,'ok')
-    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)),cacheM,forceRefresh,refreshValues)
+    addLog(`Manual: #${brand.idPrefix||''}${startId}–${useAuto?'auto':'#'+(brand.idPrefix||'')+endId} | ${concurrency}x | stop after ${stopAfter} misses`,'info')
+    if(useAuto)addLog(`Hard cap: #${brand.idPrefix||''}${autoHardCap}`,'info')
+    const cacheM=cacheEnabled?new OrderCache(brand.id, brand.slug||brand.subdomain):null
+    if(cacheM){const csM=cacheM.stats();if(csM.total>0)addLog(`Cache: ${csM.delivered} delivered (skip) + ${csM.active} active — ${cacheM.sizeKB()}KB`,'ok')}
+    else addLog('Smart cache OFF — scanning all IDs fresh','info')
+    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)),cacheM||undefined,forceRefresh,false)
     scannerRef.current=scanner
     try{
       const maxId=useAuto?autoHardCap:endId
-      const orders=await scanner.scanManual(startId,maxId,concurrency,useAuto,safeStopAfter,sa)
+      const orders=await scanner.scanManual(startId,maxId,concurrency,useAuto,stopAfter,sa)
       const dates=orders.map(r=>r.dateYMD).filter(Boolean).sort()
       const label=dates.length<2?'manual':`${dates[0]} to ${dates[dates.length-1]}`
       if(orders.length>0){const highest=Math.max(...orders.map(o=>parseInt(String(o.orderId).replace(/[^0-9]/g,''))||0));LS.set(`manual_resume_${brand.id}`,highest+1)}
@@ -890,8 +910,8 @@ export default function App(){
 
           {(tab==='date'||tab==='manual')&&(
             <>
-              {tab==='date'&&<DateTab active={active} scanning={scanning} scanLabel={scanLabel} onStart={(f:string,t:string,c:number)=>startDateScan(f,t,c)} inp={inp} lbl={lbl} forceRefresh={forceRefresh} setForceRefresh={setForceRefresh} refreshValues={refreshValues} setRefreshValues={setRefreshValues}/>}
-              {tab==='manual'&&<ManualTab active={active} scanning={scanning} scanLabel={scanLabel} onStart={(si:number,ei:number,c:number,ua:boolean,sa:number)=>startManualScan(si,ei,c,ua,sa)} inp={inp} lbl={lbl} forceRefresh={forceRefresh} setForceRefresh={setForceRefresh} refreshValues={refreshValues} setRefreshValues={setRefreshValues}/>}
+              {tab==='date'&&<DateTab active={active} scanning={scanning} scanLabel={scanLabel} onStart={(f:string,t:string,c:number)=>startDateScan(f,t,c)} inp={inp} lbl={lbl} forceRefresh={forceRefresh} setForceRefresh={setForceRefresh} cacheEnabled={cacheEnabled} setCacheEnabled={setCacheEnabled}/>}
+              {tab==='manual'&&<ManualTab active={active} scanning={scanning} scanLabel={scanLabel} onStart={(si:number,ei:number,c:number,ua:boolean,sa:number)=>startManualScan(si,ei,c,ua,sa)} inp={inp} lbl={lbl} forceRefresh={forceRefresh} setForceRefresh={setForceRefresh} cacheEnabled={cacheEnabled} setCacheEnabled={setCacheEnabled}/>}
               {scanning&&(
                 <div style={{marginBottom:10}}>
                   <div style={{display:'flex',justifyContent:'space-between',fontSize:10,color:'var(--muted)',marginBottom:5}}>
@@ -1021,7 +1041,7 @@ function DashboardStrip({runs}:{runs:Run[]}){
   )
 }
 
-function DateTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setForceRefresh,refreshValues,setRefreshValues}:any){
+function DateTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setForceRefresh,cacheEnabled,setCacheEnabled}:any){
   const[from,setFrom]=useState(yestStr());const[to,setTo]=useState(todayStr());const[conc,setConc]=useState('5')
   const presetBtn=(label:string,f:string,t:string)=><button key={label} onClick={()=>{setFrom(f);setTo(t)}} style={{background:'var(--surface)',border:'1px solid var(--border)',color:'var(--muted)',padding:'6px 10px',borderRadius:20,fontSize:9,fontFamily:'inherit',cursor:'pointer'}}>{label}</button>
   return(
@@ -1048,15 +1068,9 @@ function DateTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setForc
             <select value={conc} onChange={e=>setConc(e.target.value)} style={{...inp,width:'auto',padding:'5px 8px',fontSize:11}}>{['3','5','8','10','15'].map(v=><option key={v} value={v}>{v}</option>)}</select>
             <span style={{fontSize:9}}>(higher = faster)</span>
           </div>
-          <div style={{display:'flex',flexDirection:'column' as const,gap:5,marginBottom:8,padding:'8px 10px',background:'var(--surface)',borderRadius:6,border:'1px solid var(--border)'}}>
-            <div style={{display:'flex',alignItems:'center',gap:6}}>
-              <input type="checkbox" id="rv_date" checked={refreshValues} onChange={(e:any)=>setRefreshValues(e.target.checked)} style={{accentColor:'var(--accent)',width:13,height:13,cursor:'pointer'}}/>
-              <label htmlFor="rv_date" style={{fontSize:9,color:'var(--text)',cursor:'pointer',fontWeight:600}}>↻ Refresh missing values — re-fetch Delivered orders with no value</label>
-            </div>
-            <div style={{display:'flex',alignItems:'center',gap:6}}>
-              <input type="checkbox" id="fr_date" checked={forceRefresh} onChange={(e:any)=>setForceRefresh(e.target.checked)} style={{accentColor:'var(--warn)',width:13,height:13,cursor:'pointer'}}/>
-              <label htmlFor="fr_date" style={{fontSize:9,color:'var(--muted)',cursor:'pointer'}}>Force Refresh — ignore cache entirely</label>
-            </div>
+          <div style={{display:'flex',alignItems:'center',gap:6,marginBottom:8,padding:'7px 10px',background:'var(--surface)',borderRadius:6,border:'1px solid var(--border)'}}>
+            <input type="checkbox" id="cache_date" checked={cacheEnabled} onChange={(e:any)=>setCacheEnabled(e.target.checked)} style={{accentColor:'var(--accent)',width:13,height:13,cursor:'pointer'}}/>
+            <label htmlFor="cache_date" style={{fontSize:9,color:'var(--muted)',cursor:'pointer'}}>Smart Cache — skip Delivered orders already scanned (faster, won't update values)</label>
           </div>
           <button onClick={()=>onStart(from,to,parseInt(conc))} style={{width:'100%',background:'var(--accent)',color:'#000',border:'none',padding:11,borderRadius:8,fontSize:12,fontWeight:700,letterSpacing:'.06em',textTransform:'uppercase',marginBottom:12,fontFamily:'inherit',cursor:'pointer'}}>🔍 FIND &amp; SCRAPE</button>
         </>
@@ -1065,7 +1079,7 @@ function DateTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setForc
   )
 }
 
-function ManualTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setForceRefresh,refreshValues,setRefreshValues}:any){
+function ManualTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setForceRefresh,cacheEnabled,setCacheEnabled}:any){
   const[startId,setStartId]=useState('');const[endId,setEndId]=useState('');const[useAuto,setUseAuto]=useState(false);const[stopAfter,setStopAfter]=useState('500');const[conc,setConc]=useState('5')
   const pfx=active.idPrefix||''
   const recommendedStop=recommendedAutoStop(parseInt(conc)||5,active?.avgPerDay||0)
@@ -1101,12 +1115,8 @@ function ManualTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setFo
           }} style={{width:'100%',background:'var(--accent)',color:'#000',border:'none',padding:11,borderRadius:8,fontSize:12,fontWeight:700,letterSpacing:'.06em',textTransform:'uppercase',marginBottom:12,fontFamily:'inherit',cursor:'pointer'}}>▶ START MANUAL SCRAPE</button>
           <div style={{display:'flex',flexDirection:'column' as const,gap:5,marginTop:-6,marginBottom:8,padding:'8px 10px',background:'var(--surface)',borderRadius:6,border:'1px solid var(--border)'}}>
             <div style={{display:'flex',alignItems:'center',gap:6}}>
-              <input type="checkbox" id="rv_manual" checked={refreshValues} onChange={(e:any)=>setRefreshValues(e.target.checked)} style={{accentColor:'var(--accent)',width:13,height:13,cursor:'pointer'}}/>
-              <label htmlFor="rv_manual" style={{fontSize:9,color:'var(--text)',cursor:'pointer',fontWeight:600}}>↻ Refresh missing values — re-fetch Delivered orders with no value (recommended)</label>
-            </div>
-            <div style={{display:'flex',alignItems:'center',gap:6}}>
-              <input type="checkbox" id="fr_manual" checked={forceRefresh} onChange={(e:any)=>setForceRefresh(e.target.checked)} style={{accentColor:'var(--warn)',width:13,height:13,cursor:'pointer'}}/>
-              <label htmlFor="fr_manual" style={{fontSize:9,color:'var(--muted)',cursor:'pointer'}}>Force Refresh — re-scan everything including Delivered (very slow)</label>
+              <input type="checkbox" id="cache_manual" checked={cacheEnabled} onChange={(e:any)=>setCacheEnabled(e.target.checked)} style={{accentColor:'var(--accent)',width:13,height:13,cursor:'pointer'}}/>
+              <label htmlFor="cache_manual" style={{fontSize:9,color:'var(--muted)',cursor:'pointer'}}>Smart Cache — skip Delivered orders already scanned (faster, but won't update values)</label>
             </div>
           </div>
         </>
