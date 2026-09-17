@@ -107,11 +107,20 @@ async function fetchOneOrder(subdomain: string, orderId: string|number): Promise
   const id  = String(orderId)
   const url = `https://${subdomain}.shiprocket.co/tracking/order/${id}`
   const headers = {
-    'Accept': 'text/html,application/xhtml+xml',
+    // Mimic a real browser navigation — Shiprocket returns 500 for fetch-style requests
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
     'User-Agent': UA,
-    'Accept-Language': 'en-IN,en;q=0.9',
+    'Accept-Language': 'en-IN,en-GB;q=0.9,en;q=0.8',
+    'Accept-Encoding': 'gzip, deflate, br',
     'Cache-Control': 'no-cache',
-    'Referer': `https://${subdomain}.shiprocket.co/`,
+    'Pragma': 'no-cache',
+    'Upgrade-Insecure-Requests': '1',
+    // Sec-Fetch headers distinguish navigation from fetch — Shiprocket blocks fetch mode
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1',
+    'Connection': 'keep-alive',
   }
 
   // ── Attempt 1 ──────────────────────────────────────────
