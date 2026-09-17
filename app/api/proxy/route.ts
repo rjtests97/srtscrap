@@ -81,6 +81,21 @@ const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (
 const MIN_REAL_PAGE = 40000
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
+// Convert order ID → tracking URL via Shiprocket's tracking-form-check API
+async function getTrackingUrl(orderId: string|number, companyId: number): Promise<string|null> {
+  if (!companyId) return null
+  try {
+    const res = await fetch(
+      `https://apiv2.shiprocket.co/tracking-form-check?track_id=${orderId}&track_type=order_id&company_id=${companyId}`,
+      { signal: AbortSignal.timeout(8000) }
+    )
+    if (!res.ok) return null
+    const data = await res.json()
+    // Response: {"url": "https://minnies.shiprocket.co/tracking/77131061932"}
+    return data?.url || null
+  } catch { return null }
+}
+
 async function tryFetch(url: string, headers: any): Promise<{status:number, html:string}|null> {
   try {
     const res = await fetch(url, { headers, signal: AbortSignal.timeout(12000) })
@@ -103,7 +118,7 @@ function parseHtml(html: string, orderId: string|number) {
   return null
 }
 
-async function fetchOneOrder(subdomain: string, orderId: string|number): Promise<any> {
+async function fetchOneOrder(subdomain: string, orderId: string|number, companyId=0): Promise<any> {
   const id  = String(orderId)
   const url = `https://${subdomain}.shiprocket.co/tracking/order/${id}`
   const headers = {
@@ -138,23 +153,18 @@ async function fetchOneOrder(subdomain: string, orderId: string|number): Promise
   }
 
   if (r1.status === 500) {
-    // 500 can be transient throttling OR genuine archived order
-    // Retry once after a pause — transient 500s resolve, genuine ones don't
-    await sleep(1500)
-
-    const r2 = await tryFetch(url, headers)
-    if (!r2) return 'rl'
-
-    if (r2.status === 200) {
-      const parsed2 = parseHtml(r2.html, orderId)
-      if (parsed2 !== undefined) return parsed2
-      return 'rl'
+    // Try tracking-form-check: order ID → tracking URL → fetch full data
+    if (companyId) {
+      const trackingUrl = await getTrackingUrl(orderId, companyId)
+      if (trackingUrl) {
+        const awbRes = await tryFetch(trackingUrl, headers)
+        if (awbRes?.status === 200) {
+          const parsed = parseHtml(awbRes.html, orderId)
+          if (parsed) return parsed
+        }
+      }
     }
-
-    if (r2.status === 429 || r2.status === 503) return 'rl'
-
-    // Both attempts returned 500 (or other error) → persistent failure
-    // Order exists (it's on the brand subdomain) but data is unavailable
+    // Lookup failed — order exists but data inaccessible
     return {
       orderId, slug: '', orderDate: 'N/A', orderTime: 'N/A', dateYMD: null,
       value: 'N/A', valueNum: 0, payment: 'N/A', status: 'Archived',
@@ -166,12 +176,12 @@ async function fetchOneOrder(subdomain: string, orderId: string|number): Promise
 }
 
 export async function POST(req: NextRequest) {
-  const { subdomain, ids } = await req.json() as { subdomain: string; ids: Array<string|number> }
-  // Stagger parallel requests slightly to reduce server-side throttling
+  const { subdomain, ids, companyId } = await req.json() as { subdomain: string; ids: Array<string|number>; companyId?: number }
+  const cid = companyId || 0
   const results = await Promise.all(
     ids.map((id, i) =>
-      sleep(i * 150)  // 150ms stagger: 0ms, 150ms, 300ms... for a batch of 8
-        .then(() => fetchOneOrder(subdomain, id))
+      sleep(i * 150)
+        .then(() => fetchOneOrder(subdomain, id, cid))
         .catch(() => 'rl' as const)
     )
   )

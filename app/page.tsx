@@ -1,7 +1,7 @@
 'use client'
 import { useState, useEffect, useRef, useCallback } from 'react'
 
-interface Brand { id:string; name:string; subdomain:string; slug:string; companyName:string; anchorId:number; anchorDate:string; avgPerDay:number; regressionPoints:Array<{date:string,id:number}>; idPrefix:string }
+interface Brand { id:string; name:string; subdomain:string; slug:string; companyName:string; anchorId:number; anchorDate:string; avgPerDay:number; regressionPoints:Array<{date:string,id:number}>; idPrefix:string; companyId?:number }
 interface Order { orderId:number|string; slug:string; orderDate:string; orderTime:string; dateYMD:string|null; value:string; valueNum:number; payment:string; status:string; pincode:string; location:string; source?:'cache'|'fresh' }
 interface Run { runId:string; dateRange:string; found:number; orders:Order[]; createdAt:string }
 interface Analytics {
@@ -266,6 +266,7 @@ class Scanner {
   private cache:OrderCache|null=null
   private forceRefresh=false
   private refreshValues=false
+  private companyId:number=0
 
   constructor(subdomain:string,slug:string,idPrefix:string,
     onLog:(m:string,c:string)=>void,
@@ -274,10 +275,11 @@ class Scanner {
     onStats?:(s:Partial<ScanStats>)=>void,
     cache?:OrderCache,
     forceRefresh?:boolean,
-    refreshValues?:boolean){
+    refreshValues?:boolean,
+    companyId?:number){
     this.subdomain=subdomain;this.slug=slug;this.idPrefix=idPrefix
     this.onLog=onLog;this.onProgress=onProgress;this.onOrder=onOrder;this.onStats=onStats
-    this.cache=cache||null;this.forceRefresh=forceRefresh||false;this.refreshValues=refreshValues||false
+    this.cache=cache||null;this.forceRefresh=forceRefresh||false;this.refreshValues=refreshValues||false;this.companyId=companyId||0
   }
 
   stop(){this.stopped=true}
@@ -293,7 +295,7 @@ class Scanner {
     try{
       const res=await fetch('/api/proxy',{
         method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({subdomain:this.subdomain,ids:ids.map(n=>this.toId(n))})
+        body:JSON.stringify({subdomain:this.subdomain,ids:ids.map(n=>this.toId(n)),companyId:this.companyId})
       })
       if(!res.ok)return ids.map(()=>'rl' as const)
       const{results}=await res.json()
@@ -817,7 +819,7 @@ export default function App(){
     const cache=cacheEnabled?new OrderCache(brand.id, brand.slug||brand.subdomain):null
     if(cache){const cs=cache.stats();if(cs.total>0)addLog(`Cache: ${cs.delivered} delivered (skip) + ${cs.active} active — ${cache.sizeKB()}KB`,'ok')}
     else addLog('Smart cache OFF — scanning all IDs fresh','info')
-    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)),cache||undefined,forceRefresh,false)
+    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)),cache||undefined,forceRefresh,false,brand.companyId||0)
     scannerRef.current=scanner
     try{
       addLog(`Finding boundaries for ${fromDate} → ${toDate}...`,'info')
@@ -850,7 +852,7 @@ export default function App(){
     const cacheM=cacheEnabled?new OrderCache(brand.id, brand.slug||brand.subdomain):null
     if(cacheM){const csM=cacheM.stats();if(csM.total>0)addLog(`Cache: ${csM.delivered} delivered (skip) + ${csM.active} active — ${cacheM.sizeKB()}KB`,'ok')}
     else addLog('Smart cache OFF — scanning all IDs fresh','info')
-    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)),cacheM||undefined,forceRefresh,false)
+    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)),cacheM||undefined,forceRefresh,false,brand.companyId||0)
     scannerRef.current=scanner
     try{
       const maxId=useAuto?autoHardCap:endId
@@ -965,6 +967,7 @@ export default function App(){
 function AddBrandForm({onAdd,onCancel,inp,lbl}:any){
   const[url,setUrl]=useState('');const[name,setName]=useState('');const[sub,setSub]=useState('')
   const[oid,setOid]=useState('');const[date,setDate]=useState('');const[status,setStatus]=useState<{msg:string,ok:boolean}|null>(null);const[loading,setLoading]=useState(false)
+  const[companyIdInput,setCompanyIdInput]=useState('')
   function handleUrl(v:string){setUrl(v);const m=v.match(/https?:\/\/([^.]+)\.shiprocket\.co/);if(m){setSub(m[1]);if(!name)setName(m[1].charAt(0).toUpperCase()+m[1].slice(1))}}
   const normalizeDateInput=(v:string)=>{
     if(/^\d{4}-\d{2}-\d{2}$/.test(v))return v
@@ -998,7 +1001,7 @@ function AddBrandForm({onAdd,onCancel,inp,lbl}:any){
       const{results:pr}=await probeRes.json()
       const found=pr.filter((r:any)=>r&&r!=='rl'&&r.slug===o.slug)
       const avgPerDay=found.length>0?Math.min(2000,Math.max(5,Math.round((found.length/30)*2000))):30
-      onAdd({id:Date.now().toString(),name,subdomain:sub,slug:o.slug,companyName:o.companyName||name,anchorId:numericBase,anchorDate:normalizedDate,avgPerDay,regressionPoints:[],idPrefix:detectedPrefix})
+      onAdd({id:Date.now().toString(),name,subdomain:sub,slug:o.slug,companyName:o.companyName||name,anchorId:numericBase,anchorDate:normalizedDate,avgPerDay,regressionPoints:[],idPrefix:detectedPrefix,companyId:parseInt(companyIdInput)||0})
     }catch(e:any){setStatus({msg:e.message,ok:false})}
     setLoading(false)
   }
@@ -1018,6 +1021,10 @@ function AddBrandForm({onAdd,onCancel,inp,lbl}:any){
         <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
           <div><label style={lbl}>One Known Order ID</label><input type="text" value={oid} onChange={e=>setOid(e.target.value)} placeholder="e.g. 437470 or KYT47000" style={inp}/></div>
           <div><label style={lbl}>That Order's Date</label><input type="date" value={date} onChange={e=>setDate(normalizeDateInput(e.target.value))} style={inp}/></div>
+        </div>
+        <div><label style={lbl}>Shiprocket Company ID <span style={{color:'var(--muted)',fontWeight:400}}>(optional — enables archived order lookup)</span></label>
+          <input value={companyIdInput} onChange={(e:any)=>setCompanyIdInput(e.target.value)} placeholder="e.g. 4191871" style={inp}/>
+          <div style={{fontSize:8,color:'var(--muted)',marginTop:3}}>Go to your brand page → search any order → copy the company_id from the URL: apiv2.shiprocket.co/tracking-form-check?...&amp;company_id=<b>XXXXXX</b></div>
         </div>
         {status&&<div style={{padding:'8px 10px',borderRadius:6,fontSize:11,background:status.ok?'#00ff8815':'#ff444415',border:`1px solid ${status.ok?'var(--accent)':'var(--red)'}`,color:status.ok?'var(--accent)':'var(--red)'}}>{status.msg}</div>}
         <div style={{display:'flex',gap:8}}>
