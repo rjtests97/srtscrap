@@ -59,6 +59,39 @@ const ORDER_STATUSES = ['DELIVERED','RTO DELIVERED','CANCELLED','IN TRANSIT','OU
   'PENDING','UNDELIVERED','PICKUP GENERATED','SHIPPED','AT DESTINATION','REACHED','RTO OFD',
   'RTO IN TRANSIT','RTO INITIATED','ATTEMPT FAILURE','OUT FOR PICKUP','MISROUTED','UNTRACEABLE']
 
+// Parses the "Order Tracking - Archived" template — a distinct, smaller HTML page
+// returned for orders whose full apidata is no longer served. Structure:
+//   <div class="status-value delivered">DELIVERED</div>
+//   <div class="delivered-date">12 Aug 2026</div>
+//   <span class="detail-label">Order ID</span><span class="detail-value">**933</span>
+//   <div class="courier-name">Blue Dart Air</div>
+//   <div class="tracking-id-value">906188*****</div>
+function parseArchivedTemplate(html: string, originalId: string|number) {
+  if (!html.includes('Order Tracking - Archived') && !html.includes('archived tracking')) return null
+
+  const statusMatch = html.match(/status-value[^"]*"[^>]*>\s*([A-Za-z][A-Za-z\s]*)/i)
+  const dateMatch   = html.match(/delivered-date[^>]*>\s*([^<]+)/i)
+  const courierMatch = html.match(/courier-name[^>]*>\s*([^<]+)/i)
+  const trackingIdMatch = html.match(/tracking-id-value[^>]*>\s*([^<]+)/i)
+
+  const status = statusMatch?.[1]?.trim()
+  if (!status) return null  // couldn't find a status — not this template or empty
+
+  // Date on this template is the status/delivery date, not masked (unlike Order Placed On)
+  const dateText = dateMatch?.[1]?.trim() || ''
+  const dm = dateText.match(/(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})/i)
+  const orderDate = dm ? `${dm[1]} ${dm[2]} ${dm[3]}` : 'N/A'
+  const dateYMD   = dm ? toYMD(orderDate) : null
+
+  return {
+    orderId: originalId, slug: '', orderDate, orderTime: 'N/A', dateYMD,
+    value: 'N/A', valueNum: 0, payment: 'N/A',
+    status: status.charAt(0).toUpperCase() + status.slice(1).toLowerCase(),
+    pincode: 'N/A',
+    location: courierMatch?.[1]?.trim() ? `via ${courierMatch[1].trim()}` : 'N/A',
+  }
+}
+
 function parseArchivedPage(html: string, originalId: string|number) {
   const upper = html.toUpperCase()
   let status = 'N/A'
@@ -90,6 +123,10 @@ async function tryFetch(url: string, headers: any): Promise<{status:number, html
 }
 
 function parseHtml(html: string, orderId: string|number) {
+  // Check the archived template FIRST — it's smaller than MIN_REAL_PAGE but valid
+  const archivedResult = parseArchivedTemplate(html, orderId)
+  if (archivedResult) return archivedResult
+
   if (html.length < MIN_REAL_PAGE) return null  // too small = challenge page
   const apidata = extractApidata(html)
   if (apidata) {
