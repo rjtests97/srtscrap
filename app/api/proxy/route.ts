@@ -82,22 +82,27 @@ const MIN_REAL_PAGE = 40000
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
 // Convert order ID → tracking URL via Shiprocket's tracking-form-check API
-// Retries because this endpoint gets rate-limited when many orders in a burst
-// trigger it simultaneously (each 500 order needs this extra lookup call)
-async function getTrackingUrl(orderId: string|number, companyId: number): Promise<string|null> {
+// Must include Referer/Origin matching the brand subdomain — without these,
+// Shiprocket's API behaves inconsistently for server-side (non-browser) requests
+async function getTrackingUrl(orderId: string|number, companyId: number, subdomain: string, cookies?: string): Promise<string|null> {
   if (!companyId) return null
   const lookupUrl = `https://apiv2.shiprocket.co/tracking-form-check?track_id=${orderId}&track_type=order_id&company_id=${companyId}`
+  const lookupHeaders: Record<string,string> = {
+    'Accept': 'application/json, text/plain, */*',
+    'User-Agent': UA,
+    'Referer': `https://${subdomain}.shiprocket.co/`,
+    'Origin': `https://${subdomain}.shiprocket.co`,
+  }
+  if (cookies) lookupHeaders['Cookie'] = cookies
 
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const res = await fetch(lookupUrl, { signal: AbortSignal.timeout(8000) })
+      const res = await fetch(lookupUrl, { headers: lookupHeaders, signal: AbortSignal.timeout(8000) })
       if (res.ok) {
         const data = await res.json()
         if (data?.url) return data.url
-        // Got 200 but no url field — order genuinely has no tracking URL, stop retrying
         return null
       }
-      // Non-200 (rate limited or transient) — wait and retry
       if (attempt < 2) await sleep(800 * (attempt + 1))
     } catch {
       if (attempt < 2) await sleep(800 * (attempt + 1))
@@ -106,11 +111,13 @@ async function getTrackingUrl(orderId: string|number, companyId: number): Promis
   return null
 }
 
-async function tryFetch(url: string, headers: any): Promise<{status:number, html:string}|null> {
+async function tryFetch(url: string, headers: any): Promise<{status:number, html:string, cookies?:string}|null> {
   try {
     const res = await fetch(url, { headers, signal: AbortSignal.timeout(12000) })
     const html = await res.text()
-    return { status: res.status, html }
+    // Capture Set-Cookie so we can forward to apiv2.shiprocket.co (same-org, session-aware API)
+    const setCookie = res.headers.get('set-cookie') || undefined
+    return { status: res.status, html, cookies: setCookie }
   } catch { return null }
 }
 
@@ -164,22 +171,23 @@ async function fetchOneOrder(subdomain: string, orderId: string|number, companyI
 
   if (r1.status === 500) {
     // Try tracking-form-check: order ID → tracking URL → fetch full data
+    // Forward any cookies Shiprocket set on the initial request — the API
+    // behaves inconsistently without a session context
     if (companyId) {
-      const trackingUrl = await getTrackingUrl(orderId, companyId)
+      const trackingUrl = await getTrackingUrl(orderId, companyId, subdomain, r1.cookies)
       if (trackingUrl) {
-        // Retry the AWB tracking page fetch too — can also be rate-limited under burst load
         for (let attempt = 0; attempt < 2; attempt++) {
           const awbRes = await tryFetch(trackingUrl, headers)
           if (awbRes?.status === 200) {
             const parsed = parseHtml(awbRes.html, orderId)
             if (parsed) return parsed
-            break  // got 200 but couldn't parse — no point retrying
+            break
           }
           if (awbRes?.status === 429 || awbRes?.status === 503) {
             await sleep(1000)
             continue
           }
-          break  // other failure — don't retry
+          break
         }
       }
     }
