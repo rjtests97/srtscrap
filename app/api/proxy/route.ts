@@ -81,43 +81,11 @@ const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (
 const MIN_REAL_PAGE = 40000
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
-// Convert order ID → tracking URL via Shiprocket's tracking-form-check API
-// Must include Referer/Origin matching the brand subdomain — without these,
-// Shiprocket's API behaves inconsistently for server-side (non-browser) requests
-async function getTrackingUrl(orderId: string|number, companyId: number, subdomain: string, cookies?: string): Promise<string|null> {
-  if (!companyId) return null
-  const lookupUrl = `https://apiv2.shiprocket.co/tracking-form-check?track_id=${orderId}&track_type=order_id&company_id=${companyId}`
-  const lookupHeaders: Record<string,string> = {
-    'Accept': 'application/json, text/plain, */*',
-    'User-Agent': UA,
-    'Referer': `https://${subdomain}.shiprocket.co/`,
-    'Origin': `https://${subdomain}.shiprocket.co`,
-  }
-  if (cookies) lookupHeaders['Cookie'] = cookies
-
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const res = await fetch(lookupUrl, { headers: lookupHeaders, signal: AbortSignal.timeout(8000) })
-      if (res.ok) {
-        const data = await res.json()
-        if (data?.url) return data.url
-        return null
-      }
-      if (attempt < 2) await sleep(800 * (attempt + 1))
-    } catch {
-      if (attempt < 2) await sleep(800 * (attempt + 1))
-    }
-  }
-  return null
-}
-
-async function tryFetch(url: string, headers: any): Promise<{status:number, html:string, cookies?:string}|null> {
+async function tryFetch(url: string, headers: any): Promise<{status:number, html:string}|null> {
   try {
     const res = await fetch(url, { headers, signal: AbortSignal.timeout(12000) })
     const html = await res.text()
-    // Capture Set-Cookie so we can forward to apiv2.shiprocket.co (same-org, session-aware API)
-    const setCookie = res.headers.get('set-cookie') || undefined
-    return { status: res.status, html, cookies: setCookie }
+    return { status: res.status, html }
   } catch { return null }
 }
 
@@ -129,90 +97,107 @@ function parseHtml(html: string, orderId: string|number) {
     if (result) return result
     return null  // apidata found but empty = order doesn't exist
   }
-  // No apidata — try archived page format
   const upper = html.toUpperCase()
   if (ORDER_STATUSES.some(s => upper.includes(s))) return parseArchivedPage(html, orderId)
   return null
 }
 
-async function fetchOneOrder(subdomain: string, orderId: string|number, companyId=0): Promise<any> {
+const browserHeaders = {
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+  'User-Agent': UA,
+  'Accept-Language': 'en-IN,en-GB;q=0.9,en;q=0.8',
+  'Accept-Encoding': 'gzip, deflate, br',
+  'Cache-Control': 'no-cache',
+  'Pragma': 'no-cache',
+  'Upgrade-Insecure-Requests': '1',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'none',
+  'Sec-Fetch-User': '?1',
+  'Connection': 'keep-alive',
+}
+
+// Phase 1: fetch the direct tracking page. Returns a parsed Order, null (not found),
+// 'rl' (rate limited), or the string '__NEEDS_AWB__' (HTTP 500 — needs fallback lookup)
+async function fetchDirect(subdomain: string, orderId: string|number): Promise<any> {
   const id  = String(orderId)
   const url = `https://${subdomain}.shiprocket.co/tracking/order/${id}`
-  const headers = {
-    // Mimic a real browser navigation — Shiprocket returns 500 for fetch-style requests
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    'User-Agent': UA,
-    'Accept-Language': 'en-IN,en-GB;q=0.9,en;q=0.8',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Cache-Control': 'no-cache',
-    'Pragma': 'no-cache',
-    'Upgrade-Insecure-Requests': '1',
-    // Sec-Fetch headers distinguish navigation from fetch — Shiprocket blocks fetch mode
-    'Sec-Fetch-Dest': 'document',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Site': 'none',
-    'Sec-Fetch-User': '?1',
-    'Connection': 'keep-alive',
-  }
-
-  // ── Attempt 1 ──────────────────────────────────────────
-  const r1 = await tryFetch(url, headers)
+  const r1 = await tryFetch(url, browserHeaders)
   if (!r1) return 'rl'
-
   if (r1.status === 429 || r1.status === 503 || r1.status === 403) return 'rl'
-  if (r1.status === 404) return null  // genuinely doesn't exist
-
+  if (r1.status === 404) return null
   if (r1.status === 200) {
     const parsed = parseHtml(r1.html, orderId)
-    // parsed = Order → found, null → not found, undefined handled below
-    if (parsed !== undefined) return parsed  // includes null for not-found
-    return 'rl'  // full page but unrecognised format
+    if (parsed !== undefined) return parsed
+    return 'rl'
+  }
+  if (r1.status === 500) return '__NEEDS_AWB__'
+  return 'rl'
+}
+
+// Phase 2: AWB fallback lookup — called STRICTLY SEQUENTIALLY (never concurrent).
+// apiv2.shiprocket.co/tracking-form-check gets unreliable under concurrent load
+// even with staggering, so each order in this phase waits for the previous one.
+async function resolveViaAwb(subdomain: string, orderId: string|number, companyId: number): Promise<any> {
+  if (!companyId) {
+    return { orderId, slug:'', orderDate:'N/A', orderTime:'N/A', dateYMD:null,
+      value:'N/A', valueNum:0, payment:'N/A', status:'Archived', pincode:'N/A', location:'N/A' }
+  }
+  const lookupUrl = `https://apiv2.shiprocket.co/tracking-form-check?track_id=${orderId}&track_type=order_id&company_id=${companyId}`
+  const lookupHeaders = {
+    'Accept': 'application/json, text/plain, */*',
+    'User-Agent': UA,
+    'Referer': `https://${subdomain}.shiprocket.co/`,
+    'Origin': `https://${subdomain}.shiprocket.co`,
   }
 
-  if (r1.status === 500) {
-    // Try tracking-form-check: order ID → tracking URL → fetch full data
-    // Forward any cookies Shiprocket set on the initial request — the API
-    // behaves inconsistently without a session context
-    if (companyId) {
-      const trackingUrl = await getTrackingUrl(orderId, companyId, subdomain, r1.cookies)
-      if (trackingUrl) {
-        for (let attempt = 0; attempt < 2; attempt++) {
-          const awbRes = await tryFetch(trackingUrl, headers)
-          if (awbRes?.status === 200) {
-            const parsed = parseHtml(awbRes.html, orderId)
-            if (parsed) return parsed
-            break
-          }
-          if (awbRes?.status === 429 || awbRes?.status === 503) {
-            await sleep(1000)
-            continue
-          }
-          break
-        }
+  let trackingUrl: string | null = null
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch(lookupUrl, { headers: lookupHeaders, signal: AbortSignal.timeout(8000) })
+      if (res.ok) {
+        const data = await res.json()
+        trackingUrl = data?.url || null
+        break
       }
-    }
-    // Lookup failed after retries — order exists but data inaccessible
-    return {
-      orderId, slug: '', orderDate: 'N/A', orderTime: 'N/A', dateYMD: null,
-      value: 'N/A', valueNum: 0, payment: 'N/A', status: 'Archived',
-      pincode: 'N/A', location: 'N/A',
+    } catch {}
+    if (attempt === 0) await sleep(600)
+  }
+
+  if (trackingUrl) {
+    const awbRes = await tryFetch(trackingUrl, browserHeaders)
+    if (awbRes?.status === 200) {
+      const parsed = parseHtml(awbRes.html, orderId)
+      if (parsed) return parsed
     }
   }
 
-  return 'rl'  // any other status
+  return { orderId, slug:'', orderDate:'N/A', orderTime:'N/A', dateYMD:null,
+    value:'N/A', valueNum:0, payment:'N/A', status:'Archived', pincode:'N/A', location:'N/A' }
 }
 
 export async function POST(req: NextRequest) {
   const { subdomain, ids, companyId } = await req.json() as { subdomain: string; ids: Array<string|number>; companyId?: number }
   const cid = companyId || 0
-  // Stagger with slight jitter — reduces simultaneous hits on apiv2.shiprocket.co
-  // when many orders in this batch need the AWB fallback lookup
-  const results = await Promise.all(
+
+  // Phase 1: fetch all direct tracking pages in parallel with light stagger
+  // (this endpoint is NOT rate-sensitive — evidence shows it handles concurrent load fine)
+  const phase1 = await Promise.all(
     ids.map((id, i) =>
-      sleep(i * 180 + Math.floor(Math.random() * 60))
-        .then(() => fetchOneOrder(subdomain, id, cid))
+      sleep(i * 80)
+        .then(() => fetchDirect(subdomain, id))
         .catch(() => 'rl' as const)
     )
   )
+
+  // Phase 2: any order needing AWB fallback is resolved ONE AT A TIME, in sequence.
+  // This is the slow but reliable path — apiv2.shiprocket.co breaks under concurrency.
+  const results: any[] = [...phase1]
+  for (let i = 0; i < results.length; i++) {
+    if (results[i] === '__NEEDS_AWB__') {
+      results[i] = await resolveViaAwb(subdomain, ids[i], cid)
+    }
+  }
+
   return NextResponse.json({ results })
 }
