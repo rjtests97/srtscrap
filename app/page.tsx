@@ -956,7 +956,7 @@ export default function App(){
           {tab==='analytics'&&<AnalyticsTab analytics={analytics}/>}
           {tab==='compare'&&<CompareTab brands={brands}/>}
           {tab==='history'&&<HistoryTab runs={runs} brandName={active.name} brand={active} onStartRescan={startRescanHistory} syncAll={syncAllToSheets} onClear={()=>{localStorage.removeItem(`runs_${active.id}`);setRuns([]);setLastOrders([]);setAnalytics(null)}}/>}
-          {tab==='settings'&&<SettingsTab brands={brands} active={active} runs={runs} onDelete={deleteBrand} onSync={(url:string,orders:Order[])=>syncToSheets(url,orders)} inp={inp} lbl={lbl} forceRefresh={forceRefresh} setForceRefresh={setForceRefresh}/>}
+          {tab==='settings'&&<SettingsTab brands={brands} active={active} runs={runs} onDelete={deleteBrand} onUpdateBrand={(b:Brand)=>{const updated=brands.map((x:Brand)=>x.id===b.id?b:x);LS.set('brands',updated);setBrands(updated);if(active?.id===b.id)setActive(b)}} onSync={(url:string,orders:Order[])=>syncToSheets(url,orders)} inp={inp} lbl={lbl} forceRefresh={forceRefresh} setForceRefresh={setForceRefresh}/>}
         </>
       )}
     </div>
@@ -1378,7 +1378,29 @@ function CachePanel({active,brands,forceRefresh,setForceRefresh}:any){
   )
 }
 
-function SettingsTab({brands,active,runs,onDelete,onSync,inp,lbl,forceRefresh,setForceRefresh}:any){
+function BrandCard({b,active,onDelete,onUpdate}:any){
+  const[cid,setCid]=useState(String(b.companyId||''))
+  const[saved,setSaved]=useState(false)
+  function save(){
+    onUpdate({...b,companyId:parseInt(cid)||0})
+    setSaved(true);setTimeout(()=>setSaved(false),2000)
+  }
+  return(
+    <div style={{background:'var(--surface)',border:`1px solid ${b.id===active?.id?'var(--accent)':'var(--border)'}`,borderRadius:8,padding:12,marginBottom:8}}>
+      <div style={{fontWeight:700,color:'var(--accent)',fontSize:12,marginBottom:2}}>{b.name}</div>
+      <div style={{fontSize:9,color:'var(--muted)',marginBottom:8,lineHeight:1.8}}>{b.subdomain}.shiprocket.co · slug: {b.slug} · ~{b.avgPerDay}/day<br/>anchor: #{b.idPrefix||''}{b.anchorId} ({b.anchorDate}) · {b.regressionPoints?.length||0} cal pts{b.idPrefix?` · prefix: ${b.idPrefix}`:''}</div>
+      <div style={{display:'flex',alignItems:'center',gap:6,marginBottom:8}}>
+        <div style={{fontSize:9,color:'var(--muted)',whiteSpace:'nowrap' as const}}>Company ID:</div>
+        <input value={cid} onChange={(e:any)=>setCid(e.target.value)} placeholder="e.g. 4191871" style={{flex:1,background:'var(--surface2)',border:'1px solid var(--border)',borderRadius:4,padding:'4px 8px',fontSize:9,color:'var(--text)',fontFamily:'inherit'}}/>
+        <button onClick={save} style={{background:saved?'var(--accent)':'var(--surface2)',border:'1px solid var(--border)',color:saved?'#000':'var(--text)',padding:'4px 10px',borderRadius:4,fontSize:9,fontFamily:'inherit',cursor:'pointer',whiteSpace:'nowrap' as const}}>{saved?'✓ Saved':'Save'}</button>
+        <button onClick={()=>onDelete(b.id)} style={{background:'none',border:'1px solid var(--red)',color:'var(--red)',padding:'4px 10px',borderRadius:4,fontSize:9,fontWeight:700,fontFamily:'inherit',cursor:'pointer'}}>Delete</button>
+      </div>
+      {!b.companyId&&<div style={{fontSize:8,color:'var(--warn)',lineHeight:1.5}}>⚠ No Company ID — archived orders will show as "Archived" instead of fetching full data.<br/>Find it: go to your brand page → search any order → Network tab → company_id in tracking-form-check URL</div>}
+    </div>
+  )
+}
+
+function SettingsTab({brands,active,runs,onDelete,onUpdateBrand,onSync,inp,lbl,forceRefresh,setForceRefresh}:any){
   const[url,setUrl]=useState(()=>LS.get(`sheets_${active?.id}`,''));const[status,setStatus]=useState('');const[busy,setBusy]=useState(false)
   useEffect(()=>setUrl(LS.get(`sheets_${active?.id}`,'')),[ active?.id])
   const btn=(e:any={})=>({background:'var(--surface)',border:'1px solid var(--border)',color:'var(--text)',padding:'8px 12px',borderRadius:6,fontSize:10,fontWeight:700,fontFamily:'inherit',cursor:'pointer',...e})
@@ -1519,11 +1541,7 @@ function SettingsTab({brands,active,runs,onDelete,onSync,inp,lbl,forceRefresh,se
       </div>
       <div style={{fontSize:9,color:'var(--muted)',textTransform:'uppercase',letterSpacing:'.08em',marginBottom:8}}>Manage Brands</div>
       {brands.map((b:Brand)=>(
-        <div key={b.id} style={{background:'var(--surface)',border:`1px solid ${b.id===active.id?'var(--accent)':'var(--border)'}`,borderRadius:8,padding:12,marginBottom:8}}>
-          <div style={{fontWeight:700,color:'var(--accent)',fontSize:12,marginBottom:2}}>{b.name}</div>
-          <div style={{fontSize:9,color:'var(--muted)',marginBottom:8,lineHeight:1.8}}>{b.subdomain}.shiprocket.co · slug: {b.slug} · ~{b.avgPerDay}/day<br/>anchor: #{b.idPrefix||''}{b.anchorId} ({b.anchorDate}) · {b.regressionPoints?.length||0} cal pts{b.idPrefix?` · prefix: ${b.idPrefix}`:''}</div>
-          <button onClick={()=>onDelete(b.id)} style={{background:'none',border:'1px solid var(--red)',color:'var(--red)',padding:'5px 12px',borderRadius:4,fontSize:9,fontWeight:700,fontFamily:'inherit',cursor:'pointer'}}>Delete Brand</button>
-        </div>
+        <BrandCard key={b.id} b={b} active={active} onDelete={onDelete} onUpdate={onUpdateBrand}/>
       ))}
       <div style={{marginTop:12,padding:12,background:'var(--surface)',border:'1px solid var(--border)',borderRadius:8,fontSize:9,color:'var(--muted)',lineHeight:2}}>
         <b style={{color:'var(--accent)'}}>How it works</b><br/>Scan logic runs in your browser — no server timeouts.<br/>Server only proxies Shiprocket API calls (CORS bypass).<br/>Data in browser localStorage · Free forever · by RahulJ

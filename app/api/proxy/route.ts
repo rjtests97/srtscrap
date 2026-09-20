@@ -82,18 +82,28 @@ const MIN_REAL_PAGE = 40000
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
 // Convert order ID → tracking URL via Shiprocket's tracking-form-check API
+// Retries because this endpoint gets rate-limited when many orders in a burst
+// trigger it simultaneously (each 500 order needs this extra lookup call)
 async function getTrackingUrl(orderId: string|number, companyId: number): Promise<string|null> {
   if (!companyId) return null
-  try {
-    const res = await fetch(
-      `https://apiv2.shiprocket.co/tracking-form-check?track_id=${orderId}&track_type=order_id&company_id=${companyId}`,
-      { signal: AbortSignal.timeout(8000) }
-    )
-    if (!res.ok) return null
-    const data = await res.json()
-    // Response: {"url": "https://minnies.shiprocket.co/tracking/77131061932"}
-    return data?.url || null
-  } catch { return null }
+  const lookupUrl = `https://apiv2.shiprocket.co/tracking-form-check?track_id=${orderId}&track_type=order_id&company_id=${companyId}`
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await fetch(lookupUrl, { signal: AbortSignal.timeout(8000) })
+      if (res.ok) {
+        const data = await res.json()
+        if (data?.url) return data.url
+        // Got 200 but no url field — order genuinely has no tracking URL, stop retrying
+        return null
+      }
+      // Non-200 (rate limited or transient) — wait and retry
+      if (attempt < 2) await sleep(800 * (attempt + 1))
+    } catch {
+      if (attempt < 2) await sleep(800 * (attempt + 1))
+    }
+  }
+  return null
 }
 
 async function tryFetch(url: string, headers: any): Promise<{status:number, html:string}|null> {
@@ -157,14 +167,23 @@ async function fetchOneOrder(subdomain: string, orderId: string|number, companyI
     if (companyId) {
       const trackingUrl = await getTrackingUrl(orderId, companyId)
       if (trackingUrl) {
-        const awbRes = await tryFetch(trackingUrl, headers)
-        if (awbRes?.status === 200) {
-          const parsed = parseHtml(awbRes.html, orderId)
-          if (parsed) return parsed
+        // Retry the AWB tracking page fetch too — can also be rate-limited under burst load
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const awbRes = await tryFetch(trackingUrl, headers)
+          if (awbRes?.status === 200) {
+            const parsed = parseHtml(awbRes.html, orderId)
+            if (parsed) return parsed
+            break  // got 200 but couldn't parse — no point retrying
+          }
+          if (awbRes?.status === 429 || awbRes?.status === 503) {
+            await sleep(1000)
+            continue
+          }
+          break  // other failure — don't retry
         }
       }
     }
-    // Lookup failed — order exists but data inaccessible
+    // Lookup failed after retries — order exists but data inaccessible
     return {
       orderId, slug: '', orderDate: 'N/A', orderTime: 'N/A', dateYMD: null,
       value: 'N/A', valueNum: 0, payment: 'N/A', status: 'Archived',
@@ -178,9 +197,11 @@ async function fetchOneOrder(subdomain: string, orderId: string|number, companyI
 export async function POST(req: NextRequest) {
   const { subdomain, ids, companyId } = await req.json() as { subdomain: string; ids: Array<string|number>; companyId?: number }
   const cid = companyId || 0
+  // Stagger with slight jitter — reduces simultaneous hits on apiv2.shiprocket.co
+  // when many orders in this batch need the AWB fallback lookup
   const results = await Promise.all(
     ids.map((id, i) =>
-      sleep(i * 150)
+      sleep(i * 180 + Math.floor(Math.random() * 60))
         .then(() => fetchOneOrder(subdomain, id, cid))
         .catch(() => 'rl' as const)
     )
