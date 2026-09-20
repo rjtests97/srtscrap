@@ -24,28 +24,16 @@ export async function POST(req: NextRequest) {
   })
   const html = await awbRes.text()
 
-  // Extract just the body content (skip <style> block)
-  const bodyStart = html.indexOf('<body')
-  const bodyHtml = bodyStart >= 0 ? html.slice(bodyStart) : html
+  // Find the actual body section with data (skip <style>)
+  const bodyIdx = html.indexOf('<body')
+  const body = html.slice(bodyIdx)
 
-  // Try extracting specific data points with regex
-  const statusMatch = bodyHtml.match(/status-value[^"]*"[^>]*>\s*([^<]+)/i)
-  const dateMatch = bodyHtml.match(/delivered-date[^"]*"[^>]*>\s*([^<]+)/i)
-  const detailRows = [...bodyHtml.matchAll(/detail-label[^>]*>([^<]+)<\/[^>]+>\s*<[^>]+detail-value[^>]*>([^<]+)/gi)]
-    .map(m => ({ label: m[1].trim(), value: m[2].trim() }))
-  const courierMatch = bodyHtml.match(/courier-name[^>]*>([^<]+)/i)
-  const trackingIdMatch = bodyHtml.match(/tracking-id-value[^>]*>([^<]+)/i)
+  // Extract just the tracking-card section which has all the real data
+  const cardIdx = body.indexOf('tracking-card')
+  const cardSection = cardIdx >= 0 ? body.slice(cardIdx - 20, cardIdx + 3000) : 'NOT FOUND'
 
   return NextResponse.json({
     status: awbRes.status,
-    bodyLength: bodyHtml.length,
-    extracted: {
-      status: statusMatch?.[1]?.trim(),
-      deliveredDate: dateMatch?.[1]?.trim(),
-      detailRows,
-      courier: courierMatch?.[1]?.trim(),
-      trackingId: trackingIdMatch?.[1]?.trim(),
-    },
-    bodyPreview: bodyHtml.slice(0, 4000),
+    cardSection,
   })
 }
