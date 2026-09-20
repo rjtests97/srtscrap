@@ -268,6 +268,13 @@ class Scanner {
   private refreshValues=false
   private companyId:number=0
 
+  // Date interpolation for archived orders (no confirmed order-placement date).
+  // Order IDs are sequential by placement time, so an archived order between
+  // two confirmed-dated orders almost certainly shares their date. We carry
+  // forward the last confirmed date as IDs are processed in ascending order.
+  private lastKnownDate:string|null=null
+  private lastKnownId:number=0
+
   constructor(subdomain:string,slug:string,idPrefix:string,
     onLog:(m:string,c:string)=>void,
     onProgress:(done:number,total:number,found:number)=>void,
@@ -276,10 +283,29 @@ class Scanner {
     cache?:OrderCache,
     forceRefresh?:boolean,
     refreshValues?:boolean,
-    companyId?:number){
+    companyId?:number,
+    seedDate?:string){
     this.subdomain=subdomain;this.slug=slug;this.idPrefix=idPrefix
     this.onLog=onLog;this.onProgress=onProgress;this.onOrder=onOrder;this.onStats=onStats
     this.cache=cache||null;this.forceRefresh=forceRefresh||false;this.refreshValues=refreshValues||false;this.companyId=companyId||0
+    this.lastKnownDate=seedDate||null
+  }
+
+  // Called on every fetched order (in ID-ascending order) before it's used further.
+  // Fills in dateYMD for archived orders (status present, date missing) by carrying
+  // forward the nearest preceding confirmed date. Updates the running "last known"
+  // pointer whenever a confirmed date is seen.
+  private interpolateDate(o:Order):Order{
+    if(o.dateYMD){
+      this.lastKnownDate=o.dateYMD
+      this.lastKnownId=Scanner.numericPart(o.orderId)
+      return o
+    }
+    if(o.status&&o.status!=='N/A'&&this.lastKnownDate){
+      // Archived order with no confirmed date — interpolate from nearest known date
+      return {...o,dateYMD:this.lastKnownDate,orderDate:'~'+this.lastKnownDate,source:o.source}
+    }
+    return o  // no date context yet (start of scan before any confirmed date seen)
   }
 
   stop(){this.stopped=true}
@@ -430,15 +456,15 @@ class Scanner {
           const o=results[i];scanned++
           if(o==='rl'){rlInBurst++;continue}
           if(o!==null){
-            const tagged={...o,source:'fresh' as const}
+            const tagged=this.interpolateDate({...o,source:'fresh' as const})
             this.cache?.set(ids[i],tagged)
-            // Include if in date range OR if dateYMD is null (archived/500 — within scanned ID range so date is implied)
+            // Include if in date range OR if dateYMD is still null (no date context yet — very start of scan)
             const inRange=!tagged.dateYMD||(tagged.dateYMD>=fromDate&&tagged.dateYMD<=toDate)
             if(inRange){
               orders.push(tagged);matched++;this.onOrder(tagged)
-              const lbl=tagged.dateYMD
+              const lbl=o.dateYMD
                 ?`#${ids[i]}  ${tagged.orderDate}  ${tagged.value}  ${tagged.payment}  ${tagged.location}  ${tagged.pincode}`
-                :`#${ids[i]}  Archived`
+                :tagged.dateYMD?`#${ids[i]}  Archived (~${tagged.dateYMD})`:`#${ids[i]}  Archived`
               this.onLog(lbl,'ok')
             }
           }
@@ -516,13 +542,15 @@ class Scanner {
           const o=results[i];scanned++
           if(o==='rl'){rlInBurst++;continue}
           if(o!==null){
-            const fo={...o,source:'fresh' as const}
+            const fo=this.interpolateDate({...o,source:'fresh' as const})
             this.cache?.set(ids[i],fo)
             orders.push(fo);matched++;consNulls=0;cleanBursts=0
             lastGoodId=ids[i]
             this.onStats?.({lastMatchedId:Scanner.numericPart(fo.orderId)})
             this.onOrder(fo)
-            const manualLabel=fo.dateYMD?`#${ids[i]}  ${fo.orderDate}  ${fo.value}  ${fo.payment}  ${fo.location}`:`#${ids[i]}  Archived`
+            const manualLabel=o.dateYMD
+              ?`#${ids[i]}  ${fo.orderDate}  ${fo.value}  ${fo.payment}  ${fo.location}`
+              :fo.dateYMD?`#${ids[i]}  Archived (~${fo.dateYMD})`:`#${ids[i]}  Archived`
             this.onLog(manualLabel,'ok')
           }else{
             consNulls++
@@ -819,7 +847,7 @@ export default function App(){
     const cache=cacheEnabled?new OrderCache(brand.id, brand.slug||brand.subdomain):null
     if(cache){const cs=cache.stats();if(cs.total>0)addLog(`Cache: ${cs.delivered} delivered (skip) + ${cs.active} active — ${cache.sizeKB()}KB`,'ok')}
     else addLog('Smart cache OFF — scanning all IDs fresh','info')
-    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)),cache||undefined,forceRefresh,false,brand.companyId||0)
+    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)),cache||undefined,forceRefresh,false,brand.companyId||0,fromDate)
     scannerRef.current=scanner
     try{
       addLog(`Finding boundaries for ${fromDate} → ${toDate}...`,'info')
@@ -852,7 +880,11 @@ export default function App(){
     const cacheM=cacheEnabled?new OrderCache(brand.id, brand.slug||brand.subdomain):null
     if(cacheM){const csM=cacheM.stats();if(csM.total>0)addLog(`Cache: ${csM.delivered} delivered (skip) + ${csM.active} active — ${cacheM.sizeKB()}KB`,'ok')}
     else addLog('Smart cache OFF — scanning all IDs fresh','info')
-    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)),cacheM||undefined,forceRefresh,false,brand.companyId||0)
+    // Estimate a starting date from the nearest regression point / anchor for interpolation seed
+    const seedPts=[{date:brand.anchorDate,id:brand.anchorId},...(brand.regressionPoints||[])].filter(p=>p.date&&p.id>0)
+    const seedRef=seedPts.length?seedPts.reduce((best,p)=>Math.abs(p.id-startId)<Math.abs(best.id-startId)?p:best,seedPts[0]):null
+    const seedDate=seedRef?seedRef.date:undefined
+    const scanner=new Scanner(brand.subdomain,brand.slug,brand.idPrefix||'',addLog,(done,total,found)=>{setProgress({done,total,found});rateWindow.current=[...rateWindow.current,{t:Date.now(),done}]},(o)=>{ordersRef.current=[...ordersRef.current,o]},(s)=>setScanStats(p=>mergeScanStats(p,s)),cacheM||undefined,forceRefresh,false,brand.companyId||0,seedDate)
     scannerRef.current=scanner
     try{
       const maxId=useAuto?autoHardCap:endId

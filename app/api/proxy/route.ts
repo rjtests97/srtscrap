@@ -69,25 +69,20 @@ const ORDER_STATUSES = ['DELIVERED','RTO DELIVERED','CANCELLED','IN TRANSIT','OU
 function parseArchivedTemplate(html: string, originalId: string|number) {
   if (!html.includes('Order Tracking - Archived') && !html.includes('archived tracking')) return null
 
-  // <div class="status-value delivered">DELIVERED</div>
   const statusMatch = html.match(/class="status-value[^"]*">\s*([A-Za-z][A-Za-z\s]*?)\s*<\/div>/i)
-  // <div class="delivered-date">17 Aug 2026</div>
-  const dateMatch = html.match(/class="delivered-date">\s*([^<]+?)\s*<\/div>/i)
-  // <div class="courier-name">Blue Dart Surface</div>
   const courierMatch = html.match(/class="courier-name">\s*([^<]+?)\s*<\/div>/i)
-  // <span class="tracking-id-value">779163*****</span>
-  const trackingIdMatch = html.match(/class="tracking-id-value">\s*([^<]+?)\s*<\/span>/i)
 
   const status = statusMatch?.[1]?.trim()
   if (!status) return null
 
-  const dateText = dateMatch?.[1]?.trim() || ''
-  const dm = dateText.match(/(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})/i)
-  const orderDate = dm ? `${dm[1]} ${dm[2]} ${dm[3]}` : 'N/A'
-  const dateYMD   = dm ? toYMD(orderDate) : null
-
+  // IMPORTANT: this template only exposes the DELIVERY date, not the order placement date.
+  // Using delivery date as the order's date would corrupt daily/weekly/monthly order counts
+  // (e.g. an order placed Aug 1 but delivered Aug 17 would wrongly count toward Aug 17).
+  // "Order Placed On" is masked (** Aug 2026) so exact day is unavailable here.
+  // dateYMD is left null — the caller (Scanner) interpolates it from neighboring
+  // order IDs that DO have a confirmed date, since IDs are sequential by placement time.
   return {
-    orderId: originalId, slug: '', orderDate, orderTime: 'N/A', dateYMD,
+    orderId: originalId, slug: '', orderDate: 'N/A', orderTime: 'N/A', dateYMD: null,
     value: 'N/A', valueNum: 0, payment: 'N/A',
     status: status.charAt(0).toUpperCase() + status.slice(1).toLowerCase(),
     pincode: 'N/A',
