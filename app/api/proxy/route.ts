@@ -69,15 +69,18 @@ const ORDER_STATUSES = ['DELIVERED','RTO DELIVERED','CANCELLED','IN TRANSIT','OU
 function parseArchivedTemplate(html: string, originalId: string|number) {
   if (!html.includes('Order Tracking - Archived') && !html.includes('archived tracking')) return null
 
-  const statusMatch = html.match(/status-value[^"]*"[^>]*>\s*([A-Za-z][A-Za-z\s]*)/i)
-  const dateMatch   = html.match(/delivered-date[^>]*>\s*([^<]+)/i)
-  const courierMatch = html.match(/courier-name[^>]*>\s*([^<]+)/i)
-  const trackingIdMatch = html.match(/tracking-id-value[^>]*>\s*([^<]+)/i)
+  // <div class="status-value delivered">DELIVERED</div>
+  const statusMatch = html.match(/class="status-value[^"]*">\s*([A-Za-z][A-Za-z\s]*?)\s*<\/div>/i)
+  // <div class="delivered-date">17 Aug 2026</div>
+  const dateMatch = html.match(/class="delivered-date">\s*([^<]+?)\s*<\/div>/i)
+  // <div class="courier-name">Blue Dart Surface</div>
+  const courierMatch = html.match(/class="courier-name">\s*([^<]+?)\s*<\/div>/i)
+  // <span class="tracking-id-value">779163*****</span>
+  const trackingIdMatch = html.match(/class="tracking-id-value">\s*([^<]+?)\s*<\/span>/i)
 
   const status = statusMatch?.[1]?.trim()
-  if (!status) return null  // couldn't find a status — not this template or empty
+  if (!status) return null
 
-  // Date on this template is the status/delivery date, not masked (unlike Order Placed On)
   const dateText = dateMatch?.[1]?.trim() || ''
   const dm = dateText.match(/(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})/i)
   const orderDate = dm ? `${dm[1]} ${dm[2]} ${dm[3]}` : 'N/A'
