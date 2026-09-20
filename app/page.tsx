@@ -2,7 +2,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 
 interface Brand { id:string; name:string; subdomain:string; slug:string; companyName:string; anchorId:number; anchorDate:string; avgPerDay:number; regressionPoints:Array<{date:string,id:number}>; idPrefix:string; companyId?:number }
-interface Order { orderId:number|string; slug:string; orderDate:string; orderTime:string; dateYMD:string|null; value:string; valueNum:number; payment:string; status:string; pincode:string; location:string; source?:'cache'|'fresh' }
+interface Order { orderId:number|string; slug:string; orderDate:string; orderTime:string; dateYMD:string|null; value:string; valueNum:number; payment:string; status:string; pincode:string; location:string; source?:'cache'|'fresh'; deliveredDate?:string; deliveredDateYMD?:string|null; dateEstimated?:boolean }
 interface Run { runId:string; dateRange:string; found:number; orders:Order[]; createdAt:string }
 interface Analytics {
   totalOrders:number
@@ -27,6 +27,14 @@ interface ScanStats { retries:number; recovered:number; duplicates:number; gapJu
 
 const LS = { get:<T,>(k:string,d:T):T=>{try{const v=localStorage.getItem(k);return v?JSON.parse(v):d}catch{return d}}, set:(k:string,v:any)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch{}} }
 const sleep = (ms:number) => new Promise(r=>setTimeout(r,ms))
+const MONTH_NAMES=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+// Convert "2026-08-01" -> "01 Aug 2026" to match the display format of real orders
+function ymdToHuman(ymd:string|null):string{
+  if(!ymd)return 'N/A'
+  const[y,m,d]=ymd.split('-')
+  const mi=parseInt(m)-1
+  return `${d} ${MONTH_NAMES[mi]||m} ${y}`
+}
 const todayStr=()=>{const d=new Date();return`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`}
 const yestStr=()=>{const d=new Date();d.setDate(d.getDate()-1);return`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`}
 const daysAgoStr=(days:number)=>{const d=new Date();d.setDate(d.getDate()-days);return`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`}
@@ -76,7 +84,14 @@ function buildAnalytics(orders:Order[]):Analytics|null {
   return{totalOrders:N,totalRevenue:rev,avgOrderVal:rev/N,codCount:cod.length,prepaidCount:N-cod.length,codPct:Math.round((cod.length/N)*100),topCities,topPincodes,repeatLocations,statuses,daily,hours,valueBuckets:valMap,velocity,avgDailyOrders:Math.round((N/Math.max(daily.length,1))*10)/10,avgDailyRevenue:rev/Math.max(daily.length,1),revenueMomentum}
 }
 
-function buildCSV(orders:Order[]){let s='Order ID,Date,Time,Value,Payment,Status,Location,Pincode,Source\n';sortOrders(orders).forEach(r=>s+=`${esc(r.orderId)},${esc(r.orderDate)},${esc(r.orderTime)},${esc(r.value)},${esc(r.payment)},${esc(r.status)},${esc(r.location)},${esc(r.pincode)}\n`);return s}
+function buildCSV(orders:Order[]){
+  let s='Order ID,Date,Time,Value,Payment,Status,Location,Pincode,Delivered Date,Delivery Days,Source\n'
+  sortOrders(orders).forEach(r=>{
+    const days=(r.dateYMD&&r.deliveredDateYMD)?Math.round((new Date(r.deliveredDateYMD+'T00:00:00').getTime()-new Date(r.dateYMD+'T00:00:00').getTime())/86400000):''
+    s+=`${esc(r.orderId)},${esc(r.orderDate)},${esc(r.orderTime)},${esc(r.value)},${esc(r.payment)},${esc(r.status)},${esc(r.location)},${esc(r.pincode)},${esc(r.deliveredDate||'')},${days},${esc(r.source||'fresh')}\n`
+  })
+  return s
+}
 function buildReport(orders:Order[],brandName:string,dateRange:string){
   const a=buildAnalytics(orders);if(!a)return''
   const fd=(ymd:string)=>{const[y,m,d]=ymd.split('-');return new Date(+y,+m-1,+d).toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'numeric'})}
@@ -89,7 +104,23 @@ function buildReport(orders:Order[],brandName:string,dateRange:string){
   s+='\nPEAK HOURS\nHour,Orders\n';a.hours.forEach(h=>s+=`${esc(h.hour)},${h.count}\n`)
   s+='\nVALUE DISTRIBUTION\nBucket,Orders\n';Object.entries(a.valueBuckets).forEach(([k,v])=>s+=`${esc('Rs.'+k)},${v}\n`)
   s+='\nDAILY BREAKDOWN\nDate,Orders,Revenue,COD,Prepaid\n';a.daily.forEach(d=>s+=`${esc(fd(d.date))},${d.orders},${fmt(d.revenue)},${d.cod},${d.prepaid}\n`)
-  s+='\nFULL ORDER LIST\nOrder ID,Date,Time,Value,Payment,Status,Location,Pincode\n';sortOrders(orders).forEach(r=>s+=`${esc(r.orderId)},${esc(r.orderDate)},${esc(r.orderTime)},${esc(r.value)},${esc(r.payment)},${esc(r.status)},${esc(r.location)},${esc(r.pincode)}\n`)
+
+  // Order-to-delivery timing analysis
+  const withDelivery=orders.filter(o=>o.dateYMD&&o.deliveredDateYMD)
+  if(withDelivery.length>0){
+    const days=withDelivery.map(o=>Math.round((new Date(o.deliveredDateYMD!+'T00:00:00').getTime()-new Date(o.dateYMD!+'T00:00:00').getTime())/86400000))
+    const avgDays=(days.reduce((s,d)=>s+d,0)/days.length).toFixed(1)
+    const buckets:Record<string,number>={'0-2 days':0,'3-5 days':0,'6-9 days':0,'10+ days':0}
+    days.forEach(d=>{if(d<=2)buckets['0-2 days']++;else if(d<=5)buckets['3-5 days']++;else if(d<=9)buckets['6-9 days']++;else buckets['10+ days']++})
+    s+=`\nDELIVERY TIME ANALYSIS\nOrders with delivery data,${withDelivery.length}\nAvg days to deliver,${avgDays}\n`
+    s+='Delivery Speed,Orders\n';Object.entries(buckets).forEach(([k,v])=>s+=`${esc(k)},${v}\n`)
+  }
+
+  s+='\nFULL ORDER LIST\nOrder ID,Date,Time,Value,Payment,Status,Location,Pincode,Delivered Date,Delivery Days\n'
+  sortOrders(orders).forEach(r=>{
+    const days=(r.dateYMD&&r.deliveredDateYMD)?Math.round((new Date(r.deliveredDateYMD+'T00:00:00').getTime()-new Date(r.dateYMD+'T00:00:00').getTime())/86400000):''
+    s+=`${esc(r.orderId)},${esc(r.orderDate)},${esc(r.orderTime)},${esc(r.value)},${esc(r.payment)},${esc(r.status)},${esc(r.location)},${esc(r.pincode)},${esc(r.deliveredDate||'')},${days}\n`
+  })
   return s
 }
 // ── Telegram ─────────────────────────────────────────
@@ -302,8 +333,10 @@ class Scanner {
       return o
     }
     if(o.status&&o.status!=='N/A'&&this.lastKnownDate){
-      // Archived order with no confirmed date — interpolate from nearest known date
-      return {...o,dateYMD:this.lastKnownDate,orderDate:'~'+this.lastKnownDate,source:o.source}
+      // Archived order with no confirmed date — interpolate from nearest known date.
+      // Format matches real orders exactly ("DD Mon YYYY") so daily/weekly/monthly
+      // counts work identically whether the order was confirmed or interpolated.
+      return {...o,dateYMD:this.lastKnownDate,orderDate:ymdToHuman(this.lastKnownDate),dateEstimated:true}
     }
     return o  // no date context yet (start of scan before any confirmed date seen)
   }
@@ -413,9 +446,9 @@ class Scanner {
 
   // Adaptive burst controller
   // Starts at BURST_MAX, halves on RL cooldown, recovers slowly
-  private static BURST_MAX=80
-  private static BURST_MIN=10
-  private static REST_BASE=3000  // ms between bursts
+  private static BURST_MAX=100
+  private static BURST_MIN=15
+  private static REST_BASE=1500  // ms between bursts (was 3000 — halved for speed)
 
   async scanRange(scanStart:number,scanEnd:number,fromDate:string,toDate:string,concurrency:number,startedAt:number):Promise<Order[]>{
     const orders:Order[]=[]
@@ -462,9 +495,9 @@ class Scanner {
             const inRange=!tagged.dateYMD||(tagged.dateYMD>=fromDate&&tagged.dateYMD<=toDate)
             if(inRange){
               orders.push(tagged);matched++;this.onOrder(tagged)
-              const lbl=o.dateYMD
-                ?`#${ids[i]}  ${tagged.orderDate}  ${tagged.value}  ${tagged.payment}  ${tagged.location}  ${tagged.pincode}`
-                :tagged.dateYMD?`#${ids[i]}  Archived (~${tagged.dateYMD})`:`#${ids[i]}  Archived`
+              const lbl=tagged.dateEstimated
+                ?`#${ids[i]}  Archived (~${tagged.orderDate})`
+                :tagged.dateYMD?`#${ids[i]}  ${tagged.orderDate}  ${tagged.value}  ${tagged.payment}  ${tagged.location}  ${tagged.pincode}`:`#${ids[i]}  Archived`
               this.onLog(lbl,'ok')
             }
           }
@@ -548,9 +581,9 @@ class Scanner {
             lastGoodId=ids[i]
             this.onStats?.({lastMatchedId:Scanner.numericPart(fo.orderId)})
             this.onOrder(fo)
-            const manualLabel=o.dateYMD
-              ?`#${ids[i]}  ${fo.orderDate}  ${fo.value}  ${fo.payment}  ${fo.location}`
-              :fo.dateYMD?`#${ids[i]}  Archived (~${fo.dateYMD})`:`#${ids[i]}  Archived`
+            const manualLabel=fo.dateEstimated
+              ?`#${ids[i]}  Archived (~${fo.orderDate})`
+              :fo.dateYMD?`#${ids[i]}  ${fo.orderDate}  ${fo.value}  ${fo.payment}  ${fo.location}`:`#${ids[i]}  Archived`
             this.onLog(manualLabel,'ok')
           }else{
             consNulls++
@@ -873,9 +906,11 @@ export default function App(){
     setScanning(true);setLog([]);ordersRef.current=[];rateWindow.current=[]
     setScanStats({retries:0,recovered:0,duplicates:0,gapJumps:0,lastMatchedId:null})
     setProgress({done:0,total:useAuto?0:endId-startId+1,found:0});const sa=Date.now();setStartedAt(sa);setScanLabel(`#${brand.idPrefix||''}${startId}–${useAuto?'auto':'#'+(brand.idPrefix||'')+endId}`)
-    const effectiveStop=useAuto?Math.max(stopAfter,500):stopAfter
+    // No forced floor anymore — archived orders now resolve to real data (not counted
+    // as misses), so genuine consecutive nulls reliably mean end-of-orders. A small
+    // safety minimum of 20 still applies to avoid a mistyped "1" stopping instantly.
+    const effectiveStop=Math.max(stopAfter,20)
     addLog(`Manual: #${brand.idPrefix||''}${startId}–${useAuto?'auto':'#'+(brand.idPrefix||'')+endId} | ${concurrency}x | stop after ${effectiveStop} empty IDs`,'info')
-    if(useAuto&&effectiveStop>stopAfter)addLog(`ℹ Auto-stop raised to ${effectiveStop} — Shiprocket shares IDs across all sellers, gaps are normal`,'info')
     if(useAuto)addLog(`Hard cap: #${brand.idPrefix||''}${autoHardCap}`,'info')
     const cacheM=cacheEnabled?new OrderCache(brand.id, brand.slug||brand.subdomain):null
     if(cacheM){const csM=cacheM.stats();if(csM.total>0)addLog(`Cache: ${csM.delivered} delivered (skip) + ${csM.active} active — ${cacheM.sizeKB()}KB`,'ok')}
@@ -1127,7 +1162,7 @@ function DateTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setForc
 }
 
 function ManualTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setForceRefresh,cacheEnabled,setCacheEnabled}:any){
-  const[startId,setStartId]=useState('');const[endId,setEndId]=useState('');const[useAuto,setUseAuto]=useState(false);const[stopAfter,setStopAfter]=useState('500');const[conc,setConc]=useState('5')
+  const[startId,setStartId]=useState('');const[endId,setEndId]=useState('');const[useAuto,setUseAuto]=useState(true);const[stopAfter,setStopAfter]=useState('100');const[conc,setConc]=useState('5')
   const pfx=active.idPrefix||''
   const recommendedStop=recommendedAutoStop(parseInt(conc)||5,active?.avgPerDay||0)
   const storedResume=LS.get(`manual_resume_${active?.id}`,'')
@@ -1147,7 +1182,7 @@ function ManualTab({active,scanning,scanLabel,onStart,inp,lbl,forceRefresh,setFo
             <input type="checkbox" checked={useAuto} onChange={e=>setUseAuto(e.target.checked)} style={{accentColor:'var(--accent)',width:16,height:16}}/>
           </div>
           {resumeId>0&&<div style={{display:'flex',justifyContent:'space-between',alignItems:'center',background:'var(--surface2)',border:'1px solid var(--border)',borderRadius:6,padding:'8px 10px',marginBottom:10,fontSize:10,color:'var(--muted)'}}><span>Resume suggestion: start from #{pfx}{resumeId}</span><button onClick={()=>setStartId(String(resumeId))} style={{background:'none',border:'1px solid var(--accent)',color:'var(--accent)',padding:'4px 8px',borderRadius:4,fontSize:9,fontFamily:'inherit',cursor:'pointer'}}>Use resume ID</button></div>}
-          {useAuto&&<div style={{marginBottom:10}}><label style={lbl}>Stop after N misses</label><div style={{display:'flex',alignItems:'center',gap:8}}><input type="number" value={stopAfter} onChange={e=>setStopAfter(e.target.value)} style={{...inp,width:90}}/><span style={{fontSize:9,color:'var(--muted)'}}>Safe floor here: {recommendedStop}. Lower values are auto-raised, and misses are retried once before counting.</span></div></div>}
+          {useAuto&&<div style={{marginBottom:10}}><label style={lbl}>Stop after N misses</label><div style={{display:'flex',alignItems:'center',gap:8}}><input type="number" value={stopAfter} onChange={e=>setStopAfter(e.target.value)} style={{...inp,width:90}}/><span style={{fontSize:9,color:'var(--muted)'}}>100 consecutive missing IDs = end of orders. Archived orders are resolved to real data, not counted as misses.</span></div></div>}
           <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:12,fontSize:11,color:'var(--muted)'}}>
             <span>Concurrent fetches</span>
             <select value={conc} onChange={e=>setConc(e.target.value)} style={{...inp,width:'auto',padding:'5px 8px',fontSize:11}}>{['3','5','8','10'].map(v=><option key={v} value={v}>{v}</option>)}</select>
@@ -1551,10 +1586,14 @@ function SettingsTab({brands,active,runs,onDelete,onUpdateBrand,onSync,inp,lbl,f
     var sheet = ss.getSheetByName('Orders') || ss.insertSheet('Orders');
     if (data.mode === 'replace' || sheet.getLastRow() === 0) {
       sheet.clearContents();
-      sheet.appendRow(['Order ID','Date','Time','Value','Payment','Status','Location','Pincode']);
+      sheet.appendRow(['Order ID','Date','Time','Value','Payment','Status','Location','Pincode','Delivered Date','Delivery Days']);
     }
     data.orders.forEach(function(o) {
-      sheet.appendRow([o.orderId,o.orderDate,o.orderTime,o.value,o.payment,o.status,o.location,o.pincode]);
+      var days = '';
+      if (o.dateYMD && o.deliveredDateYMD) {
+        days = Math.round((new Date(o.deliveredDateYMD) - new Date(o.dateYMD)) / 86400000);
+      }
+      sheet.appendRow([o.orderId,o.orderDate,o.orderTime,o.value,o.payment,o.status,o.location,o.pincode,o.deliveredDate||'',days]);
     });
     return ContentService.createTextOutput(JSON.stringify({ok:true,added:data.orders.length})).setMimeType(ContentService.MimeType.JSON);
   } catch(e) {
@@ -1562,6 +1601,7 @@ function SettingsTab({brands,active,runs,onDelete,onUpdateBrand,onSync,inp,lbl,f
   }
 }`}</pre>
         </details>
+        <div style={{fontSize:8,color:'var(--warn)',marginBottom:10,lineHeight:1.6}}>⚠ If you already deployed this script, paste the updated code above into your existing Apps Script project and redeploy (Deploy → Manage deployments → Edit → New version) to get the new columns.</div>
         <div style={{marginBottom:8}}><label style={lbl}>Webhook URL</label><input value={url} onChange={(e:any)=>setUrl(e.target.value)} placeholder="https://script.google.com/macros/s/.../exec" style={inp}/></div>
         {status&&<div style={{fontSize:10,padding:'6px 10px',borderRadius:4,marginBottom:8,background:status.startsWith('✓')?'#00ff8815':'#ff444415',border:`1px solid ${status.startsWith('✓')?'var(--accent)':'var(--red)'}`,color:status.startsWith('✓')?'var(--accent)':'var(--red)'}}>{status}</div>}
         <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>

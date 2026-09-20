@@ -40,6 +40,20 @@ function parseApidata(apidata: any, originalId: string|number) {
   const city    = lastAct?.location || order?.customer_city || order?.customer_state || 'N/A'
   const rawTime = acts[0]?.date || orderDate || ''
 
+  // If delivered, the last tracking activity's date is the delivery date.
+  // Kept as a SEPARATE field from orderDate — never used for daily order counting.
+  let deliveredDate: string | undefined
+  let deliveredDateYMD: string | null | undefined
+  if (status.toLowerCase().includes('delivered') && lastAct?.date) {
+    const dParts = lastAct.date.match(/^(\d{4})-(\d{2})-(\d{2})/)
+    if (dParts) {
+      deliveredDateYMD = `${dParts[1]}-${dParts[2]}-${dParts[3]}`
+      const mIdx = parseInt(dParts[2]) - 1
+      const MONTHS_SHORT = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+      deliveredDate = `${dParts[3]} ${MONTHS_SHORT[mIdx]||dParts[2]} ${dParts[1]}`
+    }
+  }
+
   return {
     orderId:   originalId,
     slug:      apidata.company?.slug || '',
@@ -52,6 +66,8 @@ function parseApidata(apidata: any, originalId: string|number) {
     status:    status || 'N/A',
     pincode:   order?.customer_pincode || 'N/A',
     location:  city,
+    deliveredDate,
+    deliveredDateYMD,
   }
 }
 
@@ -71,22 +87,31 @@ function parseArchivedTemplate(html: string, originalId: string|number) {
 
   const statusMatch = html.match(/class="status-value[^"]*">\s*([A-Za-z][A-Za-z\s]*?)\s*<\/div>/i)
   const courierMatch = html.match(/class="courier-name">\s*([^<]+?)\s*<\/div>/i)
+  // This IS the delivery date — safe to use as deliveredDate (not orderDate)
+  const dateMatch = html.match(/class="delivered-date">\s*([^<]+?)\s*<\/div>/i)
 
   const status = statusMatch?.[1]?.trim()
   if (!status) return null
 
-  // IMPORTANT: this template only exposes the DELIVERY date, not the order placement date.
-  // Using delivery date as the order's date would corrupt daily/weekly/monthly order counts
-  // (e.g. an order placed Aug 1 but delivered Aug 17 would wrongly count toward Aug 17).
-  // "Order Placed On" is masked (** Aug 2026) so exact day is unavailable here.
-  // dateYMD is left null — the caller (Scanner) interpolates it from neighboring
-  // order IDs that DO have a confirmed date, since IDs are sequential by placement time.
+  let deliveredDate: string | undefined
+  let deliveredDateYMD: string | null | undefined
+  const dateText = dateMatch?.[1]?.trim() || ''
+  const dm = dateText.match(/(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})/i)
+  if (dm) {
+    deliveredDate = `${dm[1]} ${dm[2]} ${dm[3]}`
+    deliveredDateYMD = toYMD(deliveredDate)
+  }
+
+  // dateYMD (order placement date) stays null — this template never exposes an
+  // unmasked placement date. The caller (Scanner) interpolates it from
+  // neighboring order IDs that DO have a confirmed date.
   return {
     orderId: originalId, slug: '', orderDate: 'N/A', orderTime: 'N/A', dateYMD: null,
     value: 'N/A', valueNum: 0, payment: 'N/A',
     status: status.charAt(0).toUpperCase() + status.slice(1).toLowerCase(),
     pincode: 'N/A',
     location: courierMatch?.[1]?.trim() ? `via ${courierMatch[1].trim()}` : 'N/A',
+    deliveredDate, deliveredDateYMD,
   }
 }
 
@@ -216,22 +241,31 @@ export async function POST(req: NextRequest) {
   const cid = companyId || 0
 
   // Phase 1: fetch all direct tracking pages in parallel with light stagger
-  // (this endpoint is NOT rate-sensitive — evidence shows it handles concurrent load fine)
   const phase1 = await Promise.all(
     ids.map((id, i) =>
-      sleep(i * 80)
+      sleep(i * 40)  // was 80ms — this endpoint handles concurrent load fine
         .then(() => fetchDirect(subdomain, id))
         .catch(() => 'rl' as const)
     )
   )
 
-  // Phase 2: any order needing AWB fallback is resolved ONE AT A TIME, in sequence.
-  // This is the slow but reliable path — apiv2.shiprocket.co breaks under concurrency.
+  // Phase 2: AWB fallback for orders needing it. apiv2.shiprocket.co breaks under
+  // high concurrency, but a small pool of 2 workers is reliable and ~2x faster
+  // than fully sequential.
   const results: any[] = [...phase1]
-  for (let i = 0; i < results.length; i++) {
-    if (results[i] === '__NEEDS_AWB__') {
-      results[i] = await resolveViaAwb(subdomain, ids[i], cid)
+  const needsAwb = results.reduce<number[]>((acc, r, i) => { if (r === '__NEEDS_AWB__') acc.push(i); return acc }, [])
+
+  if (needsAwb.length > 0) {
+    const POOL_SIZE = 2
+    let cursor = 0
+    const worker = async () => {
+      while (cursor < needsAwb.length) {
+        const myIdx = cursor++
+        const i = needsAwb[myIdx]
+        results[i] = await resolveViaAwb(subdomain, ids[i], cid)
+      }
     }
+    await Promise.all(Array.from({ length: Math.min(POOL_SIZE, needsAwb.length) }, worker))
   }
 
   return NextResponse.json({ results })
