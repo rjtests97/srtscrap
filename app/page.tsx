@@ -379,8 +379,11 @@ class Scanner {
   async fetchBatch(ids:number[]):Promise<Array<Order|null|'rl'>>{
     if(this.stopped)return ids.map(()=>null)
     const WAITS=[10,20,40,60,90,120]
+    const MAX_ATTEMPTS=6  // after this many escalating retries, give up and hand control
+                          // back to the caller — otherwise this loop runs forever and
+                          // the "verify genuine end" logic never gets a chance to run
     let attempt=0
-    while(!this.stopped){
+    while(!this.stopped&&attempt<MAX_ATTEMPTS){
       const results=await this.callProxy(ids)
       if(results.some(r=>r!=='rl')){
         if(this.rlStreak>0){this.rlStreak=0;this.onLog('Connection restored','ok')}
@@ -392,6 +395,7 @@ class Scanner {
       this.onLog('Rate limited (x'+attempt+') — waiting '+waitSec+'s','info')
       await this.wait(waitSec*1000,'Cooldown')
     }
+    if(attempt>=MAX_ATTEMPTS)this.onLog('Giving up after '+MAX_ATTEMPTS+' attempts — treating as end of range, verifying...','info')
     return ids.map(()=>null)
   }
 
